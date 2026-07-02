@@ -1,0 +1,15 @@
+loading HF stress reference
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/326 [00:00<?, ?it/s]Loading weights: 100%|██████████| 326/326 [00:00<00:00, 19729.64it/s]
+HF case sampling_1
+HF case sampling_2
+HF case sampling_3
+loading ThinTensor mode bf16_exact
+Thin bf16_exact case sampling_1
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+Thin bf16_exact case sampling_2
+Thin bf16_exact case sampling_3
+loading ThinTensor mode retained_fp8
+Thin retained_fp8 case sampling_1
+Thin retained_fp8 case sampling_2
+Thin retained_fp8 case sampling_3

@@ -1,0 +1,356 @@
+{
+  "archive": "SmolLM3-3B.thin",
+  "case_count": 1,
+  "hf_model": "SmolLM3-3B",
+  "metric_definition": {
+    "centered_logit_cosine": "cosine after subtracting each vocabulary vector mean; this removes the unknown additive log-softmax constant and is directly comparable across HF, ThinTensor, and llama.cpp",
+    "q8_distribution": "all vocabulary log-probabilities returned by llama.cpp n_probs=vocab_size",
+    "raw_logit_cosine": "reported only when raw logits are available"
+  },
+  "modes": [
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.0,
+      "maximum_total_variation_distance": 0.0,
+      "minimum_centered_logit_cosine": 1.0,
+      "minimum_raw_logit_cosine": 1.0,
+      "minimum_top5_overlap": 1.0,
+      "mode": "hf_bf16",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "hello",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            },
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 16,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            },
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 64,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            },
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 128,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.0,
+          "maximum_total_variation_distance": 0.0,
+          "minimum_centered_logit_cosine": 1.0,
+          "minimum_raw_logit_cosine": 1.0,
+          "minimum_top5_overlap": 1.0,
+          "prompt_tokens": 1
+        }
+      ]
+    },
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.00020524010172304137,
+      "maximum_total_variation_distance": 6.762020916539768e-07,
+      "minimum_centered_logit_cosine": 0.9995961785316467,
+      "minimum_raw_logit_cosine": 0.9986467957496643,
+      "minimum_top5_overlap": 1.0,
+      "mode": "thin_bf16",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "hello",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 0.9999421834945679,
+              "jensen_shannon_distance": 0.00020524010172304137,
+              "maximum_centered_abs_error": 0.20885467529296875,
+              "mean_centered_abs_error": 0.026480136439204216,
+              "raw_logit_cosine": 0.9998486042022705,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 6.762020916539768e-07
+            },
+            {
+              "centered_logit_cosine": 0.9995961785316467,
+              "jensen_shannon_distance": 2.1499855785407913e-05,
+              "maximum_centered_abs_error": 0.8232851028442383,
+              "mean_centered_abs_error": 0.11160726100206375,
+              "raw_logit_cosine": 0.9996724724769592,
+              "step": 16,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 1.132367444256488e-08
+            },
+            {
+              "centered_logit_cosine": 0.9996822476387024,
+              "jensen_shannon_distance": 2.7333815375987758e-05,
+              "maximum_centered_abs_error": 0.43653059005737305,
+              "mean_centered_abs_error": 0.06498949229717255,
+              "raw_logit_cosine": 0.9986467957496643,
+              "step": 64,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 2.4049606750509156e-08
+            },
+            {
+              "centered_logit_cosine": 0.9999223947525024,
+              "jensen_shannon_distance": 0.00017362030909770122,
+              "maximum_centered_abs_error": 0.3085670471191406,
+              "mean_centered_abs_error": 0.040095336735248566,
+              "raw_logit_cosine": 0.9997868537902832,
+              "step": 128,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 4.065803338448859e-08
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.00020524010172304137,
+          "maximum_total_variation_distance": 6.762020916539768e-07,
+          "minimum_centered_logit_cosine": 0.9995961785316467,
+          "minimum_raw_logit_cosine": 0.9986467957496643,
+          "minimum_top5_overlap": 1.0,
+          "prompt_tokens": 1
+        }
+      ],
+      "saved_weight_bytes": 0
+    },
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.0007172728150837891,
+      "maximum_total_variation_distance": 8.81429423316149e-06,
+      "minimum_centered_logit_cosine": 0.9953662157058716,
+      "minimum_raw_logit_cosine": 0.9962490200996399,
+      "minimum_top5_overlap": 0.8,
+      "mode": "thin_quality_8_28",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "hello",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 0.9995825290679932,
+              "jensen_shannon_distance": 0.00019252255974119283,
+              "maximum_centered_abs_error": 0.6027612686157227,
+              "mean_centered_abs_error": 0.0694551020860672,
+              "raw_logit_cosine": 0.9994345903396606,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 2.999452419771842e-07
+            },
+            {
+              "centered_logit_cosine": 0.9953662157058716,
+              "jensen_shannon_distance": 0.00031241934757109417,
+              "maximum_centered_abs_error": 2.574144124984741,
+              "mean_centered_abs_error": 0.37923744320869446,
+              "raw_logit_cosine": 0.9962490200996399,
+              "step": 16,
+              "top1_same": true,
+              "top5_overlap": 0.8,
+              "total_variation_distance": 1.4172464943840168e-06
+            },
+            {
+              "centered_logit_cosine": 0.9977949261665344,
+              "jensen_shannon_distance": 0.00014404076264302603,
+              "maximum_centered_abs_error": 1.2060062885284424,
+              "mean_centered_abs_error": 0.1710147112607956,
+              "raw_logit_cosine": 0.9981610774993896,
+              "step": 64,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 5.694292894986575e-07
+            },
+            {
+              "centered_logit_cosine": 0.9994370341300964,
+              "jensen_shannon_distance": 0.0007172728150837891,
+              "maximum_centered_abs_error": 0.7561635971069336,
+              "mean_centered_abs_error": 0.10666971653699875,
+              "raw_logit_cosine": 0.9990514516830444,
+              "step": 128,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 8.81429423316149e-06
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.0007172728150837891,
+          "maximum_total_variation_distance": 8.81429423316149e-06,
+          "minimum_centered_logit_cosine": 0.9953662157058716,
+          "minimum_raw_logit_cosine": 0.9962490200996399,
+          "minimum_top5_overlap": 0.8,
+          "prompt_tokens": 1
+        }
+      ],
+      "saved_weight_bytes": 2070749184
+    },
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.0006143896440051355,
+      "maximum_total_variation_distance": 7.164504495449364e-06,
+      "minimum_centered_logit_cosine": 0.9952350854873657,
+      "minimum_raw_logit_cosine": 0.9959534406661987,
+      "minimum_top5_overlap": 0.8,
+      "mode": "thin_quality_10_26",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "hello",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 0.9996931552886963,
+              "jensen_shannon_distance": 0.0001925860938604007,
+              "maximum_centered_abs_error": 0.4970879554748535,
+              "mean_centered_abs_error": 0.059732601046562195,
+              "raw_logit_cosine": 0.9996321201324463,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 3.0036977705094614e-07
+            },
+            {
+              "centered_logit_cosine": 0.9952350854873657,
+              "jensen_shannon_distance": 0.00028568054197035175,
+              "maximum_centered_abs_error": 2.865950345993042,
+              "mean_centered_abs_error": 0.3853514492511749,
+              "raw_logit_cosine": 0.9959534406661987,
+              "step": 16,
+              "top1_same": true,
+              "top5_overlap": 0.8,
+              "total_variation_distance": 1.0150334901481983e-06
+            },
+            {
+              "centered_logit_cosine": 0.9978652000427246,
+              "jensen_shannon_distance": 0.0002760478942388191,
+              "maximum_centered_abs_error": 1.1861684322357178,
+              "mean_centered_abs_error": 0.169654980301857,
+              "raw_logit_cosine": 0.9985025525093079,
+              "step": 64,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 7.470011382793018e-07
+            },
+            {
+              "centered_logit_cosine": 0.9995158314704895,
+              "jensen_shannon_distance": 0.0006143896440051355,
+              "maximum_centered_abs_error": 0.7217741012573242,
+              "mean_centered_abs_error": 0.09950673580169678,
+              "raw_logit_cosine": 0.9981977343559265,
+              "step": 128,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 7.164504495449364e-06
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.0006143896440051355,
+          "maximum_total_variation_distance": 7.164504495449364e-06,
+          "minimum_centered_logit_cosine": 0.9952350854873657,
+          "minimum_raw_logit_cosine": 0.9959534406661987,
+          "minimum_top5_overlap": 0.8,
+          "prompt_tokens": 1
+        }
+      ],
+      "saved_weight_bytes": 1980604416
+    },
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.02710222004008654,
+      "maximum_total_variation_distance": 0.0021549323573708534,
+      "minimum_centered_logit_cosine": 0.9526655077934265,
+      "minimum_raw_logit_cosine": null,
+      "minimum_top5_overlap": 0.8,
+      "mode": "llamacpp_q8_0",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "hello",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 0.9526655077934265,
+              "jensen_shannon_distance": 0.02710222004008654,
+              "maximum_centered_abs_error": 11.004743576049805,
+              "mean_centered_abs_error": 0.7320768237113953,
+              "raw_logit_cosine": null,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 0.8,
+              "total_variation_distance": 0.0021549323573708534
+            },
+            {
+              "centered_logit_cosine": 0.998590350151062,
+              "jensen_shannon_distance": 0.00021860851612357836,
+              "maximum_centered_abs_error": 1.683246374130249,
+              "mean_centered_abs_error": 0.2073679119348526,
+              "raw_logit_cosine": null,
+              "step": 16,
+              "top1_same": true,
+              "top5_overlap": 0.8,
+              "total_variation_distance": 1.1205844430151046e-06
+            },
+            {
+              "centered_logit_cosine": 0.9989991784095764,
+              "jensen_shannon_distance": 0.00017328768895570032,
+              "maximum_centered_abs_error": 0.9429383277893066,
+              "mean_centered_abs_error": 0.1155136451125145,
+              "raw_logit_cosine": null,
+              "step": 64,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 7.932608241389971e-07
+            },
+            {
+              "centered_logit_cosine": 0.9996535778045654,
+              "jensen_shannon_distance": 0.000176808958157453,
+              "maximum_centered_abs_error": 0.7877216339111328,
+              "mean_centered_abs_error": 0.08329741656780243,
+              "raw_logit_cosine": null,
+              "step": 128,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 1.6450690054625738e-06
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.02710222004008654,
+          "maximum_total_variation_distance": 0.0021549323573708534,
+          "minimum_centered_logit_cosine": 0.9526655077934265,
+          "minimum_raw_logit_cosine": null,
+          "minimum_top5_overlap": 0.8,
+          "prompt_tokens": 1
+        }
+      ]
+    }
+  ],
+  "q8_gguf": "/tmp/SmolLM3-Q8_0.gguf"
+}

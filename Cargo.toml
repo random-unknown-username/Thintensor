@@ -1,0 +1,18 @@
+[package]
+name = "thintensor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+byteorder = "1"
+hex = "0.4"
+walkdir = "2"
+safetensors = "0.6"
+memmap2 = "0.9"
+glob = "0.3"

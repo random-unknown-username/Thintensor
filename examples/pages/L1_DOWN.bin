@@ -1,0 +1,4 @@
+thin fake page L1_DOWN
+semantic=layer 1 mlp down
+layout=generic
+payload=not real weights

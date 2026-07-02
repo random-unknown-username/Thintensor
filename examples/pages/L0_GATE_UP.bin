@@ -1,0 +1,4 @@
+thin fake page L0_GATE_UP
+semantic=layer 0 fused mlp gate up
+layout=generic
+payload=not real weights

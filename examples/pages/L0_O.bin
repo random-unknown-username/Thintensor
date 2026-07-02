@@ -1,0 +1,4 @@
+thin fake page L0_O
+semantic=layer 0 attention output
+layout=generic
+payload=not real weights

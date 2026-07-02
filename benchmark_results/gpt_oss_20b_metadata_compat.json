@@ -1,0 +1,931 @@
+{
+  "available_quant_kernels": [
+    "fp8_scaled_matvec",
+    "mxfp4_matvec"
+  ],
+  "cuda_capability": [
+    12,
+    0
+  ],
+  "current_native_executor_gaps": [],
+  "current_native_executor_ready": true,
+  "execution_plan": {
+    "descriptor": {
+      "activation": "silu",
+      "architecture_family": "decoder_moe",
+      "attention_bias": true,
+      "attention_kind": "gqa",
+      "attention_sinks": true,
+      "attention_variants": [
+        "causal_kv",
+        "current_only_smoke",
+        "sliding_causal_kv"
+      ],
+      "head_dim": 64,
+      "hidden_size": 2880,
+      "intermediate_size": 2880,
+      "layer_types": [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention"
+      ],
+      "max_position_embeddings": 131072,
+      "mlp_bias": true,
+      "mlp_kind": "sparse_moe",
+      "model_type": "gpt_oss",
+      "no_rope_layers": [],
+      "num_attention_heads": 64,
+      "num_experts_per_token": 4,
+      "num_hidden_layers": 24,
+      "num_key_value_heads": 8,
+      "num_local_experts": 32,
+      "qkv_bias": true,
+      "quantization": {
+        "bits": 4,
+        "group_size": null,
+        "method": "mxfp4",
+        "modules_to_not_convert": [
+          "model.layers.*.self_attn",
+          "model.layers.*.mlp.router",
+          "model.embed_tokens",
+          "lm_head"
+        ],
+        "scale_dtype": null,
+        "source_config": {
+          "modules_to_not_convert": [
+            "model.layers.*.self_attn",
+            "model.layers.*.mlp.router",
+            "model.embed_tokens",
+            "lm_head"
+          ],
+          "quant_method": "mxfp4"
+        },
+        "storage_dtype": "mxfp4",
+        "zero_point": null
+      },
+      "required_operators": [
+        "embedding",
+        "rms_norm",
+        "qkv_projection",
+        "rope",
+        "gqa_attention",
+        "o_projection",
+        "lm_head",
+        "attention_sinks",
+        "per_layer_attention_window",
+        "topk_router",
+        "sparse_experts",
+        "expert_weighted_sum"
+      ],
+      "rms_norm_eps": 1e-05,
+      "rope_parameters": {
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "factor": 32.0,
+        "original_max_position_embeddings": 4096,
+        "rope_type": "yarn",
+        "truncate": false
+      },
+      "rope_scaling": {
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "factor": 32.0,
+        "original_max_position_embeddings": 4096,
+        "rope_type": "yarn",
+        "truncate": false
+      },
+      "rope_theta": 150000.0,
+      "rope_variant": "yarn",
+      "sliding_window": 128,
+      "supported_precision_modes": [
+        "native_mxfp4",
+        "bf16",
+        "head8"
+      ],
+      "swiglu_alpha": 1.702,
+      "swiglu_limit": 7.0,
+      "tensor_naming_scheme": "hf_decoder_layers",
+      "tie_word_embeddings": false,
+      "vocab_size": 201088
+    },
+    "globals": {
+      "embed_tokens": "model.embed_tokens.weight",
+      "final_norm": "model.norm.weight",
+      "lm_head": "lm_head.weight"
+    },
+    "layers": [
+      {
+        "attention_window": 128,
+        "layer": 0,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.0.self_attn.sinks",
+          "experts_down_bias": "model.layers.0.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.0.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.0.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.0.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.0.self_attn.k_proj.bias",
+          "o_bias": "model.layers.0.self_attn.o_proj.bias",
+          "q_bias": "model.layers.0.self_attn.q_proj.bias",
+          "router_bias": "model.layers.0.mlp.router.bias",
+          "v_bias": "model.layers.0.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.0.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.0.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.0.input_layernorm.weight",
+          "k_weight": "model.layers.0.self_attn.k_proj.weight",
+          "o_weight": "model.layers.0.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.0.post_attention_layernorm.weight",
+          "q_weight": "model.layers.0.self_attn.q_proj.weight",
+          "router_weight": "model.layers.0.mlp.router.weight",
+          "v_weight": "model.layers.0.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 1,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.1.self_attn.sinks",
+          "experts_down_bias": "model.layers.1.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.1.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.1.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.1.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.1.self_attn.k_proj.bias",
+          "o_bias": "model.layers.1.self_attn.o_proj.bias",
+          "q_bias": "model.layers.1.self_attn.q_proj.bias",
+          "router_bias": "model.layers.1.mlp.router.bias",
+          "v_bias": "model.layers.1.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.1.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.1.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.1.input_layernorm.weight",
+          "k_weight": "model.layers.1.self_attn.k_proj.weight",
+          "o_weight": "model.layers.1.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.1.post_attention_layernorm.weight",
+          "q_weight": "model.layers.1.self_attn.q_proj.weight",
+          "router_weight": "model.layers.1.mlp.router.weight",
+          "v_weight": "model.layers.1.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 2,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.2.self_attn.sinks",
+          "experts_down_bias": "model.layers.2.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.2.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.2.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.2.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.2.self_attn.k_proj.bias",
+          "o_bias": "model.layers.2.self_attn.o_proj.bias",
+          "q_bias": "model.layers.2.self_attn.q_proj.bias",
+          "router_bias": "model.layers.2.mlp.router.bias",
+          "v_bias": "model.layers.2.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.2.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.2.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.2.input_layernorm.weight",
+          "k_weight": "model.layers.2.self_attn.k_proj.weight",
+          "o_weight": "model.layers.2.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.2.post_attention_layernorm.weight",
+          "q_weight": "model.layers.2.self_attn.q_proj.weight",
+          "router_weight": "model.layers.2.mlp.router.weight",
+          "v_weight": "model.layers.2.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 3,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.3.self_attn.sinks",
+          "experts_down_bias": "model.layers.3.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.3.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.3.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.3.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.3.self_attn.k_proj.bias",
+          "o_bias": "model.layers.3.self_attn.o_proj.bias",
+          "q_bias": "model.layers.3.self_attn.q_proj.bias",
+          "router_bias": "model.layers.3.mlp.router.bias",
+          "v_bias": "model.layers.3.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.3.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.3.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.3.input_layernorm.weight",
+          "k_weight": "model.layers.3.self_attn.k_proj.weight",
+          "o_weight": "model.layers.3.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.3.post_attention_layernorm.weight",
+          "q_weight": "model.layers.3.self_attn.q_proj.weight",
+          "router_weight": "model.layers.3.mlp.router.weight",
+          "v_weight": "model.layers.3.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 4,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.4.self_attn.sinks",
+          "experts_down_bias": "model.layers.4.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.4.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.4.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.4.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.4.self_attn.k_proj.bias",
+          "o_bias": "model.layers.4.self_attn.o_proj.bias",
+          "q_bias": "model.layers.4.self_attn.q_proj.bias",
+          "router_bias": "model.layers.4.mlp.router.bias",
+          "v_bias": "model.layers.4.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.4.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.4.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.4.input_layernorm.weight",
+          "k_weight": "model.layers.4.self_attn.k_proj.weight",
+          "o_weight": "model.layers.4.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.4.post_attention_layernorm.weight",
+          "q_weight": "model.layers.4.self_attn.q_proj.weight",
+          "router_weight": "model.layers.4.mlp.router.weight",
+          "v_weight": "model.layers.4.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 5,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.5.self_attn.sinks",
+          "experts_down_bias": "model.layers.5.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.5.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.5.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.5.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.5.self_attn.k_proj.bias",
+          "o_bias": "model.layers.5.self_attn.o_proj.bias",
+          "q_bias": "model.layers.5.self_attn.q_proj.bias",
+          "router_bias": "model.layers.5.mlp.router.bias",
+          "v_bias": "model.layers.5.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.5.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.5.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.5.input_layernorm.weight",
+          "k_weight": "model.layers.5.self_attn.k_proj.weight",
+          "o_weight": "model.layers.5.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.5.post_attention_layernorm.weight",
+          "q_weight": "model.layers.5.self_attn.q_proj.weight",
+          "router_weight": "model.layers.5.mlp.router.weight",
+          "v_weight": "model.layers.5.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 6,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.6.self_attn.sinks",
+          "experts_down_bias": "model.layers.6.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.6.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.6.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.6.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.6.self_attn.k_proj.bias",
+          "o_bias": "model.layers.6.self_attn.o_proj.bias",
+          "q_bias": "model.layers.6.self_attn.q_proj.bias",
+          "router_bias": "model.layers.6.mlp.router.bias",
+          "v_bias": "model.layers.6.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.6.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.6.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.6.input_layernorm.weight",
+          "k_weight": "model.layers.6.self_attn.k_proj.weight",
+          "o_weight": "model.layers.6.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.6.post_attention_layernorm.weight",
+          "q_weight": "model.layers.6.self_attn.q_proj.weight",
+          "router_weight": "model.layers.6.mlp.router.weight",
+          "v_weight": "model.layers.6.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 7,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.7.self_attn.sinks",
+          "experts_down_bias": "model.layers.7.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.7.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.7.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.7.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.7.self_attn.k_proj.bias",
+          "o_bias": "model.layers.7.self_attn.o_proj.bias",
+          "q_bias": "model.layers.7.self_attn.q_proj.bias",
+          "router_bias": "model.layers.7.mlp.router.bias",
+          "v_bias": "model.layers.7.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.7.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.7.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.7.input_layernorm.weight",
+          "k_weight": "model.layers.7.self_attn.k_proj.weight",
+          "o_weight": "model.layers.7.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.7.post_attention_layernorm.weight",
+          "q_weight": "model.layers.7.self_attn.q_proj.weight",
+          "router_weight": "model.layers.7.mlp.router.weight",
+          "v_weight": "model.layers.7.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 8,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.8.self_attn.sinks",
+          "experts_down_bias": "model.layers.8.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.8.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.8.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.8.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.8.self_attn.k_proj.bias",
+          "o_bias": "model.layers.8.self_attn.o_proj.bias",
+          "q_bias": "model.layers.8.self_attn.q_proj.bias",
+          "router_bias": "model.layers.8.mlp.router.bias",
+          "v_bias": "model.layers.8.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.8.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.8.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.8.input_layernorm.weight",
+          "k_weight": "model.layers.8.self_attn.k_proj.weight",
+          "o_weight": "model.layers.8.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.8.post_attention_layernorm.weight",
+          "q_weight": "model.layers.8.self_attn.q_proj.weight",
+          "router_weight": "model.layers.8.mlp.router.weight",
+          "v_weight": "model.layers.8.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 9,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.9.self_attn.sinks",
+          "experts_down_bias": "model.layers.9.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.9.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.9.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.9.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.9.self_attn.k_proj.bias",
+          "o_bias": "model.layers.9.self_attn.o_proj.bias",
+          "q_bias": "model.layers.9.self_attn.q_proj.bias",
+          "router_bias": "model.layers.9.mlp.router.bias",
+          "v_bias": "model.layers.9.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.9.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.9.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.9.input_layernorm.weight",
+          "k_weight": "model.layers.9.self_attn.k_proj.weight",
+          "o_weight": "model.layers.9.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.9.post_attention_layernorm.weight",
+          "q_weight": "model.layers.9.self_attn.q_proj.weight",
+          "router_weight": "model.layers.9.mlp.router.weight",
+          "v_weight": "model.layers.9.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 10,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.10.self_attn.sinks",
+          "experts_down_bias": "model.layers.10.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.10.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.10.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.10.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.10.self_attn.k_proj.bias",
+          "o_bias": "model.layers.10.self_attn.o_proj.bias",
+          "q_bias": "model.layers.10.self_attn.q_proj.bias",
+          "router_bias": "model.layers.10.mlp.router.bias",
+          "v_bias": "model.layers.10.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.10.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.10.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.10.input_layernorm.weight",
+          "k_weight": "model.layers.10.self_attn.k_proj.weight",
+          "o_weight": "model.layers.10.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.10.post_attention_layernorm.weight",
+          "q_weight": "model.layers.10.self_attn.q_proj.weight",
+          "router_weight": "model.layers.10.mlp.router.weight",
+          "v_weight": "model.layers.10.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 11,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.11.self_attn.sinks",
+          "experts_down_bias": "model.layers.11.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.11.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.11.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.11.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.11.self_attn.k_proj.bias",
+          "o_bias": "model.layers.11.self_attn.o_proj.bias",
+          "q_bias": "model.layers.11.self_attn.q_proj.bias",
+          "router_bias": "model.layers.11.mlp.router.bias",
+          "v_bias": "model.layers.11.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.11.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.11.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.11.input_layernorm.weight",
+          "k_weight": "model.layers.11.self_attn.k_proj.weight",
+          "o_weight": "model.layers.11.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.11.post_attention_layernorm.weight",
+          "q_weight": "model.layers.11.self_attn.q_proj.weight",
+          "router_weight": "model.layers.11.mlp.router.weight",
+          "v_weight": "model.layers.11.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 12,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.12.self_attn.sinks",
+          "experts_down_bias": "model.layers.12.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.12.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.12.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.12.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.12.self_attn.k_proj.bias",
+          "o_bias": "model.layers.12.self_attn.o_proj.bias",
+          "q_bias": "model.layers.12.self_attn.q_proj.bias",
+          "router_bias": "model.layers.12.mlp.router.bias",
+          "v_bias": "model.layers.12.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.12.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.12.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.12.input_layernorm.weight",
+          "k_weight": "model.layers.12.self_attn.k_proj.weight",
+          "o_weight": "model.layers.12.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.12.post_attention_layernorm.weight",
+          "q_weight": "model.layers.12.self_attn.q_proj.weight",
+          "router_weight": "model.layers.12.mlp.router.weight",
+          "v_weight": "model.layers.12.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 13,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.13.self_attn.sinks",
+          "experts_down_bias": "model.layers.13.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.13.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.13.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.13.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.13.self_attn.k_proj.bias",
+          "o_bias": "model.layers.13.self_attn.o_proj.bias",
+          "q_bias": "model.layers.13.self_attn.q_proj.bias",
+          "router_bias": "model.layers.13.mlp.router.bias",
+          "v_bias": "model.layers.13.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.13.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.13.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.13.input_layernorm.weight",
+          "k_weight": "model.layers.13.self_attn.k_proj.weight",
+          "o_weight": "model.layers.13.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.13.post_attention_layernorm.weight",
+          "q_weight": "model.layers.13.self_attn.q_proj.weight",
+          "router_weight": "model.layers.13.mlp.router.weight",
+          "v_weight": "model.layers.13.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 14,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.14.self_attn.sinks",
+          "experts_down_bias": "model.layers.14.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.14.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.14.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.14.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.14.self_attn.k_proj.bias",
+          "o_bias": "model.layers.14.self_attn.o_proj.bias",
+          "q_bias": "model.layers.14.self_attn.q_proj.bias",
+          "router_bias": "model.layers.14.mlp.router.bias",
+          "v_bias": "model.layers.14.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.14.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.14.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.14.input_layernorm.weight",
+          "k_weight": "model.layers.14.self_attn.k_proj.weight",
+          "o_weight": "model.layers.14.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.14.post_attention_layernorm.weight",
+          "q_weight": "model.layers.14.self_attn.q_proj.weight",
+          "router_weight": "model.layers.14.mlp.router.weight",
+          "v_weight": "model.layers.14.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 15,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.15.self_attn.sinks",
+          "experts_down_bias": "model.layers.15.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.15.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.15.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.15.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.15.self_attn.k_proj.bias",
+          "o_bias": "model.layers.15.self_attn.o_proj.bias",
+          "q_bias": "model.layers.15.self_attn.q_proj.bias",
+          "router_bias": "model.layers.15.mlp.router.bias",
+          "v_bias": "model.layers.15.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.15.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.15.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.15.input_layernorm.weight",
+          "k_weight": "model.layers.15.self_attn.k_proj.weight",
+          "o_weight": "model.layers.15.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.15.post_attention_layernorm.weight",
+          "q_weight": "model.layers.15.self_attn.q_proj.weight",
+          "router_weight": "model.layers.15.mlp.router.weight",
+          "v_weight": "model.layers.15.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 16,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.16.self_attn.sinks",
+          "experts_down_bias": "model.layers.16.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.16.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.16.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.16.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.16.self_attn.k_proj.bias",
+          "o_bias": "model.layers.16.self_attn.o_proj.bias",
+          "q_bias": "model.layers.16.self_attn.q_proj.bias",
+          "router_bias": "model.layers.16.mlp.router.bias",
+          "v_bias": "model.layers.16.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.16.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.16.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.16.input_layernorm.weight",
+          "k_weight": "model.layers.16.self_attn.k_proj.weight",
+          "o_weight": "model.layers.16.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.16.post_attention_layernorm.weight",
+          "q_weight": "model.layers.16.self_attn.q_proj.weight",
+          "router_weight": "model.layers.16.mlp.router.weight",
+          "v_weight": "model.layers.16.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 17,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.17.self_attn.sinks",
+          "experts_down_bias": "model.layers.17.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.17.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.17.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.17.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.17.self_attn.k_proj.bias",
+          "o_bias": "model.layers.17.self_attn.o_proj.bias",
+          "q_bias": "model.layers.17.self_attn.q_proj.bias",
+          "router_bias": "model.layers.17.mlp.router.bias",
+          "v_bias": "model.layers.17.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.17.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.17.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.17.input_layernorm.weight",
+          "k_weight": "model.layers.17.self_attn.k_proj.weight",
+          "o_weight": "model.layers.17.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.17.post_attention_layernorm.weight",
+          "q_weight": "model.layers.17.self_attn.q_proj.weight",
+          "router_weight": "model.layers.17.mlp.router.weight",
+          "v_weight": "model.layers.17.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 18,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.18.self_attn.sinks",
+          "experts_down_bias": "model.layers.18.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.18.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.18.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.18.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.18.self_attn.k_proj.bias",
+          "o_bias": "model.layers.18.self_attn.o_proj.bias",
+          "q_bias": "model.layers.18.self_attn.q_proj.bias",
+          "router_bias": "model.layers.18.mlp.router.bias",
+          "v_bias": "model.layers.18.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.18.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.18.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.18.input_layernorm.weight",
+          "k_weight": "model.layers.18.self_attn.k_proj.weight",
+          "o_weight": "model.layers.18.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.18.post_attention_layernorm.weight",
+          "q_weight": "model.layers.18.self_attn.q_proj.weight",
+          "router_weight": "model.layers.18.mlp.router.weight",
+          "v_weight": "model.layers.18.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 19,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.19.self_attn.sinks",
+          "experts_down_bias": "model.layers.19.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.19.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.19.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.19.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.19.self_attn.k_proj.bias",
+          "o_bias": "model.layers.19.self_attn.o_proj.bias",
+          "q_bias": "model.layers.19.self_attn.q_proj.bias",
+          "router_bias": "model.layers.19.mlp.router.bias",
+          "v_bias": "model.layers.19.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.19.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.19.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.19.input_layernorm.weight",
+          "k_weight": "model.layers.19.self_attn.k_proj.weight",
+          "o_weight": "model.layers.19.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.19.post_attention_layernorm.weight",
+          "q_weight": "model.layers.19.self_attn.q_proj.weight",
+          "router_weight": "model.layers.19.mlp.router.weight",
+          "v_weight": "model.layers.19.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 20,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.20.self_attn.sinks",
+          "experts_down_bias": "model.layers.20.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.20.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.20.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.20.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.20.self_attn.k_proj.bias",
+          "o_bias": "model.layers.20.self_attn.o_proj.bias",
+          "q_bias": "model.layers.20.self_attn.q_proj.bias",
+          "router_bias": "model.layers.20.mlp.router.bias",
+          "v_bias": "model.layers.20.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.20.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.20.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.20.input_layernorm.weight",
+          "k_weight": "model.layers.20.self_attn.k_proj.weight",
+          "o_weight": "model.layers.20.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.20.post_attention_layernorm.weight",
+          "q_weight": "model.layers.20.self_attn.q_proj.weight",
+          "router_weight": "model.layers.20.mlp.router.weight",
+          "v_weight": "model.layers.20.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 21,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.21.self_attn.sinks",
+          "experts_down_bias": "model.layers.21.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.21.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.21.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.21.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.21.self_attn.k_proj.bias",
+          "o_bias": "model.layers.21.self_attn.o_proj.bias",
+          "q_bias": "model.layers.21.self_attn.q_proj.bias",
+          "router_bias": "model.layers.21.mlp.router.bias",
+          "v_bias": "model.layers.21.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.21.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.21.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.21.input_layernorm.weight",
+          "k_weight": "model.layers.21.self_attn.k_proj.weight",
+          "o_weight": "model.layers.21.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.21.post_attention_layernorm.weight",
+          "q_weight": "model.layers.21.self_attn.q_proj.weight",
+          "router_weight": "model.layers.21.mlp.router.weight",
+          "v_weight": "model.layers.21.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": 128,
+        "layer": 22,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.22.self_attn.sinks",
+          "experts_down_bias": "model.layers.22.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.22.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.22.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.22.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.22.self_attn.k_proj.bias",
+          "o_bias": "model.layers.22.self_attn.o_proj.bias",
+          "q_bias": "model.layers.22.self_attn.q_proj.bias",
+          "router_bias": "model.layers.22.mlp.router.bias",
+          "v_bias": "model.layers.22.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.22.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.22.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.22.input_layernorm.weight",
+          "k_weight": "model.layers.22.self_attn.k_proj.weight",
+          "o_weight": "model.layers.22.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.22.post_attention_layernorm.weight",
+          "q_weight": "model.layers.22.self_attn.q_proj.weight",
+          "router_weight": "model.layers.22.mlp.router.weight",
+          "v_weight": "model.layers.22.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 23,
+        "missing_required_roles": [],
+        "optional_tensors": {
+          "attention_sinks": "model.layers.23.self_attn.sinks",
+          "experts_down_bias": "model.layers.23.mlp.experts.down_proj_bias",
+          "experts_down_scales": "model.layers.23.mlp.experts.down_proj_scales",
+          "experts_gate_up_bias": "model.layers.23.mlp.experts.gate_up_proj_bias",
+          "experts_gate_up_scales": "model.layers.23.mlp.experts.gate_up_proj_scales",
+          "k_bias": "model.layers.23.self_attn.k_proj.bias",
+          "o_bias": "model.layers.23.self_attn.o_proj.bias",
+          "q_bias": "model.layers.23.self_attn.q_proj.bias",
+          "router_bias": "model.layers.23.mlp.router.bias",
+          "v_bias": "model.layers.23.self_attn.v_proj.bias"
+        },
+        "schema": "packed_expert_moe",
+        "tensors": {
+          "experts_down": "model.layers.23.mlp.experts.down_proj_blocks",
+          "experts_gate_up": "model.layers.23.mlp.experts.gate_up_proj_blocks",
+          "input_norm": "model.layers.23.input_layernorm.weight",
+          "k_weight": "model.layers.23.self_attn.k_proj.weight",
+          "o_weight": "model.layers.23.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.23.post_attention_layernorm.weight",
+          "q_weight": "model.layers.23.self_attn.q_proj.weight",
+          "router_weight": "model.layers.23.mlp.router.weight",
+          "v_weight": "model.layers.23.self_attn.v_proj.weight"
+        }
+      }
+    ],
+    "optimization_candidates": [
+      "shape_autotune",
+      "role_aware_matvec",
+      "lm_head_backend_autotune",
+      "causal_kv_layout",
+      "layer_window_aware_kv",
+      "router_topk_gpu",
+      "expert_hotset_cache",
+      "selected_expert_prefetch",
+      "grouped_expert_matvec",
+      "native_mxfp4_execution"
+    ],
+    "quantization": {
+      "compute_dtype": "mxfp4",
+      "exact_storage_preserved": true,
+      "kernel_family": "mxfp4_matvec",
+      "reason": "native source-format kernel selected",
+      "requested": "auto",
+      "requires_requantization": false,
+      "source": {
+        "bits": 4,
+        "group_size": null,
+        "method": "mxfp4",
+        "modules_to_not_convert": [
+          "model.layers.*.self_attn",
+          "model.layers.*.mlp.router",
+          "model.embed_tokens",
+          "lm_head"
+        ],
+        "scale_dtype": null,
+        "source_config": {
+          "modules_to_not_convert": [
+            "model.layers.*.self_attn",
+            "model.layers.*.mlp.router",
+            "model.embed_tokens",
+            "lm_head"
+          ],
+          "quant_method": "mxfp4"
+        },
+        "storage_dtype": "mxfp4",
+        "zero_point": null
+      },
+      "storage_action": "preserve",
+      "supported": true
+    },
+    "schema": "packed_expert_moe",
+    "supported": true,
+    "unsupported_reasons": []
+  },
+  "performance_contract": {
+    "candidate_optimizations": [
+      "shape_autotune",
+      "role_aware_matvec",
+      "lm_head_backend_autotune",
+      "causal_kv_layout",
+      "layer_window_aware_kv",
+      "router_topk_gpu",
+      "expert_hotset_cache",
+      "selected_expert_prefetch",
+      "grouped_expert_matvec",
+      "native_mxfp4_execution"
+    ],
+    "claim_rule": "claim 30% only after correctness-gated real decode beats the same-model same-precision baseline",
+    "minimum_claimed_speedup": 0.0,
+    "target_speedup": 0.3
+  },
+  "precision_ladder": [
+    {
+      "conversion": "preserve",
+      "mode": "native_mxfp4",
+      "note": "preserve source bits, scales, zero-point, and grouping",
+      "safety": "preferred"
+    },
+    {
+      "conversion": "dequantize",
+      "mode": "bf16",
+      "note": "correctness fallback when no native kernel exists",
+      "safety": "fallback"
+    },
+    {
+      "conversion": "preserve_numeric_format",
+      "mode": "fp4",
+      "note": "keep block scales and use a hardware-compatible layout",
+      "safety": "native_or_layout_convert"
+    },
+    {
+      "conversion": "requantize",
+      "mode": "q2",
+      "note": "never enabled automatically",
+      "safety": "lossy_opt_in"
+    }
+  ],
+  "schema_plan_compiles": true,
+  "schema_plan_errors": [],
+  "source": "/tmp/gpt-oss-schema",
+  "tensor_count": 459
+}

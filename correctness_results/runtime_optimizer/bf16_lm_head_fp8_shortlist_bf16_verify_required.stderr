@@ -1,0 +1,6 @@
+loading HF model SmolLM3-3B
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading weights:   0%|          | 0/326 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 326/326 [00:00<00:00, 18984.55it/s]
+loading ThinTensor archive SmolLM3-3B.thin

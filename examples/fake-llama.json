@@ -1,0 +1,174 @@
+{
+  "format": "thintensor",
+  "version": 0,
+  "model": {
+    "arch": "llama",
+    "hidden_size": 4096,
+    "layers": 2,
+    "heads": 32,
+    "kv_heads": 8,
+    "dtype": "q4_mixed"
+  },
+  "execution_tape": [
+    {
+      "stage": "embed",
+      "page_refs": ["EMBED"]
+    },
+    {
+      "stage": "layer_0_attn_qkv",
+      "page_refs": ["L0_QKV"]
+    },
+    {
+      "stage": "layer_0_attn_out",
+      "page_refs": ["L0_O"]
+    },
+    {
+      "stage": "layer_0_mlp_gate_up",
+      "page_refs": ["L0_GATE_UP"]
+    },
+    {
+      "stage": "layer_0_mlp_down",
+      "page_refs": ["L0_DOWN"]
+    },
+    {
+      "stage": "layer_1_attn_qkv",
+      "page_refs": ["L1_QKV"]
+    },
+    {
+      "stage": "layer_1_attn_out",
+      "page_refs": ["L1_O"]
+    },
+    {
+      "stage": "layer_1_mlp_gate_up",
+      "page_refs": ["L1_GATE_UP"]
+    },
+    {
+      "stage": "layer_1_mlp_down",
+      "page_refs": ["L1_DOWN"]
+    },
+    {
+      "stage": "lm_head",
+      "page_refs": ["LM_HEAD"]
+    }
+  ],
+  "pages": [
+    {
+      "id": "EMBED",
+      "kind": "weight",
+      "op": "embedding",
+      "dtype": "q6",
+      "shape": [32000, 4096],
+      "backend_layout": "generic",
+      "size": 86,
+      "checksum": "f6a04ed075c167bf819d1c3c5275a5a3b1e171934b2f9c3d41a81cbcd9d9f35a"
+    },
+    {
+      "id": "L0_QKV",
+      "kind": "weight",
+      "layer": 0,
+      "op": "attn_qkv",
+      "dtype": "q4",
+      "shape": [12288, 4096],
+      "backend_layout": "generic",
+      "size": 99,
+      "checksum": "5614baae7a4a0b4883f5fdc6f8f6ecb71c73d3d942e52d7f077b89f8970c5d39"
+    },
+    {
+      "id": "L0_O",
+      "kind": "weight",
+      "layer": 0,
+      "op": "attn_out",
+      "dtype": "q4",
+      "shape": [4096, 4096],
+      "backend_layout": "generic",
+      "size": 94,
+      "checksum": "c3f852bc8551cdfebbb166e286e8f50ec4d8ea3c97ac858eafe8da3b34bdbce7"
+    },
+    {
+      "id": "L0_GATE_UP",
+      "kind": "weight",
+      "layer": 0,
+      "op": "mlp_gate_up",
+      "dtype": "q3",
+      "shape": [22016, 4096],
+      "backend_layout": "generic",
+      "size": 101,
+      "checksum": "0b9314d3457505a80bbc40a3827d9a9f6d32ee7f9b7175c9cfb99da3eeae40d9"
+    },
+    {
+      "id": "L0_DOWN",
+      "kind": "weight",
+      "layer": 0,
+      "op": "mlp_down",
+      "dtype": "q4",
+      "shape": [4096, 11008],
+      "backend_layout": "generic",
+      "size": 89,
+      "checksum": "d0f0b564e247af2c099c0412126ae0a0eea62eed1318e720b2bd261a2029e631"
+    },
+    {
+      "id": "L1_QKV",
+      "kind": "weight",
+      "layer": 1,
+      "op": "attn_qkv",
+      "dtype": "q4",
+      "shape": [12288, 4096],
+      "backend_layout": "generic",
+      "size": 99,
+      "checksum": "ec2eab04159cca4d5069508a911e1ac8be11557cc2214f32f32769a8cc12df83"
+    },
+    {
+      "id": "L1_O",
+      "kind": "weight",
+      "layer": 1,
+      "op": "attn_out",
+      "dtype": "q4",
+      "shape": [4096, 4096],
+      "backend_layout": "generic",
+      "size": 94,
+      "checksum": "5606cab517e5559480a681b2cab1f15c921a6f5d05b8946344d7893806f67e2d"
+    },
+    {
+      "id": "L1_GATE_UP",
+      "kind": "weight",
+      "layer": 1,
+      "op": "mlp_gate_up",
+      "dtype": "q3",
+      "shape": [22016, 4096],
+      "backend_layout": "generic",
+      "size": 101,
+      "checksum": "98d5977ed569594ae2ba2695cdecb93e176a095ba81348327a1983f36412d67f"
+    },
+    {
+      "id": "L1_DOWN",
+      "kind": "weight",
+      "layer": 1,
+      "op": "mlp_down",
+      "dtype": "q4",
+      "shape": [4096, 11008],
+      "backend_layout": "generic",
+      "size": 89,
+      "checksum": "7da204e1e3752ec2107719e2ff0473b8fb5dec62bc860729ba30b6aff29461fe"
+    },
+    {
+      "id": "LM_HEAD",
+      "kind": "weight",
+      "op": "lm_head",
+      "dtype": "q6",
+      "shape": [4096, 32000],
+      "backend_layout": "generic",
+      "size": 92,
+      "checksum": "385ed00b494780ff91ffe465f2beff5bebfae080c9dad24db41e7694fb2b284e"
+    }
+  ],
+  "memory_plan": {
+    "scratch_bytes": 67108864,
+    "min_vram_bytes": 134217728,
+    "recommended_vram_bytes": 8589934592,
+    "kv_cache": {
+      "policy": "paged",
+      "recent_tokens_high_precision": 256,
+      "old_tokens_codec": "q4"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "kind": "isolated existing fused attention diagnostic",
+  "contexts": [
+    {
+      "context": 512,
+      "torch_ms": 0.05584959983825684,
+      "fused_ms": 0.03802880048751831,
+      "cosine": 0.9999825954437256,
+      "max_abs": 0.001953125
+    },
+    {
+      "context": 1024,
+      "torch_ms": 0.054854722023010255,
+      "fused_ms": 0.06746304035186768,
+      "cosine": 0.9999817609786987,
+      "max_abs": 0.00146484375
+    },
+    {
+      "context": 2048,
+      "torch_ms": 0.05612351894378662,
+      "fused_ms": 0.13358912467956544,
+      "cosine": 0.999985933303833,
+      "max_abs": 0.0009765625
+    },
+    {
+      "context": 4096,
+      "torch_ms": 0.0558892822265625,
+      "fused_ms": 0.2661536026000977,
+      "cosine": 0.9999827146530151,
+      "max_abs": 0.00048828125
+    }
+  ],
+  "decision": "reject",
+  "reason": "The fused kernel wins only in the isolated 512-token case, loses increasingly from 1024 through 4096, and the context-aware full-decode switch regressed the 1000-token loop by 1.65 percent."
+}

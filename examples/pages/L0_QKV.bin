@@ -1,0 +1,4 @@
+thin fake page L0_QKV
+semantic=layer 0 fused attention qkv
+layout=generic
+payload=not real weights

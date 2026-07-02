@@ -1,0 +1,27 @@
+loading HF stress reference
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/326 [00:00<?, ?it/s]Loading weights: 100%|██████████| 326/326 [00:00<00:00, 18159.81it/s]
+HF case hello
+HF case code
+HF case weird_control
+HF case multi_turn_chat
+HF case sampling_1
+HF case sampling_2
+HF case sampling_3
+loading ThinTensor mode hybrid_mlp_8_28
+Thin hybrid_mlp_8_28 case hello
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+Thin hybrid_mlp_8_28 case code
+Thin hybrid_mlp_8_28 case weird_control
+Thin hybrid_mlp_8_28 case multi_turn_chat
+Thin hybrid_mlp_8_28 case sampling_1
+Thin hybrid_mlp_8_28 case sampling_2
+Thin hybrid_mlp_8_28 case sampling_3
+loading ThinTensor mode hybrid_mlp_10_26
+Thin hybrid_mlp_10_26 case hello
+Thin hybrid_mlp_10_26 case code
+Thin hybrid_mlp_10_26 case weird_control
+Thin hybrid_mlp_10_26 case multi_turn_chat
+Thin hybrid_mlp_10_26 case sampling_1
+Thin hybrid_mlp_10_26 case sampling_2
+Thin hybrid_mlp_10_26 case sampling_3

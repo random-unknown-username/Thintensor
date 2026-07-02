@@ -1,0 +1,9 @@
+/target/
+/*.ttn
+/*.thin
+/examples/out/
+/SmolLM3-3B/
+/imp
+__pycache__/
+*.py[cod]
+*.safetensors

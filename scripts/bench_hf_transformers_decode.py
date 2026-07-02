@@ -1,0 +1,90 @@
+import argparse
+import json
+import time
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+@torch.inference_mode()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--steps", type=int, default=500)
+    ap.add_argument("--warmup-steps", type=int, default=10)
+    ap.add_argument("--prompt", default="Hello")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default="bf16")
+    args = ap.parse_args()
+
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[args.dtype]
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    load_t0 = time.perf_counter()
+
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=dtype,
+        device_map=args.device,
+        trust_remote_code=True,
+        attn_implementation="sdpa",
+    )
+    model.eval()
+
+    torch.cuda.synchronize()
+    load_s = time.perf_counter() - load_t0
+
+    input_ids = tok(args.prompt, return_tensors="pt").input_ids.to(args.device)
+
+    # Prefill prompt.
+    out = model(input_ids=input_ids, use_cache=True)
+    past = out.past_key_values
+    token = torch.argmax(out.logits[:, -1, :], dim=-1).view(1, 1)
+
+    # Warmup decode, GPU token stays GPU.
+    for _ in range(args.warmup_steps):
+        out = model(input_ids=token, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        token = torch.argmax(out.logits[:, -1, :], dim=-1).view(1, 1)
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    for _ in range(args.steps):
+        out = model(input_ids=token, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        token = torch.argmax(out.logits[:, -1, :], dim=-1).view(1, 1)
+
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    # After timing only.
+    final_token = int(token.item())
+
+    dt = t1 - t0
+    print(json.dumps({
+        "runtime": "hf_transformers",
+        "model": args.model,
+        "dtype": args.dtype,
+        "steps": args.steps,
+        "prompt": args.prompt,
+        "load_s": load_s,
+        "decode_s": dt,
+        "tokens_per_s": args.steps / dt,
+        "ms_per_token": 1000.0 * dt / args.steps,
+        "final_token": final_token,
+        "gpu_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+        "gpu_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        "note": "Custom greedy decode loop. No token .item() inside timed loop.",
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

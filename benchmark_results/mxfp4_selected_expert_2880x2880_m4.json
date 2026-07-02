@@ -1,0 +1,16 @@
+{
+  "block_m": 4,
+  "cols": 2880,
+  "cosine_similarity": 1.0,
+  "direct_packed_median_ms": 0.29177600145339966,
+  "effective_bandwidth_gb_s": 60.40798390615766,
+  "expand_then_matvec_median_ms": 8.422080039978027,
+  "experts": 32,
+  "max_abs_error": 0.0,
+  "mean_abs_error": 0.0,
+  "num_warps": 8,
+  "rows": 2880,
+  "selected_packed_bytes": 17625600,
+  "speedup": 28.86488264293779,
+  "top_k": 4
+}

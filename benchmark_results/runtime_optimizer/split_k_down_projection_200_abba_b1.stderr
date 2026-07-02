@@ -1,0 +1,12 @@
+In file included from /usr/include/python3.14/Python.h:14,
+                 from /tmp/tmpzbtf443f/__triton_launcher.c:7:
+/usr/include/python3.14/pyconfig.h:2007:9: warning: ‘_POSIX_C_SOURCE’ redefined
+ 2007 | #define _POSIX_C_SOURCE 200809L
+      |         ^~~~~~~~~~~~~~~
+In file included from /usr/include/bits/libc-header-start.h:33,
+                 from /usr/include/stdlib.h:26,
+                 from /home/satvik/.local/lib/python3.14/site-packages/triton/backends/nvidia/include/cuda.h:56,
+                 from /tmp/tmpzbtf443f/__triton_launcher.c:2:
+/usr/include/features.h:319:10: note: this is the location of the previous definition
+  319 | # define _POSIX_C_SOURCE        202405L
+      |          ^~~~~~~~~~~~~~~

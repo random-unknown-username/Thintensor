@@ -1,0 +1,11 @@
+full-logit comparison: HF BF16 reference
+Loading weights:   0%|          | 0/326 [00:00<?, ?it/s]Loading weights: 100%|██████████| 326/326 [00:00<00:00, 14101.55it/s]
+  HF hello
+full-logit comparison: thin_bf16
+  thin_bf16 hello
+full-logit comparison: thin_quality_8_28
+  thin_quality_8_28 hello
+full-logit comparison: thin_quality_10_26
+  thin_quality_10_26 hello
+full-logit comparison: llama.cpp Q8_0
+  llama.cpp Q8_0 hello

@@ -1,0 +1,894 @@
+{
+  "available_quant_kernels": [
+    "fp8_scaled_matvec",
+    "mxfp4_matvec"
+  ],
+  "cuda_capability": [
+    12,
+    0
+  ],
+  "current_native_executor_gaps": [],
+  "current_native_executor_ready": true,
+  "execution_plan": {
+    "descriptor": {
+      "activation": "silu",
+      "architecture_family": "decoder_dense",
+      "attention_bias": false,
+      "attention_kind": "gqa",
+      "attention_sinks": false,
+      "attention_variants": [
+        "causal_kv",
+        "current_only_smoke",
+        "sliding_causal_kv"
+      ],
+      "head_dim": 128,
+      "hidden_size": 2048,
+      "intermediate_size": 11008,
+      "layer_types": [
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention"
+      ],
+      "max_position_embeddings": 65536,
+      "mlp_bias": false,
+      "mlp_kind": "gated_dense",
+      "model_type": "smollm3",
+      "no_rope_layers": [
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false
+      ],
+      "num_attention_heads": 16,
+      "num_experts_per_token": 0,
+      "num_hidden_layers": 36,
+      "num_key_value_heads": 4,
+      "num_local_experts": 0,
+      "qkv_bias": false,
+      "quantization": {
+        "bits": null,
+        "group_size": null,
+        "method": "none",
+        "modules_to_not_convert": [],
+        "scale_dtype": null,
+        "source_config": {},
+        "storage_dtype": "bfloat16",
+        "zero_point": null
+      },
+      "required_operators": [
+        "embedding",
+        "rms_norm",
+        "qkv_projection",
+        "rope",
+        "gqa_attention",
+        "o_projection",
+        "lm_head",
+        "per_layer_attention_window",
+        "gated_activation",
+        "down_projection"
+      ],
+      "rms_norm_eps": 1e-06,
+      "rope_parameters": null,
+      "rope_scaling": null,
+      "rope_theta": 5000000.0,
+      "rope_variant": null,
+      "sliding_window": null,
+      "supported_precision_modes": [
+        "bf16",
+        "head8",
+        "down_fp8",
+        "gate_up_fp8",
+        "mlp_fp8",
+        "attn_proj_fp8"
+      ],
+      "swiglu_alpha": 1.702,
+      "swiglu_limit": null,
+      "tensor_naming_scheme": "hf_decoder_layers",
+      "tie_word_embeddings": true,
+      "vocab_size": 128256
+    },
+    "globals": {
+      "embed_tokens": "model.embed_tokens.weight",
+      "final_norm": "model.norm.weight"
+    },
+    "layers": [
+      {
+        "attention_window": null,
+        "layer": 0,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.0.mlp.down_proj.weight",
+          "gate_weight": "model.layers.0.mlp.gate_proj.weight",
+          "input_norm": "model.layers.0.input_layernorm.weight",
+          "k_weight": "model.layers.0.self_attn.k_proj.weight",
+          "o_weight": "model.layers.0.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.0.post_attention_layernorm.weight",
+          "q_weight": "model.layers.0.self_attn.q_proj.weight",
+          "up_weight": "model.layers.0.mlp.up_proj.weight",
+          "v_weight": "model.layers.0.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 1,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.1.mlp.down_proj.weight",
+          "gate_weight": "model.layers.1.mlp.gate_proj.weight",
+          "input_norm": "model.layers.1.input_layernorm.weight",
+          "k_weight": "model.layers.1.self_attn.k_proj.weight",
+          "o_weight": "model.layers.1.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.1.post_attention_layernorm.weight",
+          "q_weight": "model.layers.1.self_attn.q_proj.weight",
+          "up_weight": "model.layers.1.mlp.up_proj.weight",
+          "v_weight": "model.layers.1.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 2,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.2.mlp.down_proj.weight",
+          "gate_weight": "model.layers.2.mlp.gate_proj.weight",
+          "input_norm": "model.layers.2.input_layernorm.weight",
+          "k_weight": "model.layers.2.self_attn.k_proj.weight",
+          "o_weight": "model.layers.2.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.2.post_attention_layernorm.weight",
+          "q_weight": "model.layers.2.self_attn.q_proj.weight",
+          "up_weight": "model.layers.2.mlp.up_proj.weight",
+          "v_weight": "model.layers.2.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 3,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.3.mlp.down_proj.weight",
+          "gate_weight": "model.layers.3.mlp.gate_proj.weight",
+          "input_norm": "model.layers.3.input_layernorm.weight",
+          "k_weight": "model.layers.3.self_attn.k_proj.weight",
+          "o_weight": "model.layers.3.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.3.post_attention_layernorm.weight",
+          "q_weight": "model.layers.3.self_attn.q_proj.weight",
+          "up_weight": "model.layers.3.mlp.up_proj.weight",
+          "v_weight": "model.layers.3.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 4,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.4.mlp.down_proj.weight",
+          "gate_weight": "model.layers.4.mlp.gate_proj.weight",
+          "input_norm": "model.layers.4.input_layernorm.weight",
+          "k_weight": "model.layers.4.self_attn.k_proj.weight",
+          "o_weight": "model.layers.4.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.4.post_attention_layernorm.weight",
+          "q_weight": "model.layers.4.self_attn.q_proj.weight",
+          "up_weight": "model.layers.4.mlp.up_proj.weight",
+          "v_weight": "model.layers.4.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 5,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.5.mlp.down_proj.weight",
+          "gate_weight": "model.layers.5.mlp.gate_proj.weight",
+          "input_norm": "model.layers.5.input_layernorm.weight",
+          "k_weight": "model.layers.5.self_attn.k_proj.weight",
+          "o_weight": "model.layers.5.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.5.post_attention_layernorm.weight",
+          "q_weight": "model.layers.5.self_attn.q_proj.weight",
+          "up_weight": "model.layers.5.mlp.up_proj.weight",
+          "v_weight": "model.layers.5.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 6,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.6.mlp.down_proj.weight",
+          "gate_weight": "model.layers.6.mlp.gate_proj.weight",
+          "input_norm": "model.layers.6.input_layernorm.weight",
+          "k_weight": "model.layers.6.self_attn.k_proj.weight",
+          "o_weight": "model.layers.6.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.6.post_attention_layernorm.weight",
+          "q_weight": "model.layers.6.self_attn.q_proj.weight",
+          "up_weight": "model.layers.6.mlp.up_proj.weight",
+          "v_weight": "model.layers.6.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 7,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.7.mlp.down_proj.weight",
+          "gate_weight": "model.layers.7.mlp.gate_proj.weight",
+          "input_norm": "model.layers.7.input_layernorm.weight",
+          "k_weight": "model.layers.7.self_attn.k_proj.weight",
+          "o_weight": "model.layers.7.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.7.post_attention_layernorm.weight",
+          "q_weight": "model.layers.7.self_attn.q_proj.weight",
+          "up_weight": "model.layers.7.mlp.up_proj.weight",
+          "v_weight": "model.layers.7.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 8,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.8.mlp.down_proj.weight",
+          "gate_weight": "model.layers.8.mlp.gate_proj.weight",
+          "input_norm": "model.layers.8.input_layernorm.weight",
+          "k_weight": "model.layers.8.self_attn.k_proj.weight",
+          "o_weight": "model.layers.8.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.8.post_attention_layernorm.weight",
+          "q_weight": "model.layers.8.self_attn.q_proj.weight",
+          "up_weight": "model.layers.8.mlp.up_proj.weight",
+          "v_weight": "model.layers.8.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 9,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.9.mlp.down_proj.weight",
+          "gate_weight": "model.layers.9.mlp.gate_proj.weight",
+          "input_norm": "model.layers.9.input_layernorm.weight",
+          "k_weight": "model.layers.9.self_attn.k_proj.weight",
+          "o_weight": "model.layers.9.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.9.post_attention_layernorm.weight",
+          "q_weight": "model.layers.9.self_attn.q_proj.weight",
+          "up_weight": "model.layers.9.mlp.up_proj.weight",
+          "v_weight": "model.layers.9.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 10,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.10.mlp.down_proj.weight",
+          "gate_weight": "model.layers.10.mlp.gate_proj.weight",
+          "input_norm": "model.layers.10.input_layernorm.weight",
+          "k_weight": "model.layers.10.self_attn.k_proj.weight",
+          "o_weight": "model.layers.10.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.10.post_attention_layernorm.weight",
+          "q_weight": "model.layers.10.self_attn.q_proj.weight",
+          "up_weight": "model.layers.10.mlp.up_proj.weight",
+          "v_weight": "model.layers.10.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 11,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.11.mlp.down_proj.weight",
+          "gate_weight": "model.layers.11.mlp.gate_proj.weight",
+          "input_norm": "model.layers.11.input_layernorm.weight",
+          "k_weight": "model.layers.11.self_attn.k_proj.weight",
+          "o_weight": "model.layers.11.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.11.post_attention_layernorm.weight",
+          "q_weight": "model.layers.11.self_attn.q_proj.weight",
+          "up_weight": "model.layers.11.mlp.up_proj.weight",
+          "v_weight": "model.layers.11.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 12,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.12.mlp.down_proj.weight",
+          "gate_weight": "model.layers.12.mlp.gate_proj.weight",
+          "input_norm": "model.layers.12.input_layernorm.weight",
+          "k_weight": "model.layers.12.self_attn.k_proj.weight",
+          "o_weight": "model.layers.12.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.12.post_attention_layernorm.weight",
+          "q_weight": "model.layers.12.self_attn.q_proj.weight",
+          "up_weight": "model.layers.12.mlp.up_proj.weight",
+          "v_weight": "model.layers.12.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 13,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.13.mlp.down_proj.weight",
+          "gate_weight": "model.layers.13.mlp.gate_proj.weight",
+          "input_norm": "model.layers.13.input_layernorm.weight",
+          "k_weight": "model.layers.13.self_attn.k_proj.weight",
+          "o_weight": "model.layers.13.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.13.post_attention_layernorm.weight",
+          "q_weight": "model.layers.13.self_attn.q_proj.weight",
+          "up_weight": "model.layers.13.mlp.up_proj.weight",
+          "v_weight": "model.layers.13.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 14,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.14.mlp.down_proj.weight",
+          "gate_weight": "model.layers.14.mlp.gate_proj.weight",
+          "input_norm": "model.layers.14.input_layernorm.weight",
+          "k_weight": "model.layers.14.self_attn.k_proj.weight",
+          "o_weight": "model.layers.14.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.14.post_attention_layernorm.weight",
+          "q_weight": "model.layers.14.self_attn.q_proj.weight",
+          "up_weight": "model.layers.14.mlp.up_proj.weight",
+          "v_weight": "model.layers.14.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 15,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.15.mlp.down_proj.weight",
+          "gate_weight": "model.layers.15.mlp.gate_proj.weight",
+          "input_norm": "model.layers.15.input_layernorm.weight",
+          "k_weight": "model.layers.15.self_attn.k_proj.weight",
+          "o_weight": "model.layers.15.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.15.post_attention_layernorm.weight",
+          "q_weight": "model.layers.15.self_attn.q_proj.weight",
+          "up_weight": "model.layers.15.mlp.up_proj.weight",
+          "v_weight": "model.layers.15.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 16,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.16.mlp.down_proj.weight",
+          "gate_weight": "model.layers.16.mlp.gate_proj.weight",
+          "input_norm": "model.layers.16.input_layernorm.weight",
+          "k_weight": "model.layers.16.self_attn.k_proj.weight",
+          "o_weight": "model.layers.16.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.16.post_attention_layernorm.weight",
+          "q_weight": "model.layers.16.self_attn.q_proj.weight",
+          "up_weight": "model.layers.16.mlp.up_proj.weight",
+          "v_weight": "model.layers.16.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 17,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.17.mlp.down_proj.weight",
+          "gate_weight": "model.layers.17.mlp.gate_proj.weight",
+          "input_norm": "model.layers.17.input_layernorm.weight",
+          "k_weight": "model.layers.17.self_attn.k_proj.weight",
+          "o_weight": "model.layers.17.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.17.post_attention_layernorm.weight",
+          "q_weight": "model.layers.17.self_attn.q_proj.weight",
+          "up_weight": "model.layers.17.mlp.up_proj.weight",
+          "v_weight": "model.layers.17.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 18,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.18.mlp.down_proj.weight",
+          "gate_weight": "model.layers.18.mlp.gate_proj.weight",
+          "input_norm": "model.layers.18.input_layernorm.weight",
+          "k_weight": "model.layers.18.self_attn.k_proj.weight",
+          "o_weight": "model.layers.18.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.18.post_attention_layernorm.weight",
+          "q_weight": "model.layers.18.self_attn.q_proj.weight",
+          "up_weight": "model.layers.18.mlp.up_proj.weight",
+          "v_weight": "model.layers.18.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 19,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.19.mlp.down_proj.weight",
+          "gate_weight": "model.layers.19.mlp.gate_proj.weight",
+          "input_norm": "model.layers.19.input_layernorm.weight",
+          "k_weight": "model.layers.19.self_attn.k_proj.weight",
+          "o_weight": "model.layers.19.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.19.post_attention_layernorm.weight",
+          "q_weight": "model.layers.19.self_attn.q_proj.weight",
+          "up_weight": "model.layers.19.mlp.up_proj.weight",
+          "v_weight": "model.layers.19.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 20,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.20.mlp.down_proj.weight",
+          "gate_weight": "model.layers.20.mlp.gate_proj.weight",
+          "input_norm": "model.layers.20.input_layernorm.weight",
+          "k_weight": "model.layers.20.self_attn.k_proj.weight",
+          "o_weight": "model.layers.20.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.20.post_attention_layernorm.weight",
+          "q_weight": "model.layers.20.self_attn.q_proj.weight",
+          "up_weight": "model.layers.20.mlp.up_proj.weight",
+          "v_weight": "model.layers.20.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 21,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.21.mlp.down_proj.weight",
+          "gate_weight": "model.layers.21.mlp.gate_proj.weight",
+          "input_norm": "model.layers.21.input_layernorm.weight",
+          "k_weight": "model.layers.21.self_attn.k_proj.weight",
+          "o_weight": "model.layers.21.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.21.post_attention_layernorm.weight",
+          "q_weight": "model.layers.21.self_attn.q_proj.weight",
+          "up_weight": "model.layers.21.mlp.up_proj.weight",
+          "v_weight": "model.layers.21.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 22,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.22.mlp.down_proj.weight",
+          "gate_weight": "model.layers.22.mlp.gate_proj.weight",
+          "input_norm": "model.layers.22.input_layernorm.weight",
+          "k_weight": "model.layers.22.self_attn.k_proj.weight",
+          "o_weight": "model.layers.22.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.22.post_attention_layernorm.weight",
+          "q_weight": "model.layers.22.self_attn.q_proj.weight",
+          "up_weight": "model.layers.22.mlp.up_proj.weight",
+          "v_weight": "model.layers.22.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 23,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.23.mlp.down_proj.weight",
+          "gate_weight": "model.layers.23.mlp.gate_proj.weight",
+          "input_norm": "model.layers.23.input_layernorm.weight",
+          "k_weight": "model.layers.23.self_attn.k_proj.weight",
+          "o_weight": "model.layers.23.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.23.post_attention_layernorm.weight",
+          "q_weight": "model.layers.23.self_attn.q_proj.weight",
+          "up_weight": "model.layers.23.mlp.up_proj.weight",
+          "v_weight": "model.layers.23.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 24,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.24.mlp.down_proj.weight",
+          "gate_weight": "model.layers.24.mlp.gate_proj.weight",
+          "input_norm": "model.layers.24.input_layernorm.weight",
+          "k_weight": "model.layers.24.self_attn.k_proj.weight",
+          "o_weight": "model.layers.24.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.24.post_attention_layernorm.weight",
+          "q_weight": "model.layers.24.self_attn.q_proj.weight",
+          "up_weight": "model.layers.24.mlp.up_proj.weight",
+          "v_weight": "model.layers.24.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 25,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.25.mlp.down_proj.weight",
+          "gate_weight": "model.layers.25.mlp.gate_proj.weight",
+          "input_norm": "model.layers.25.input_layernorm.weight",
+          "k_weight": "model.layers.25.self_attn.k_proj.weight",
+          "o_weight": "model.layers.25.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.25.post_attention_layernorm.weight",
+          "q_weight": "model.layers.25.self_attn.q_proj.weight",
+          "up_weight": "model.layers.25.mlp.up_proj.weight",
+          "v_weight": "model.layers.25.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 26,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.26.mlp.down_proj.weight",
+          "gate_weight": "model.layers.26.mlp.gate_proj.weight",
+          "input_norm": "model.layers.26.input_layernorm.weight",
+          "k_weight": "model.layers.26.self_attn.k_proj.weight",
+          "o_weight": "model.layers.26.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.26.post_attention_layernorm.weight",
+          "q_weight": "model.layers.26.self_attn.q_proj.weight",
+          "up_weight": "model.layers.26.mlp.up_proj.weight",
+          "v_weight": "model.layers.26.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 27,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.27.mlp.down_proj.weight",
+          "gate_weight": "model.layers.27.mlp.gate_proj.weight",
+          "input_norm": "model.layers.27.input_layernorm.weight",
+          "k_weight": "model.layers.27.self_attn.k_proj.weight",
+          "o_weight": "model.layers.27.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.27.post_attention_layernorm.weight",
+          "q_weight": "model.layers.27.self_attn.q_proj.weight",
+          "up_weight": "model.layers.27.mlp.up_proj.weight",
+          "v_weight": "model.layers.27.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 28,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.28.mlp.down_proj.weight",
+          "gate_weight": "model.layers.28.mlp.gate_proj.weight",
+          "input_norm": "model.layers.28.input_layernorm.weight",
+          "k_weight": "model.layers.28.self_attn.k_proj.weight",
+          "o_weight": "model.layers.28.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.28.post_attention_layernorm.weight",
+          "q_weight": "model.layers.28.self_attn.q_proj.weight",
+          "up_weight": "model.layers.28.mlp.up_proj.weight",
+          "v_weight": "model.layers.28.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 29,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.29.mlp.down_proj.weight",
+          "gate_weight": "model.layers.29.mlp.gate_proj.weight",
+          "input_norm": "model.layers.29.input_layernorm.weight",
+          "k_weight": "model.layers.29.self_attn.k_proj.weight",
+          "o_weight": "model.layers.29.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.29.post_attention_layernorm.weight",
+          "q_weight": "model.layers.29.self_attn.q_proj.weight",
+          "up_weight": "model.layers.29.mlp.up_proj.weight",
+          "v_weight": "model.layers.29.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 30,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.30.mlp.down_proj.weight",
+          "gate_weight": "model.layers.30.mlp.gate_proj.weight",
+          "input_norm": "model.layers.30.input_layernorm.weight",
+          "k_weight": "model.layers.30.self_attn.k_proj.weight",
+          "o_weight": "model.layers.30.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.30.post_attention_layernorm.weight",
+          "q_weight": "model.layers.30.self_attn.q_proj.weight",
+          "up_weight": "model.layers.30.mlp.up_proj.weight",
+          "v_weight": "model.layers.30.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 31,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.31.mlp.down_proj.weight",
+          "gate_weight": "model.layers.31.mlp.gate_proj.weight",
+          "input_norm": "model.layers.31.input_layernorm.weight",
+          "k_weight": "model.layers.31.self_attn.k_proj.weight",
+          "o_weight": "model.layers.31.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.31.post_attention_layernorm.weight",
+          "q_weight": "model.layers.31.self_attn.q_proj.weight",
+          "up_weight": "model.layers.31.mlp.up_proj.weight",
+          "v_weight": "model.layers.31.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 32,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.32.mlp.down_proj.weight",
+          "gate_weight": "model.layers.32.mlp.gate_proj.weight",
+          "input_norm": "model.layers.32.input_layernorm.weight",
+          "k_weight": "model.layers.32.self_attn.k_proj.weight",
+          "o_weight": "model.layers.32.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.32.post_attention_layernorm.weight",
+          "q_weight": "model.layers.32.self_attn.q_proj.weight",
+          "up_weight": "model.layers.32.mlp.up_proj.weight",
+          "v_weight": "model.layers.32.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 33,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.33.mlp.down_proj.weight",
+          "gate_weight": "model.layers.33.mlp.gate_proj.weight",
+          "input_norm": "model.layers.33.input_layernorm.weight",
+          "k_weight": "model.layers.33.self_attn.k_proj.weight",
+          "o_weight": "model.layers.33.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.33.post_attention_layernorm.weight",
+          "q_weight": "model.layers.33.self_attn.q_proj.weight",
+          "up_weight": "model.layers.33.mlp.up_proj.weight",
+          "v_weight": "model.layers.33.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 34,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.34.mlp.down_proj.weight",
+          "gate_weight": "model.layers.34.mlp.gate_proj.weight",
+          "input_norm": "model.layers.34.input_layernorm.weight",
+          "k_weight": "model.layers.34.self_attn.k_proj.weight",
+          "o_weight": "model.layers.34.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.34.post_attention_layernorm.weight",
+          "q_weight": "model.layers.34.self_attn.q_proj.weight",
+          "up_weight": "model.layers.34.mlp.up_proj.weight",
+          "v_weight": "model.layers.34.self_attn.v_proj.weight"
+        }
+      },
+      {
+        "attention_window": null,
+        "layer": 35,
+        "missing_required_roles": [],
+        "optional_tensors": {},
+        "schema": "separate_qkv_gated_dense",
+        "tensors": {
+          "down_weight": "model.layers.35.mlp.down_proj.weight",
+          "gate_weight": "model.layers.35.mlp.gate_proj.weight",
+          "input_norm": "model.layers.35.input_layernorm.weight",
+          "k_weight": "model.layers.35.self_attn.k_proj.weight",
+          "o_weight": "model.layers.35.self_attn.o_proj.weight",
+          "post_attention_norm": "model.layers.35.post_attention_layernorm.weight",
+          "q_weight": "model.layers.35.self_attn.q_proj.weight",
+          "up_weight": "model.layers.35.mlp.up_proj.weight",
+          "v_weight": "model.layers.35.self_attn.v_proj.weight"
+        }
+      }
+    ],
+    "optimization_candidates": [
+      "shape_autotune",
+      "role_aware_matvec",
+      "lm_head_backend_autotune",
+      "causal_kv_layout",
+      "separate_quantized_execution_head",
+      "layer_window_aware_kv",
+      "gate_up_multi_matvec",
+      "selective_mlp_precision"
+    ],
+    "quantization": {
+      "compute_dtype": "bf16",
+      "exact_storage_preserved": true,
+      "kernel_family": "bf16_matvec",
+      "reason": "unquantized source uses the BF16 reference path",
+      "requested": "auto",
+      "requires_requantization": false,
+      "source": {
+        "bits": null,
+        "group_size": null,
+        "method": "none",
+        "modules_to_not_convert": [],
+        "scale_dtype": null,
+        "source_config": {},
+        "storage_dtype": "bfloat16",
+        "zero_point": null
+      },
+      "storage_action": "preserve",
+      "supported": true
+    },
+    "schema": "separate_qkv_gated_dense",
+    "supported": true,
+    "unsupported_reasons": []
+  },
+  "performance_contract": {
+    "candidate_optimizations": [
+      "shape_autotune",
+      "role_aware_matvec",
+      "lm_head_backend_autotune",
+      "causal_kv_layout",
+      "separate_quantized_execution_head",
+      "layer_window_aware_kv",
+      "gate_up_multi_matvec",
+      "selective_mlp_precision"
+    ],
+    "claim_rule": "claim 30% only after correctness-gated real decode beats the same-model same-precision baseline",
+    "minimum_claimed_speedup": 0.0,
+    "target_speedup": 0.3
+  },
+  "precision_ladder": [
+    {
+      "conversion": "none",
+      "mode": "bf16",
+      "note": "reference execution precision",
+      "safety": "safe_default"
+    },
+    {
+      "conversion": "scaled_quantization",
+      "mode": "fp8",
+      "note": "use only on selected tensor roles after correctness testing",
+      "safety": "opt_in_validate"
+    },
+    {
+      "conversion": "quantize_to_q8",
+      "mode": "q8",
+      "note": "requires a native packed kernel and model validation",
+      "safety": "experimental_validate"
+    },
+    {
+      "conversion": "quantize_to_q4",
+      "mode": "q4",
+      "note": "requires a native packed kernel and model validation",
+      "safety": "experimental_validate"
+    },
+    {
+      "conversion": "quantize_to_q2",
+      "mode": "q2",
+      "note": "requires a native packed kernel and model validation",
+      "safety": "experimental_validate"
+    }
+  ],
+  "schema_plan_compiles": true,
+  "schema_plan_errors": [],
+  "source": "SmolLM3-3B",
+  "tensor_count": 326
+}

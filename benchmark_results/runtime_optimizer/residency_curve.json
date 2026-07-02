@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "archive": "SmolLM3-3B.thin",
+  "dtype": "bf16",
+  "steps": 10,
+  "warmup_steps": 2,
+  "attention_mode": "causal_kv",
+  "correctness": {
+    "criterion": "identical reported BF16 top-5 token IDs and logits versus all-resident",
+    "all_equal": true,
+    "reference_top_logits": [
+      {
+        "logit": 37.5,
+        "token_id": 25
+      },
+      {
+        "logit": 24.875,
+        "token_id": 1473
+      },
+      {
+        "logit": 23.625,
+        "token_id": 49131
+      },
+      {
+        "logit": 23.5,
+        "token_id": 512
+      },
+      {
+        "logit": 23.125,
+        "token_id": 31074
+      }
+    ]
+  },
+  "curve": [
+    {
+      "budget": "1GB",
+      "residency": "stream",
+      "steady_tokens_per_s": 2.6238478993864938,
+      "ms_per_token": 381.383056640625,
+      "gpu_resident_weight_bytes": 681586688,
+      "cpu_resident_weight_bytes": 6150197248,
+      "h2d_bytes_per_token": 5499591773.090909,
+      "prefetch_overlap_efficiency": 0.0053391053391053395,
+      "gpu_peak_allocated_bytes": 1016142848,
+      "gpu_peak_reserved_bytes": 6769606656,
+      "budget_resident_layers": [
+        0
+      ]
+    },
+    {
+      "budget": "2GB",
+      "residency": "stream",
+      "steady_tokens_per_s": 3.146481712424703,
+      "ms_per_token": 318.4053466796875,
+      "gpu_resident_weight_bytes": 1619062784,
+      "cpu_resident_weight_bytes": 6150197248,
+      "h2d_bytes_per_token": 4604728226.909091,
+      "prefetch_overlap_efficiency": 0.0013932427725531174,
+      "gpu_peak_allocated_bytes": 1972493312,
+      "gpu_peak_reserved_bytes": 6769606656,
+      "budget_resident_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "budget": "4GB",
+      "residency": "stream",
+      "steady_tokens_per_s": 5.657610401261344,
+      "ms_per_token": 177.8002197265625,
+      "gpu_resident_weight_bytes": 3650260992,
+      "cpu_resident_weight_bytes": 6150197248,
+      "h2d_bytes_per_token": 2665857210.181818,
+      "prefetch_overlap_efficiency": 0.005366161616161616,
+      "gpu_peak_allocated_bytes": 4044585984,
+      "gpu_peak_reserved_bytes": 6769606656,
+      "budget_resident_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ]
+    },
+    {
+      "budget": "6GB",
+      "residency": "stream",
+      "steady_tokens_per_s": 28.138578194460077,
+      "ms_per_token": 37.123678588867186,
+      "gpu_resident_weight_bytes": 5681459200,
+      "cpu_resident_weight_bytes": 6150197248,
+      "h2d_bytes_per_token": 726986193.4545455,
+      "prefetch_overlap_efficiency": 0.037037037037037035,
+      "gpu_peak_allocated_bytes": 6116678656,
+      "gpu_peak_reserved_bytes": 6748635136,
+      "budget_resident_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32
+      ]
+    },
+    {
+      "budget": "all",
+      "residency": "all",
+      "steady_tokens_per_s": 45.34697282687652,
+      "ms_per_token": 22.212051391601562,
+      "gpu_resident_weight_bytes": 6150197248,
+      "cpu_resident_weight_bytes": 0,
+      "h2d_bytes_per_token": 0,
+      "prefetch_overlap_efficiency": 0,
+      "gpu_peak_allocated_bytes": 6276070400,
+      "gpu_peak_reserved_bytes": 6289358848,
+      "budget_resident_layers": []
+    }
+  ]
+}

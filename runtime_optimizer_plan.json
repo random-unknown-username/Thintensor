@@ -1,0 +1,73 @@
+{
+  "archive": "SmolLM3-3B.thin",
+  "hf_model": "SmolLM3-3B",
+  "device": "cuda",
+  "dtype": "bf16",
+  "residency": "all",
+  "kernel_backend": "triton",
+  "warmup_steps": 10,
+  "benchmark_steps": [
+    200,
+    500
+  ],
+  "balanced_abba": true,
+  "minimum_speedup": 0.02,
+  "cosine_tolerance": 0.0005,
+  "top5_tolerance": 0.0,
+  "distribution_tolerance": 0.001,
+  "common_benchmark_args": [
+    "--gate-up-fp8",
+    "--down-proj-fp8",
+    "--down-fp8-layers",
+    "8:28"
+  ],
+  "common_correctness_args": [
+    "--gate-up-fp8",
+    "--down-proj-fp8",
+    "--down-fp8-layers",
+    "8:28"
+  ],
+  "stress_mode": "quality_8_28",
+  "baseline": {
+    "name": "quality_baseline",
+    "hypothesis": "Locked retained quality profile",
+    "implementation_summary": "Existing gate/up FP8 plus down-projection FP8 in layers 8:28",
+    "expected_bottleneck": "Reference point",
+    "enabled_by_default": false
+  },
+  "candidates": [
+    {
+      "name": "lm_head_fp8_shortlist_bf16_verify",
+      "hypothesis": "Reading an FP8 execution head and recomputing only shortlisted logits in BF16 can halve the dominant LM-head weight traffic without changing public logits or final candidate math",
+      "implementation_summary": "Use row-scaled FP8 only to shortlist 64 vocabulary IDs, recompute those rows from the resident tied BF16 head, and preserve BF16 argmax tie-breaking",
+      "expected_bottleneck": "BF16 LM-head weight bandwidth",
+      "benchmark_args": [
+        "--lm-head-fp8",
+        "--keep-bf16-lm-head",
+        "--lm-head-topk-guard",
+        "64"
+      ],
+      "correctness_args": [
+        "--lm-head-fp8",
+        "--lm-head-topk-guard",
+        "64"
+      ],
+      "stress_mode": "quality_8_28_head8_topk_guard",
+      "enabled_by_default": false
+    },
+    {
+      "name": "split_k_down_projection",
+      "hypothesis": "Two exact column partitions provide enough CTAs to saturate the low-row down-projection GEMV",
+      "implementation_summary": "Compute two FP32 partial sums per output row and reduce them into the existing BF16 output",
+      "expected_bottleneck": "BF16 and scaled-FP8 down-projection bandwidth",
+      "benchmark_args": [
+        "--split-k-down-proj"
+      ],
+      "correctness_args": [
+        "--split-k-down-proj"
+      ],
+      "stress_mode": "quality_8_28_head8_topk_guard_split_k",
+      "enabled_by_default": false
+    }
+  ]
+}

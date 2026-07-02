@@ -1,0 +1,751 @@
+{
+  "acceptance": {
+    "attention_equivalent": true,
+    "exact_minimum_cosine_similarity": 0.999,
+    "minimum_generated_token_match_rate": 0.8,
+    "minimum_top5_overlap": 0.8,
+    "short_generation_mostly_matches": true,
+    "strict_cosine_all_records": false,
+    "top1_same_all_records": true,
+    "top5_overlap_high_all_records": true
+  },
+  "archive": "SmolLM3-3B.thin",
+  "attention_equivalent": true,
+  "attn_proj_fp8": false,
+  "config_mismatches": [],
+  "correctness_tier": "ranking_pass",
+  "down_fp8_layers": "all",
+  "down_proj_fp8": false,
+  "dtype": "bf16",
+  "exact_hf_mode": false,
+  "fp8_layers": "all",
+  "gate_up_fp8": false,
+  "hf_config_summary": {
+    "attention_bias": false,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 2048,
+    "intermediate_size": 11008,
+    "max_position_embeddings": 65536,
+    "model_type": "smollm3",
+    "no_rope_layers": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ],
+    "num_attention_heads": 16,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 4,
+    "qkv_bias": false,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": null,
+    "rope_theta": 5000000.0,
+    "rope_variant": "smollm3_selective_rope",
+    "sliding_window": null,
+    "tie_word_embeddings": true,
+    "torch_dtype": "bfloat16",
+    "use_sliding_window": false
+  },
+  "hf_descriptor": {
+    "activation": "silu",
+    "attention_variants": [
+      "causal_kv",
+      "current_only_smoke"
+    ],
+    "head_dim": 128,
+    "hidden_size": 2048,
+    "intermediate_size": 11008,
+    "model_type": "smollm3",
+    "no_rope_layers": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ],
+    "num_attention_heads": 16,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 4,
+    "qkv_bias": false,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": null,
+    "rope_theta": 5000000.0,
+    "supported_precision_modes": [
+      "bf16",
+      "head8",
+      "down_fp8",
+      "gate_up_fp8",
+      "mlp_fp8"
+    ],
+    "tensor_naming_scheme": "hf_decoder_layers",
+    "tie_word_embeddings": true,
+    "vocab_size": 128256
+  },
+  "hf_equivalent": false,
+  "hf_reference_mode": "full_recompute_causal",
+  "lm_head_fp8": false,
+  "mlp_fp8": true,
+  "model_name": "SmolLM3-3B",
+  "o_proj_fp8": true,
+  "prompt": "Hello",
+  "qkv_fp8": false,
+  "quantized_experimental": true,
+  "ranking_equivalent": true,
+  "records": [
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.9759092330932617,
+      "decode_step": 1,
+      "generated_hf_tokens": [
+        9125
+      ],
+      "generated_thin_tokens": [
+        9125
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 34.0,
+          "token_id": 9125
+        },
+        {
+          "logit": 21.25,
+          "token_id": 46654
+        },
+        {
+          "logit": 20.0,
+          "token_id": 2374
+        },
+        {
+          "logit": 19.875,
+          "token_id": 744
+        },
+        {
+          "logit": 19.0,
+          "token_id": 1887
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 2048,
+      "kv_tokens_attended": 1,
+      "max_abs_logit_error": 5.875,
+      "mean_abs_logit_error": 0.5250269174575806,
+      "model_name": "SmolLM3-3B",
+      "not_hf_equivalent": false,
+      "prefill_length": 1,
+      "prompt": "Hello",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 28.125,
+          "token_id": 9125
+        },
+        {
+          "logit": 18.625,
+          "token_id": 46654
+        },
+        {
+          "logit": 17.75,
+          "token_id": 2374
+        },
+        {
+          "logit": 16.875,
+          "token_id": 744
+        },
+        {
+          "logit": 15.375,
+          "token_id": 1887
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.9996538758277893,
+      "decode_step": 10,
+      "generated_hf_tokens": [
+        9125,
+        198,
+        567,
+        34689,
+        271,
+        81434,
+        356,
+        28540,
+        2696,
+        25
+      ],
+      "generated_thin_tokens": [
+        9125,
+        198,
+        567,
+        34689,
+        271,
+        81434,
+        356,
+        28540,
+        2696,
+        25
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 37.5,
+          "token_id": 25
+        },
+        {
+          "logit": 26.25,
+          "token_id": 1473
+        },
+        {
+          "logit": 25.125,
+          "token_id": 512
+        },
+        {
+          "logit": 23.375,
+          "token_id": 31074
+        },
+        {
+          "logit": 23.0,
+          "token_id": 49131
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 20480,
+      "kv_tokens_attended": 10,
+      "max_abs_logit_error": 1.390625,
+      "mean_abs_logit_error": 0.29988422989845276,
+      "model_name": "SmolLM3-3B",
+      "not_hf_equivalent": false,
+      "prefill_length": 1,
+      "prompt": "Hello",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 38.25,
+          "token_id": 25
+        },
+        {
+          "logit": 26.25,
+          "token_id": 1473
+        },
+        {
+          "logit": 25.5,
+          "token_id": 512
+        },
+        {
+          "logit": 23.125,
+          "token_id": 49131
+        },
+        {
+          "logit": 22.75,
+          "token_id": 31074
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.9709612131118774,
+      "decode_step": 1,
+      "generated_hf_tokens": [
+        9125
+      ],
+      "generated_thin_tokens": [
+        9125
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 34.5,
+          "token_id": 9125
+        },
+        {
+          "logit": 21.375,
+          "token_id": 46654
+        },
+        {
+          "logit": 20.125,
+          "token_id": 2374
+        },
+        {
+          "logit": 20.0,
+          "token_id": 744
+        },
+        {
+          "logit": 19.25,
+          "token_id": 1887
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 16384,
+      "kv_tokens_attended": 8,
+      "max_abs_logit_error": 6.375,
+      "mean_abs_logit_error": 0.5777783989906311,
+      "model_name": "SmolLM3-3B",
+      "not_hf_equivalent": false,
+      "prefill_length": 8,
+      "prompt": "Hello",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 28.125,
+          "token_id": 9125
+        },
+        {
+          "logit": 18.625,
+          "token_id": 46654
+        },
+        {
+          "logit": 17.75,
+          "token_id": 2374
+        },
+        {
+          "logit": 17.0,
+          "token_id": 744
+        },
+        {
+          "logit": 15.375,
+          "token_id": 1887
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.9977624416351318,
+      "decode_step": 10,
+      "generated_hf_tokens": [
+        9125,
+        198,
+        567,
+        744,
+        8245,
+        198,
+        14711,
+        10293,
+        198,
+        13466
+      ],
+      "generated_thin_tokens": [
+        9125,
+        198,
+        567,
+        744,
+        8245,
+        198,
+        14711,
+        10293,
+        198,
+        13466
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 20.25,
+          "token_id": 13466
+        },
+        {
+          "logit": 19.75,
+          "token_id": 47424
+        },
+        {
+          "logit": 19.375,
+          "token_id": 76752
+        },
+        {
+          "logit": 19.0,
+          "token_id": 13068
+        },
+        {
+          "logit": 18.5,
+          "token_id": 35
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 34816,
+      "kv_tokens_attended": 17,
+      "max_abs_logit_error": 1.328125,
+      "mean_abs_logit_error": 0.24830955266952515,
+      "model_name": "SmolLM3-3B",
+      "not_hf_equivalent": false,
+      "prefill_length": 8,
+      "prompt": "Hello",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 19.75,
+          "token_id": 13466
+        },
+        {
+          "logit": 19.375,
+          "token_id": 47424
+        },
+        {
+          "logit": 19.25,
+          "token_id": 76752
+        },
+        {
+          "logit": 18.5,
+          "token_id": 13068
+        },
+        {
+          "logit": 18.375,
+          "token_id": 35
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.9757336378097534,
+      "decode_step": 1,
+      "generated_hf_tokens": [
+        9125
+      ],
+      "generated_thin_tokens": [
+        9125
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 34.0,
+          "token_id": 9125
+        },
+        {
+          "logit": 21.25,
+          "token_id": 46654
+        },
+        {
+          "logit": 20.0,
+          "token_id": 2374
+        },
+        {
+          "logit": 19.875,
+          "token_id": 744
+        },
+        {
+          "logit": 19.0,
+          "token_id": 1887
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 262144,
+      "kv_tokens_attended": 128,
+      "max_abs_logit_error": 5.875,
+      "mean_abs_logit_error": 0.5264200568199158,
+      "model_name": "SmolLM3-3B",
+      "not_hf_equivalent": false,
+      "prefill_length": 128,
+      "prompt": "Hello",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 28.125,
+          "token_id": 9125
+        },
+        {
+          "logit": 18.625,
+          "token_id": 46654
+        },
+        {
+          "logit": 17.75,
+          "token_id": 2374
+        },
+        {
+          "logit": 17.0,
+          "token_id": 744
+        },
+        {
+          "logit": 15.375,
+          "token_id": 1887
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.995895504951477,
+      "decode_step": 10,
+      "generated_hf_tokens": [
+        9125,
+        198,
+        11,
+        279,
+        1887,
+        374,
+        1523,
+        11,
+        719,
+        433
+      ],
+      "generated_thin_tokens": [
+        9125,
+        198,
+        11,
+        279,
+        1887,
+        374,
+        1523,
+        11,
+        719,
+        433
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 22.625,
+          "token_id": 433
+        },
+        {
+          "logit": 22.375,
+          "token_id": 279
+        },
+        {
+          "logit": 22.125,
+          "token_id": 358
+        },
+        {
+          "logit": 20.875,
+          "token_id": 584
+        },
+        {
+          "logit": 20.875,
+          "token_id": 539
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 280576,
+      "kv_tokens_attended": 137,
+      "max_abs_logit_error": 1.78125,
+      "mean_abs_logit_error": 0.58384770154953,
+      "model_name": "SmolLM3-3B",
+      "not_hf_equivalent": false,
+      "prefill_length": 128,
+      "prompt": "Hello",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 23.0,
+          "token_id": 433
+        },
+        {
+          "logit": 22.75,
+          "token_id": 279
+        },
+        {
+          "logit": 22.625,
+          "token_id": 358
+        },
+        {
+          "logit": 21.375,
+          "token_id": 539
+        },
+        {
+          "logit": 21.125,
+          "token_id": 584
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_overlap": 1.0
+    }
+  ],
+  "thin_config_summary": {
+    "attention_bias": false,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 2048,
+    "intermediate_size": 11008,
+    "manifest_metadata_missing": [
+      "rope_scaling",
+      "sliding_window"
+    ],
+    "max_position_embeddings": 65536,
+    "model_type": "smollm3",
+    "no_rope_layers": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ],
+    "num_attention_heads": 16,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 4,
+    "qkv_bias": false,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": null,
+    "rope_theta": 5000000.0,
+    "rope_variant": "smollm3_selective_rope",
+    "sliding_window": null,
+    "tie_word_embeddings": true,
+    "torch_dtype": "bfloat16",
+    "use_sliding_window": false
+  },
+  "thin_descriptor": {
+    "activation": "silu",
+    "attention_variants": [
+      "causal_kv",
+      "current_only_smoke"
+    ],
+    "head_dim": 128,
+    "hidden_size": 2048,
+    "intermediate_size": 11008,
+    "model_type": "smollm3",
+    "no_rope_layers": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ],
+    "num_attention_heads": 16,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 4,
+    "qkv_bias": false,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": null,
+    "rope_theta": 5000000.0,
+    "supported_precision_modes": [
+      "bf16",
+      "head8",
+      "down_fp8",
+      "gate_up_fp8",
+      "mlp_fp8"
+    ],
+    "tensor_naming_scheme": "hf_decoder_layers",
+    "tie_word_embeddings": true,
+    "vocab_size": 128256
+  }
+}

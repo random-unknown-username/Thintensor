@@ -1,0 +1,49 @@
+{
+  "archive": "SmolLM3-3B.thin",
+  "mode": "quality_8_28_guarded_lm_head",
+  "steps": 500,
+  "vocab_rows": 128256,
+  "trajectory": "free_running_exact_bf16_greedy",
+  "recall": {
+    "32": {
+      "top1_count": 500,
+      "top1_recall": 1.0,
+      "complete_top5_count": 500,
+      "complete_top5_recall": 1.0
+    },
+    "64": {
+      "top1_count": 500,
+      "top1_recall": 1.0,
+      "complete_top5_count": 500,
+      "complete_top5_recall": 1.0
+    },
+    "128": {
+      "top1_count": 500,
+      "top1_recall": 1.0,
+      "complete_top5_count": 500,
+      "complete_top5_recall": 1.0
+    },
+    "256": {
+      "top1_count": 500,
+      "top1_recall": 1.0,
+      "complete_top5_count": 500,
+      "complete_top5_recall": 1.0
+    },
+    "512": {
+      "top1_count": 500,
+      "top1_recall": 1.0,
+      "complete_top5_count": 500,
+      "complete_top5_recall": 1.0
+    },
+    "1024": {
+      "top1_count": 500,
+      "top1_recall": 1.0,
+      "complete_top5_count": 500,
+      "complete_top5_recall": 1.0
+    }
+  },
+  "selection": {
+    "retained_k": 64,
+    "reason": "K=32 improved balanced 200-token decode by only 0.09% versus K=64, below the 2% gate; retain the larger safety margin."
+  }
+}

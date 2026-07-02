@@ -1,0 +1,3 @@
+benchmarking thin_bf16
+benchmarking thin_quality_fp8
+benchmarking thin_quality_10_26
