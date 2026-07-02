@@ -1,7 +1,7 @@
 # ThinTensor
 
 ThinTensor v0 is a `.thin` archive, schema compiler, CUDA decode runtime, and
-runtime budget planner.
+runtime budget planner for changing how LLM models are stored and executed.
 
 The manifest says what the model means. The page table says where bytes live.
 Verification compares both and then checks the blobs.
