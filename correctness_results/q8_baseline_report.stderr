@@ -1,60 +1,0 @@
-Q8 comparison: HF BF16 reference
-Loading weights:   0%|          | 0/326 [00:00<?, ?it/s]Loading weights: 100%|██████████| 326/326 [00:00<00:00, 16136.89it/s]
-  HF BF16 hello
-  HF BF16 factual
-  HF BF16 reasoning
-  HF BF16 code
-  HF BF16 unicode
-  HF BF16 repetition
-  HF BF16 weird_control
-  HF BF16 multi_turn_chat
-  HF BF16 sampling_1
-  HF BF16 sampling_2
-  HF BF16 sampling_3
-  HF BF16 long_context_512
-  HF BF16 long_context_1024
-Q8 comparison: ThinTensor BF16
-  ThinTensor BF16 hello
-  ThinTensor BF16 factual
-  ThinTensor BF16 reasoning
-  ThinTensor BF16 code
-  ThinTensor BF16 unicode
-  ThinTensor BF16 repetition
-  ThinTensor BF16 weird_control
-  ThinTensor BF16 multi_turn_chat
-  ThinTensor BF16 sampling_1
-  ThinTensor BF16 sampling_2
-  ThinTensor BF16 sampling_3
-  ThinTensor BF16 long_context_512
-  ThinTensor BF16 long_context_1024
-Q8 comparison: ThinTensor quality FP8
-  ThinTensor quality FP8 hello
-  ThinTensor quality FP8 factual
-  ThinTensor quality FP8 reasoning
-  ThinTensor quality FP8 code
-  ThinTensor quality FP8 unicode
-  ThinTensor quality FP8 repetition
-  ThinTensor quality FP8 weird_control
-  ThinTensor quality FP8 multi_turn_chat
-  ThinTensor quality FP8 sampling_1
-  ThinTensor quality FP8 sampling_2
-  ThinTensor quality FP8 sampling_3
-  ThinTensor quality FP8 long_context_512
-  ThinTensor quality FP8 long_context_1024
-Q8 comparison: HF bitsandbytes int8/Q8-ish
-Loading weights:   0%|          | 0/326 [00:00<?, ?it/s]Loading weights:   2%|▏         | 7/326 [00:00<00:04, 68.99it/s]Loading weights:   7%|▋         | 22/326 [00:00<00:02, 113.29it/s]Loading weights:  12%|█▏        | 39/326 [00:00<00:02, 136.30it/s]Loading weights:  16%|█▋        | 53/326 [00:00<00:02, 135.44it/s]Loading weights:  21%|██        | 67/326 [00:00<00:01, 136.05it/s]Loading weights:  26%|██▌       | 84/326 [00:00<00:01, 145.72it/s]Loading weights:  30%|███       | 99/326 [00:00<00:01, 145.46it/s]Loading weights:  35%|███▍      | 114/326 [00:00<00:01, 140.64it/s]Loading weights:  40%|███▉      | 130/326 [00:00<00:01, 144.41it/s]Loading weights:  45%|████▌     | 147/326 [00:01<00:01, 149.64it/s]Loading weights:  50%|████▉     | 162/326 [00:01<00:01, 148.82it/s]Loading weights:  54%|█████▍    | 177/326 [00:01<00:01, 143.53it/s]Loading weights:  59%|█████▉    | 193/326 [00:01<00:00, 147.27it/s]Loading weights:  64%|██████▍   | 210/326 [00:01<00:00, 150.83it/s]Loading weights:  69%|██████▉   | 226/326 [00:01<00:00, 149.49it/s]Loading weights:  74%|███████▍  | 241/326 [00:01<00:00, 141.80it/s]Loading weights:  79%|███████▊  | 256/326 [00:01<00:00, 141.02it/s]Loading weights:  83%|████████▎ | 271/326 [00:01<00:00, 135.65it/s]Loading weights:  87%|████████▋ | 285/326 [00:02<00:00, 102.44it/s]Loading weights:  91%|█████████ | 297/326 [00:02<00:00, 89.36it/s] Loading weights:  94%|█████████▍| 307/326 [00:02<00:00, 64.09it/s]Loading weights:  97%|█████████▋| 315/326 [00:02<00:00, 61.34it/s]Loading weights:  99%|█████████▉| 323/326 [00:03<00:00, 31.82it/s]Loading weights: 100%|██████████| 326/326 [00:03<00:00, 94.52it/s]
-  bitsandbytes int8 hello
-/home/satvik/.local/lib/python3.14/site-packages/bitsandbytes/autograd/_functions.py:123: UserWarning: MatMul8bitLt: inputs will be cast from torch.bfloat16 to float16 during quantization
-  warnings.warn(f"MatMul8bitLt: inputs will be cast from {A.dtype} to float16 during quantization")
-  bitsandbytes int8 factual
-  bitsandbytes int8 reasoning
-  bitsandbytes int8 code
-  bitsandbytes int8 unicode
-  bitsandbytes int8 repetition
-  bitsandbytes int8 weird_control
-  bitsandbytes int8 multi_turn_chat
-  bitsandbytes int8 sampling_1
-  bitsandbytes int8 sampling_2
-  bitsandbytes int8 sampling_3
-  bitsandbytes int8 long_context_512
-  bitsandbytes int8 long_context_1024

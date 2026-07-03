@@ -1,4 +1,0 @@
-thin fake page LM_HEAD
-semantic=language model head
-layout=generic
-payload=not real weights
