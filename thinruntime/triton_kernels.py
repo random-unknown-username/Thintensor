@@ -512,6 +512,49 @@ def _indexed_matvec_argmax_kernel(
 
 
 @triton.jit
+def _sparse_residual_matvec_kernel(
+    residual_values,
+    residual_indices,
+    x,
+    out,
+    rows: tl.constexpr,
+    terms: tl.constexpr,
+    stride_vm: tl.constexpr,
+    stride_vk: tl.constexpr,
+    stride_im: tl.constexpr,
+    stride_ik: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = offs_m < rows
+    mask_k = offs_k < terms
+    indices = tl.load(
+        residual_indices
+        + offs_m[:, None] * stride_im
+        + offs_k[None, :] * stride_ik,
+        mask=mask_m[:, None] & mask_k[None, :],
+        other=0,
+    )
+    values = tl.load(
+        residual_values
+        + offs_m[:, None] * stride_vm
+        + offs_k[None, :] * stride_vk,
+        mask=mask_m[:, None] & mask_k[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    x_values = tl.load(
+        x + indices,
+        mask=mask_m[:, None] & mask_k[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    correction = tl.sum(values * x_values, axis=1)
+    base = tl.load(out + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+    tl.store(out + offs_m, base + correction, mask=mask_m)
+
+
+@triton.jit
 def _argmax_stage2_kernel(
     partial_vals,
     partial_idxs,
@@ -1981,6 +2024,35 @@ class TritonDecodeBackend:
             num_warps=8,
         )
         return self._argmax_out_idx
+
+    def sparse_residual_matvec(
+        self,
+        residual_values: torch.Tensor,
+        residual_indices: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        if residual_values.shape != residual_indices.shape:
+            raise ValueError("sparse residual values/indices shape mismatch")
+        rows = int(residual_values.shape[0])
+        terms = int(residual_values.shape[1])
+        block_m = 64
+        _sparse_residual_matvec_kernel[(triton.cdiv(rows, block_m),)](
+            residual_values,
+            residual_indices,
+            x,
+            out,
+            rows=rows,
+            terms=terms,
+            stride_vm=int(residual_values.stride(0)),
+            stride_vk=int(residual_values.stride(1)),
+            stride_im=int(residual_indices.stride(0)),
+            stride_ik=int(residual_indices.stride(1)),
+            BLOCK_M=block_m,
+            BLOCK_K=triton.next_power_of_2(terms),
+            num_warps=4,
+        )
+        return out
 
     def persistent_vocab_block_matvec_argmax_tensor(
         self,

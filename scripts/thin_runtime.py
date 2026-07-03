@@ -69,7 +69,12 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--dtype", choices=["archive", "bf16", "fp16", "fp32"], default="bf16")
     run.add_argument("--residency", choices=["all", "stream"], default="stream")
     run.add_argument("--vram", default="0")
-    run.add_argument("--prefetch", type=int, default=1)
+    run.add_argument(
+        "--prefetch",
+        type=int,
+        default=0,
+        help="Streamed-weight layer prefetch distance; measured default is 0",
+    )
     run.add_argument("--steps", type=int, default=8)
     run.add_argument("--warmup-steps", type=int, default=0)
     run.add_argument("--token-id", type=int, default=0)
@@ -85,7 +90,16 @@ def parse_args() -> argparse.Namespace:
         help="Physical K/V organization inside each exact KV page",
     )
     run.add_argument("--recent-window", type=int, default=256)
-    run.add_argument("--kv-block-size", type=int, default=16)
+    run.add_argument(
+        "--kv-block-size",
+        type=int,
+        default=0,
+        help=(
+            "Exact KV page capacity. 0 selects 16 below 1280 decode steps "
+            "and, for the quality-FP8 profile, one preallocated exact page "
+            "at 1280+ steps."
+        ),
+    )
     run.add_argument(
         "--kv-residency",
         choices=["gpu_full", "cpu_exact", "hybrid_recent"],
@@ -179,6 +193,29 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="0 for row scales, or a power-of-two column block size",
+    )
+    run.add_argument(
+        "--fp8-residual-terms",
+        type=int,
+        default=0,
+        help=(
+            "Experimental: retain this many largest FP8 quantization residual "
+            "terms per selected down-projection row"
+        ),
+    )
+    run.add_argument(
+        "--fp8-residual-layers",
+        help="Experimental residual layer selection; defaults to all FP8 down layers",
+    )
+    run.add_argument(
+        "--fp8-residual-ranking",
+        choices=["raw", "mlp_scale"],
+        default="raw",
+    )
+    run.add_argument(
+        "--fp8-residual-dtype",
+        choices=["bf16", "fp16"],
+        default="bf16",
     )
     run.add_argument(
         "--lm-head-fp8-scale-block",
@@ -442,6 +479,35 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 
         model = weights.manifest["model"]
         kv_dtype = dtype or torch.bfloat16
+        requested_kv_block_size = int(args.kv_block_size)
+        exact_kv = str(args.kv).lower() in {
+            "none",
+            "bf16",
+            "bfloat16",
+            "fp16",
+            "float16",
+            "high_precision",
+        }
+        quality_fp8_profile = (
+            args.gate_up_fp8
+            and args.down_proj_fp8
+            and args.down_fp8_layers == "8:28"
+            and not args.qkv_fp8
+            and not args.o_proj_fp8
+            and not args.attn_proj_fp8
+        )
+        auto_single_page = (
+            requested_kv_block_size <= 0
+            and args.kv_residency == "gpu_full"
+            and exact_kv
+            and quality_fp8_profile
+            and args.steps >= 1280
+        )
+        effective_kv_block_size = (
+            requested_kv_block_size
+            if requested_kv_block_size > 0
+            else (max(1280, int(args.steps)) if auto_single_page else 16)
+        )
 
         def build_runtime() -> tuple[PagedKVCache, ThinGpuCausalLMRuntime]:
             kv = PagedKVCache(
@@ -453,7 +519,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 device=torch.device(args.device),
                 dtype=kv_dtype,
-                block_size=args.kv_block_size,
+                block_size=effective_kv_block_size,
                 recent_window=args.recent_window,
                 old_codec=args.kv,
                 budget_bytes=parse_bytes(args.kv_budget) or None,
@@ -467,7 +533,9 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             rt = ThinGpuCausalLMRuntime(
                 weights,
                 kv_cache=kv,
-                prefetch_distance=args.prefetch if args.residency == "stream" else 0,
+                prefetch_distance=(
+                    prefetch_dist if args.residency == "stream" else 0
+                ),
                 evict_completed_layers=args.residency == "stream",
                 kernel_backend="torch" if args.exact_hf_mode else args.kernel_backend,
                 persistent_buffers=not args.no_persistent_buffers,
@@ -502,6 +570,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 attention_backend=args.attention_backend,
                 exact_hf_mode=args.exact_hf_mode,
                 fp8_scale_block=args.fp8_scale_block,
+                fp8_residual_terms=args.fp8_residual_terms,
+                fp8_residual_layers=args.fp8_residual_layers,
+                fp8_residual_ranking=args.fp8_residual_ranking,
+                fp8_residual_dtype=args.fp8_residual_dtype,
                 lm_head_backend=args.lm_head_backend,
                 lm_head_argmax_mode=args.lm_head_argmax_mode,
                 lm_head_topk_guard=args.lm_head_topk_guard,
@@ -671,6 +743,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "effective_bandwidth_gb_s": effective_bandwidth_gb_s,
             "resident_weight_bytes": runtime.resident_weight_bytes,
             "kv_cache_bytes": timed_kv_telemetry["kv_allocated_bytes"],
+            "kv_block_size_requested": requested_kv_block_size,
+            "kv_block_size_effective": effective_kv_block_size,
+            "kv_auto_single_page": auto_single_page,
+            "kv_auto_quality_fp8_profile": quality_fp8_profile,
             "gpu_kv_cache_bytes": timed_kv_telemetry["kv_gpu_bytes"],
             "cpu_kv_cache_bytes": timed_kv_telemetry["kv_cpu_bytes"],
             "temp_buffer_bytes": runtime.temp_buffer_bytes,
@@ -727,6 +803,17 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "body_fp8_original_bytes": runtime.body_fp8_original_bytes,
             "body_fp8_resident_bytes": runtime.body_fp8_resident_bytes,
             "body_fp8_memory_saved_bytes": runtime.body_fp8_memory_saved_bytes,
+            "fp8_sparse_residual_terms": runtime._fp8_sparse_residual_terms,
+            "fp8_sparse_residual_bytes": runtime.fp8_sparse_residual_bytes,
+            "fp8_sparse_residual_layers": sorted(
+                runtime._fp8_sparse_residual_layers
+            ),
+            "fp8_sparse_residual_ranking": (
+                runtime._fp8_sparse_residual_ranking
+            ),
+            "fp8_sparse_residual_dtype": str(
+                runtime._fp8_sparse_residual_dtype
+            ).replace("torch.", ""),
             "fp8_layers": args.fp8_layers or "all",
             "down_fp8_layers": (
                 args.down_fp8_layers or args.fp8_layers or "all"

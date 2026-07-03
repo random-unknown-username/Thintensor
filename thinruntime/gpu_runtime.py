@@ -2015,6 +2015,10 @@ class ThinGpuQwenRuntime:
         attention_backend: str = "torch",
         exact_hf_mode: bool = False,
         fp8_scale_block: int = 0,
+        fp8_residual_terms: int = 0,
+        fp8_residual_layers: Optional[str] = None,
+        fp8_residual_ranking: str = "raw",
+        fp8_residual_dtype: str = "bf16",
         lm_head_fp8_scale_block: int = 0,
         lm_head_backend: Optional[str] = None,
         lm_head_argmax_mode: str = "torch",
@@ -2401,6 +2405,42 @@ class ThinGpuQwenRuntime:
             self.lm_head_fp8_extra_bytes = max(0, self.lm_head_net_extra_bytes)
 
         self._weight_scales: Dict[int, torch.Tensor] = {}
+        env_residual_terms = os.environ.get("THINTENSOR_FP8_RESIDUAL_TERMS")
+        self._fp8_sparse_residual_terms = max(
+            0,
+            int(env_residual_terms)
+            if env_residual_terms is not None
+            else int(fp8_residual_terms),
+        )
+        residual_dtype_name = os.environ.get(
+            "THINTENSOR_FP8_RESIDUAL_DTYPE", fp8_residual_dtype
+        )
+        if residual_dtype_name not in {"bf16", "fp16"}:
+            raise ValueError(
+                "THINTENSOR_FP8_RESIDUAL_DTYPE must be bf16 or fp16"
+            )
+        self._fp8_sparse_residual_dtype = (
+            torch.float16
+            if residual_dtype_name == "fp16"
+            else torch.bfloat16
+        )
+        self._fp8_sparse_residual_ranking = os.environ.get(
+            "THINTENSOR_FP8_RESIDUAL_RANKING", fp8_residual_ranking
+        )
+        if self._fp8_sparse_residual_ranking not in {"raw", "mlp_scale"}:
+            raise ValueError(
+                "THINTENSOR_FP8_RESIDUAL_RANKING must be raw or mlp_scale"
+            )
+        self._fp8_sparse_residual_layers = _parse_layer_selection(
+            os.environ.get(
+                "THINTENSOR_FP8_RESIDUAL_LAYERS",
+                fp8_residual_layers or "all",
+            ),
+            self.layers,
+        )
+        self._sparse_residual_sidecars: Dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self.body_fp8_original_bytes = 0
         self.body_fp8_resident_bytes = 0
         if isinstance(self.weights, ThinGpuWeights):
@@ -2409,7 +2449,9 @@ class ThinGpuQwenRuntime:
             for layer in range(self.layers):
                 if self.down_proj_fp8 and layer in self.down_fp8_layers:
                     page_id = _layer_tensor(layer, "mlp.down_proj.weight")
-                    q_w, q_s = self._quantize_weight_page(page_id)
+                    q_w, q_s = self._quantize_weight_page(
+                        page_id, residual_layer=layer
+                    )
                     self._weight_scales[id(q_w)] = q_s
                 if self.gate_up_fp8 and layer in self.fp8_layers:
                     for suffix in ("mlp.gate_proj.weight", "mlp.up_proj.weight"):
@@ -2445,6 +2487,10 @@ class ThinGpuQwenRuntime:
                     self.body_fp8_resident_bytes += (
                         _tensor_nbytes(quantized) + _tensor_nbytes(scale)
                     )
+            self.body_fp8_resident_bytes += sum(
+                _tensor_nbytes(values) + _tensor_nbytes(indices)
+                for values, indices in self._sparse_residual_sidecars.values()
+            )
         elif isinstance(self.weights, ThinGpuPagePool):
             for quantized, scale in self.weights._fp8_cpu_cache.values():
                 self.body_fp8_original_bytes += quantized.numel() * 2
@@ -2454,7 +2500,10 @@ class ThinGpuQwenRuntime:
         self.body_fp8_memory_saved_bytes = max(
             0, self.body_fp8_original_bytes - self.body_fp8_resident_bytes
         )
-
+        self.fp8_sparse_residual_bytes = sum(
+            _tensor_nbytes(values) + _tensor_nbytes(indices)
+            for values, indices in self._sparse_residual_sidecars.values()
+        )
         self._layer_plan: Optional[list[LayerPlan]] = None
         if (
             isinstance(self.weights, ThinGpuWeights)
@@ -2515,17 +2564,63 @@ class ThinGpuQwenRuntime:
                         id(weight)
                     ] = self.attn_proj_backend_override
 
-    def _quantize_weight_page(self, page_id: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _quantize_weight_page(
+        self,
+        page_id: str,
+        residual_layer: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         source = self.weights.tensors[page_id]
         if source.dtype == torch.float8_e4m3fn:
             q_s = self.weights._weight_scales.get(page_id)
             if q_s is None:
-                raise RuntimeError(f"Weight {page_id} is FP8 but its scales were not found.")
+                raise RuntimeError(
+                    f"Weight {page_id} is FP8 but its scales "
+                    "were not found."
+                )
             return source, q_s
         q_w, q_s = self._quantize_fp8_rows(
             source,
             scale_block_size=self.fp8_scale_block,
         )
+        if (
+            page_id.endswith("mlp.down_proj.weight")
+            and q_s.ndim == 1
+            and residual_layer in self._fp8_sparse_residual_layers
+        ):
+            if self._fp8_sparse_residual_terms > 0:
+                reconstructed = q_w.float().mul(q_s[:, None])
+                error = source.float().sub(reconstructed)
+                terms = min(
+                    self._fp8_sparse_residual_terms, int(source.shape[1])
+                )
+                ranking_error = error.abs()
+                if self._fp8_sparse_residual_ranking == "mlp_scale":
+                    gate_source = self.weights.tensors[
+                        page_id.replace("down_proj", "gate_proj")
+                    ]
+                    up_source = self.weights.tensors[
+                        page_id.replace("down_proj", "up_proj")
+                    ]
+                    channel_importance = (
+                        gate_source.float().abs().amax(dim=1)
+                        * up_source.float().abs().amax(dim=1)
+                    ).sqrt_()
+                    ranking_error = ranking_error * channel_importance[None, :]
+                residual_abs, residual_indices_i64 = torch.topk(
+                    ranking_error,
+                    k=terms,
+                    dim=1,
+                    sorted=False,
+                )
+                del residual_abs
+                residual_values = torch.gather(
+                    error, 1, residual_indices_i64
+                ).to(dtype=self._fp8_sparse_residual_dtype)
+                residual_indices = residual_indices_i64.to(torch.int16)
+                self._sparse_residual_sidecars[id(q_w)] = (
+                    residual_values.contiguous(),
+                    residual_indices.contiguous(),
+                )
         self.weights.tensors[page_id] = q_w
         self.weights._weight_scales[page_id] = q_s
         return q_w, q_s
@@ -4124,6 +4219,7 @@ class ThinGpuQwenRuntime:
                     * int(exact_head.shape[1])
                     * exact_head.element_size()
                 )
+        total += self.fp8_sparse_residual_bytes
         return total
 
     @property
@@ -4133,6 +4229,7 @@ class ThinGpuQwenRuntime:
             + self.lm_head_external_resident_bytes
             + self.runtime_fusion_extra_bytes
             + self.fused_mlp_extra_bytes
+            + self.fp8_sparse_residual_bytes
         )
 
     @property
@@ -5139,7 +5236,7 @@ class ThinGpuQwenRuntime:
                 return out
             elif choice == "triton":
                 assert self.kernel_backend is not None
-                return self.kernel_backend.scaled_matvec(
+                result = self.kernel_backend.scaled_matvec(
                     weight,
                     scale,
                     x,
@@ -5147,9 +5244,16 @@ class ThinGpuQwenRuntime:
                     block_m=block_m,
                     num_warps=num_warps,
                 )
+                residual = self._sparse_residual_sidecars.get(id(weight))
+                if residual is not None:
+                    values, indices = residual
+                    self.kernel_backend.sparse_residual_matvec(
+                        values, indices, x, result
+                    )
+                return result
             elif choice.startswith("triton_loop_"):
                 assert self.kernel_backend is not None
-                return self.kernel_backend.scaled_matvec(
+                result = self.kernel_backend.scaled_matvec(
                     weight,
                     scale,
                     x,
@@ -5158,6 +5262,13 @@ class ThinGpuQwenRuntime:
                     block_m=block_m,
                     num_warps=num_warps,
                 )
+                residual = self._sparse_residual_sidecars.get(id(weight))
+                if residual is not None:
+                    values, indices = residual
+                    self.kernel_backend.sparse_residual_matvec(
+                        values, indices, x, result
+                    )
+                return result
             else:
                 dequant = weight.to(dtype=x.dtype) * scale[:, None]
                 torch.mv(dequant, x, out=out)
@@ -5264,6 +5375,14 @@ class ThinGpuQwenRuntime:
 
     def capture_cuda_graph(self, steps: int) -> None:
         if self.device.type != "cuda":
+            return
+        if self.attention_mode == "causal_kv":
+            self._cuda_graph_error = (
+                "causal_kv CUDA graph capture is disabled: the current graph "
+                "hardcodes token_index=0 and would replay an invalid one-token "
+                "attention history"
+            )
+            self._cuda_graphs_enabled = False
             return
         
         if self.kv_cache is not None:
