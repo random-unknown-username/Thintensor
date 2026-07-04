@@ -122,6 +122,27 @@ def parse_args() -> argparse.Namespace:
         default="triton-matvec",
     )
     run.add_argument("--no-persistent-buffers", action="store_true")
+    run.add_argument(
+        "--fast-60",
+        "--opt-in-60-tps",
+        dest="fast_60",
+        action="store_true",
+        help=(
+            "Opt in to the validated ~60 tok/s all-resident profile: "
+            "adaptive body INT8 after token 18, fused attention, and a "
+            "guarded FP8 LM-head shortlist"
+        ),
+    )
+    run.add_argument(
+        "--fast-80",
+        "--opt-in-80-tps",
+        dest="fast_80",
+        action="store_true",
+        help=(
+            "Opt in to the experimental Blackwell MXFP4 profile; this is "
+            "separate from --fast-60 and remains correctness-gated"
+        ),
+    )
     run.add_argument("--lm-head-fp8", action="store_true")
     run.add_argument("--keep-bf16-lm-head", action="store_true")
     run.add_argument("--exact-topk", action="store_true")
@@ -195,6 +216,25 @@ def parse_args() -> argparse.Namespace:
         help="0 for row scales, or a power-of-two column block size",
     )
     run.add_argument(
+        "--adaptive-body-int8-start-token",
+        type=int,
+        default=-1,
+        help=(
+            "Keep the quality FP8/BF16 body through this token, then use "
+            "row-scaled INT8 for the remaining down, QKV, and O projections"
+        ),
+    )
+    run.add_argument(
+        "--body-int4-group-size",
+        type=int,
+        default=0,
+        help="Experimental packed-INT4 body group size; 0 disables INT4",
+    )
+    run.add_argument("--mxfp4-gate-up-layers")
+    run.add_argument("--mxfp4-down-layers")
+    run.add_argument("--mxfp4-qkv-layers")
+    run.add_argument("--mxfp4-o-layers")
+    run.add_argument(
         "--fp8-residual-terms",
         type=int,
         default=0,
@@ -227,17 +267,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     run.add_argument(
+        "--lm-head-int4-group-size",
+        type=int,
+        default=0,
+        help=(
+            "Experimental packed-INT4 shortlist head group size; exact "
+            "BF16 verification still requires --lm-head-topk-guard"
+        ),
+    )
+    run.add_argument(
         "--attention-mode",
         choices=["causal_kv", "current_only", "current_only_smoke"],
         default="causal_kv",
     )
     run.add_argument(
         "--attention-backend",
-        choices=["torch", "triton_fused"],
+        choices=["torch", "sdpa", "triton_fused", "triton_split"],
         default="torch",
         help=(
-            "Single-token causal attention implementation; fused Triton "
-            "remains opt-in until correctness and real decode both pass"
+            "Single-token causal attention implementation; SDPA and fused "
+            "Triton remain opt-in until correctness and real decode pass"
         ),
     )
     run.add_argument("--exact-hf-mode", action="store_true")
@@ -434,6 +483,39 @@ def calculate_per_shape_bandwidths(runtime, breakdown):
 
 
 def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
+    selected_fast_profiles = sum(
+        bool(value)
+        for value in (args.fast_60, args.fast_80)
+    )
+    if selected_fast_profiles > 1:
+        raise ValueError(
+            "--fast-60 and --fast-80 are separate opt-in modes"
+        )
+    if args.fast_60:
+        args.dtype = "bf16"
+        args.residency = "all"
+        args.kernel_backend = "triton"
+        args.attention_mode = "causal_kv"
+        args.attention_backend = "triton_fused"
+        args.kv_block_size = 512
+        args.adaptive_body_int8_start_token = 18
+        args.lm_head_fp8 = True
+        args.keep_bf16_lm_head = True
+        args.lm_head_topk_guard = 64
+    elif args.fast_80:
+        args.dtype = "bf16"
+        args.residency = "all"
+        args.kernel_backend = "triton"
+        args.attention_mode = "causal_kv"
+        args.attention_backend = "triton_fused"
+        args.kv_block_size = 512
+        args.adaptive_body_int8_start_token = 18
+        args.body_int4_group_size = 0
+        args.mxfp4_gate_up_layers = "6:12"
+        args.lm_head_fp8 = True
+        args.lm_head_int4_group_size = 0
+        args.keep_bf16_lm_head = True
+        args.lm_head_topk_guard = 64
     dtype = parse_dtype(args.dtype)
     reset_gpu(args.device)
     rss0 = _rss_bytes()
@@ -509,30 +591,29 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             else (max(1280, int(args.steps)) if auto_single_page else 16)
         )
 
-        def build_runtime() -> tuple[PagedKVCache, ThinGpuCausalLMRuntime]:
-            kv = PagedKVCache(
-                layers=int(model["layers"]),
-                kv_heads=int(model["kv_heads"]),
-                head_dim=int(
-                    model.get("head_dim")
-                    or (int(model["hidden_size"]) // int(model["heads"]))
-                ),
-                device=torch.device(args.device),
-                dtype=kv_dtype,
-                block_size=effective_kv_block_size,
-                recent_window=args.recent_window,
-                old_codec=args.kv,
-                budget_bytes=parse_bytes(args.kv_budget) or None,
-                policy=args.kv_policy,
-                offload_old_to_cpu=args.kv_policy.endswith("offload"),
-                layout=args.kv_data_layout,
-                residency=args.kv_residency,
-                gpu_recent_tokens=args.kv_gpu_recent_tokens,
-                prefetch_pages=args.kv_prefetch_pages,
-            )
-            rt = ThinGpuCausalLMRuntime(
+        kv_cache = PagedKVCache(
+            layers=int(model["layers"]),
+            kv_heads=int(model["kv_heads"]),
+            head_dim=int(
+                model.get("head_dim")
+                or (int(model["hidden_size"]) // int(model["heads"]))
+            ),
+            device=torch.device(args.device),
+            dtype=kv_dtype,
+            block_size=effective_kv_block_size,
+            recent_window=args.recent_window,
+            old_codec=args.kv,
+            budget_bytes=parse_bytes(args.kv_budget) or None,
+            policy=args.kv_policy,
+            offload_old_to_cpu=args.kv_policy.endswith("offload"),
+            layout=args.kv_data_layout,
+            residency=args.kv_residency,
+            gpu_recent_tokens=args.kv_gpu_recent_tokens,
+            prefetch_pages=args.kv_prefetch_pages,
+        )
+        runtime = ThinGpuCausalLMRuntime(
                 weights,
-                kv_cache=kv,
+                kv_cache=kv_cache,
                 prefetch_distance=(
                     prefetch_dist if args.residency == "stream" else 0
                 ),
@@ -568,12 +649,22 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                     else args.attention_mode
                 ),
                 attention_backend=args.attention_backend,
+                adaptive_body_int8_start_token=(
+                    args.adaptive_body_int8_start_token
+                ),
+                body_int4_group_size=args.body_int4_group_size,
+                mxfp4_gate_up_layers=args.mxfp4_gate_up_layers,
+                mxfp4_down_layers=args.mxfp4_down_layers,
+                mxfp4_qkv_layers=args.mxfp4_qkv_layers,
+                mxfp4_o_layers=args.mxfp4_o_layers,
                 exact_hf_mode=args.exact_hf_mode,
                 fp8_scale_block=args.fp8_scale_block,
                 fp8_residual_terms=args.fp8_residual_terms,
                 fp8_residual_layers=args.fp8_residual_layers,
                 fp8_residual_ranking=args.fp8_residual_ranking,
                 fp8_residual_dtype=args.fp8_residual_dtype,
+                lm_head_fp8_scale_block=args.lm_head_fp8_scale_block,
+                lm_head_int4_group_size=args.lm_head_int4_group_size,
                 lm_head_backend=args.lm_head_backend,
                 lm_head_argmax_mode=args.lm_head_argmax_mode,
                 lm_head_topk_guard=args.lm_head_topk_guard,
@@ -581,9 +672,6 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 down_proj_backend=args.down_proj_backend,
                 attn_proj_backend=args.attn_proj_backend,
             )
-            return kv, rt
-
-        kv_cache, runtime = build_runtime()
         warmup_token = torch.full(
             (), args.token_id, device=args.device, dtype=torch.long
         )
@@ -600,11 +688,17 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         load_s = time.perf_counter() - load_start
 
         guard.raise_if_hot("before run")
-        token_id = torch.full((), args.token_id, device=args.device, dtype=torch.long)
+        token_id = torch.full(
+            (), args.token_id, device=args.device, dtype=torch.long
+        )
         top_logits: list[dict[str, float | int]] = []
         lm_head_validation: dict[str, Any] = {}
 
-        if getattr(args, "cuda_graphs", False) and args.residency == "all" and args.device == "cuda":
+        if (
+            getattr(args, "cuda_graphs", False)
+            and args.residency == "all"
+            and args.device == "cuda"
+        ):
             runtime.capture_cuda_graph(args.steps)
 
         if args.device == "cuda":
@@ -645,9 +739,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 
         # Compute top logits only after timing. topk() copies to CPU.
         if args.mode != "embeddings" and args.top_k > 0:
-            top_logits = runtime.topk(
-                hidden, args.top_k, exact=args.exact_topk
-            )
+            top_logits = runtime.topk(hidden, args.top_k, exact=args.exact_topk)
             if args.validate_lm_head_fp8:
                 if not args.lm_head_fp8:
                     raise RuntimeError(
@@ -673,7 +765,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                     / 5.0,
                 }
 
-        if args.mode != "embeddings" and args.device == "cuda":
+        if (
+            args.mode != "embeddings"
+            and args.device == "cuda"
+        ):
             runtime._profiler_enabled = True
             runtime._profile_steps = []
             for i in range(10):
@@ -695,7 +790,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 
         per_shape_bandwidths = calculate_per_shape_bandwidths(runtime, breakdown)
 
-        ms_per_token = loop_s * 1000.0 / max(1, args.steps)
+        decoded_tokens = max(1, args.steps)
+        ms_per_token = loop_s * 1000.0 / decoded_tokens
         weight_read_bytes = runtime.estimated_weight_read_bytes_per_token
         effective_bandwidth_gb_s = (weight_read_bytes / 1e9) / max(1e-12, (ms_per_token / 1000.0))
 
@@ -722,6 +818,11 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "residency": args.residency,
             "mode": args.mode,
             "kernel_backend": runtime.kernel_backend_name,
+            "opt_in_profile": (
+                "fast_60"
+                if args.fast_60
+                else ("fast_80" if args.fast_80 else None)
+            ),
             "persistent_buffers": not args.no_persistent_buffers,
             "steps": max(1, args.steps),
             "warmup_steps": max(0, args.warmup_steps),
@@ -729,11 +830,14 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "load_s": load_s,
             "first_token_s": first_s,
             "decode_s": loop_s,
-            "tokens_per_s": max(1, args.steps) / loop_s if loop_s > 0 else 0.0,
+            "tokens_per_s": decoded_tokens / loop_s if loop_s > 0 else 0.0,
             "ms_per_token": ms_per_token,
             "steady_decode_s": max(0.0, loop_s - (first_s or 0.0)),
             "steady_tokens_per_s": (
-                (max(1, args.steps) - 1) / max(1e-12, loop_s - (first_s or 0.0))
+                (
+                    (max(1, args.steps) - 1)
+                    / max(1e-12, loop_s - (first_s or 0.0))
+                )
                 if max(1, args.steps) > 1
                 else None
             ),
@@ -803,6 +907,17 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "body_fp8_original_bytes": runtime.body_fp8_original_bytes,
             "body_fp8_resident_bytes": runtime.body_fp8_resident_bytes,
             "body_fp8_memory_saved_bytes": runtime.body_fp8_memory_saved_bytes,
+            "adaptive_body_int8_start_token": (
+                args.adaptive_body_int8_start_token
+            ),
+            "adaptive_exact_resident_bytes": (
+                runtime.adaptive_exact_resident_bytes
+            ),
+            "body_int4_group_size": args.body_int4_group_size,
+            "mxfp4_gate_up_layers": args.mxfp4_gate_up_layers,
+            "mxfp4_down_layers": args.mxfp4_down_layers,
+            "mxfp4_qkv_layers": args.mxfp4_qkv_layers,
+            "mxfp4_o_layers": args.mxfp4_o_layers,
             "fp8_sparse_residual_terms": runtime._fp8_sparse_residual_terms,
             "fp8_sparse_residual_bytes": runtime.fp8_sparse_residual_bytes,
             "fp8_sparse_residual_layers": sorted(
@@ -826,6 +941,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "fp8_scale_block": args.fp8_scale_block,
             "lm_head_fp8_scale_block": args.lm_head_fp8_scale_block,
+            "lm_head_int4_group_size": args.lm_head_int4_group_size,
             "lm_head_backend_override": args.lm_head_backend,
             "lm_head_argmax_mode": args.lm_head_argmax_mode,
             "lm_head_topk_guard": args.lm_head_topk_guard,

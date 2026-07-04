@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thintensor"
+version = "0.1.0"
+description = "ThinTensor model archive and GPU runtime CLI"
+readme = "README_CLI.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.optional-dependencies]
+runtime = [
+  "torch",
+  "triton",
+  "transformers",
+  "safetensors",
+]
+cli = [
+  "huggingface-hub",
+  "rich",
+]
+tui = [
+  "textual",
+]
+dev = [
+  "pytest",
+  "ruff",
+]
+all = [
+  "huggingface-hub",
+  "rich",
+  "safetensors",
+  "textual",
+  "torch",
+  "transformers",
+  "triton",
+]
+
+[project.scripts]
+thin = "thinruntime.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["thinruntime*"]
+
+[tool.setuptools.data-files]
+"share/thintensor/scripts" = [
+  "scripts/compare_hf_thin_logits.py",
+  "scripts/optimize_runtime_one_by_one.py",
+  "scripts/stress_validate_thin.py",
+  "scripts/thin_runtime.py",
+]

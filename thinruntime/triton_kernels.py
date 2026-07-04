@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -93,6 +94,142 @@ def _single_token_gqa_attention_kernel(
     tl.store(
         output + head * head_dim + offsets_d,
         accumulator / running_den,
+        mask=mask_d,
+    )
+
+
+@triton.jit
+def _split_gqa_attention_partial_kernel(
+    query,
+    keys,
+    values,
+    partial_max,
+    partial_den,
+    partial_acc,
+    tokens,
+    stride_kk,
+    stride_kt,
+    stride_kd,
+    stride_vk,
+    stride_vt,
+    stride_vd,
+    heads: tl.constexpr,
+    kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    scale: tl.constexpr,
+    token_bucket: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    head = tl.program_id(0)
+    split = tl.program_id(1)
+    kv_head = head // (heads // kv_heads)
+    offsets_d = tl.arange(0, BLOCK_D)
+    mask_d = offsets_d < head_dim
+    query_values = tl.load(
+        query + head * head_dim + offsets_d,
+        mask=mask_d,
+        other=0.0,
+    ).to(tl.float32)
+    chunk_tokens: tl.constexpr = token_bucket // SPLITS
+    chunk_start = split * chunk_tokens
+
+    running_max = -3.4028234663852886e38
+    running_den = 0.0
+    accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for local_start in range(0, chunk_tokens, BLOCK_T):
+        offsets_t = chunk_start + local_start + tl.arange(0, BLOCK_T)
+        mask_t = offsets_t < tokens
+        key = tl.load(
+            keys
+            + kv_head * stride_kk
+            + offsets_t[:, None] * stride_kt
+            + offsets_d[None, :] * stride_kd,
+            mask=mask_t[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        scores = tl.sum(
+            key * query_values[None, :],
+            axis=1,
+        ) * scale
+        scores = tl.where(mask_t, scores, -3.4028234663852886e38)
+        local_max = tl.max(scores, axis=0)
+        next_max = tl.maximum(running_max, local_max)
+        old_scale = tl.exp(running_max - next_max)
+        old_scale = tl.where(
+            running_max == -3.4028234663852886e38,
+            0.0,
+            old_scale,
+        )
+        probabilities = tl.exp(scores - next_max)
+        probabilities = tl.where(mask_t, probabilities, 0.0)
+        running_den = (
+            running_den * old_scale
+            + tl.sum(probabilities, axis=0)
+        )
+        value = tl.load(
+            values
+            + kv_head * stride_vk
+            + offsets_t[:, None] * stride_vt
+            + offsets_d[None, :] * stride_vd,
+            mask=mask_t[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        accumulator = (
+            accumulator * old_scale
+            + tl.sum(probabilities[:, None] * value, axis=0)
+        )
+        running_max = next_max
+
+    partial_index = head * SPLITS + split
+    tl.store(partial_max + partial_index, running_max)
+    tl.store(partial_den + partial_index, running_den)
+    tl.store(
+        partial_acc + partial_index * head_dim + offsets_d,
+        accumulator,
+        mask=mask_d,
+    )
+
+
+@triton.jit
+def _split_gqa_attention_reduce_kernel(
+    partial_max,
+    partial_den,
+    partial_acc,
+    output,
+    heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    head = tl.program_id(0)
+    offsets_s = tl.arange(0, SPLITS)
+    offsets_d = tl.arange(0, BLOCK_D)
+    mask_d = offsets_d < head_dim
+    max_values = tl.load(
+        partial_max + head * SPLITS + offsets_s,
+    )
+    global_max = tl.max(max_values, axis=0)
+    correction = tl.exp(max_values - global_max)
+    den_values = tl.load(
+        partial_den + head * SPLITS + offsets_s,
+    )
+    denominator = tl.sum(den_values * correction, axis=0)
+    partial_values = tl.load(
+        partial_acc
+        + (head * SPLITS + offsets_s[:, None]) * head_dim
+        + offsets_d[None, :],
+        mask=mask_d[None, :],
+        other=0.0,
+    )
+    accumulator = tl.sum(
+        partial_values * correction[:, None],
+        axis=0,
+    )
+    tl.store(
+        output + head * head_dim + offsets_d,
+        accumulator / denominator,
         mask=mask_d,
     )
 
@@ -306,6 +443,551 @@ def _scaled_matvec_nomask_n_kernel(
     scale = tl.load(scales + offs_m, mask=mask_m, other=0.0).to(tl.float32)
     acc = tl.sum(w * xv[None, :], axis=1) * scale
     tl.store(y + offs_m, acc, mask=mask_m)
+
+
+@triton.jit
+def _fp8_bf16_tensorcore_matvec_kernel(
+    weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        weight_values = tl.load(
+            weight
+            + offsets_m[:, None] * stride_wm
+            + offsets_k[None, :],
+            mask=mask_m[:, None],
+            other=0.0,
+        )
+        vector = tl.load(x + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N),
+            dtype=tl.bfloat16,
+        )
+        accumulator = tl.dot_scaled(
+            weight_values,
+            None,
+            "e4m3",
+            vector_tile,
+            None,
+            "bf16",
+            acc=accumulator,
+            fast_math=True,
+        )
+    scale = tl.load(scales + offsets_m, mask=mask_m, other=0.0)
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(y + offsets_m, result * scale, mask=mask_m)
+
+
+@triton.jit
+def _int8_bf16_tensorcore_matvec_kernel(
+    weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        weight_values = tl.load(
+            weight
+            + offsets_m[:, None] * stride_wm
+            + offsets_k[None, :],
+            mask=mask_m[:, None],
+            other=0,
+        ).to(tl.bfloat16)
+        vector = tl.load(x + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N),
+            dtype=tl.bfloat16,
+        )
+        accumulator += tl.dot(weight_values, vector_tile)
+    scale = tl.load(scales + offsets_m, mask=mask_m, other=0.0)
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(y + offsets_m, result * scale, mask=mask_m)
+
+
+@triton.jit
+def _mxfp4_bf16_tensorcore_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sk: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Blackwell MXFP4 x BF16 matvec using native scaled tensor cores."""
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_packed_k = start_k // 2 + tl.arange(0, BLOCK_K // 2)
+        weight_values = tl.load(
+            packed_weight
+            + offsets_m[:, None] * stride_wm
+            + offsets_packed_k[None, :],
+            mask=mask_m[:, None],
+            other=0,
+        )
+        offsets_scale_k = (
+            start_k // 32 + tl.arange(0, BLOCK_K // 32)
+        )
+        weight_scales = tl.load(
+            scales
+            + offsets_m[:, None] * stride_sm
+            + offsets_scale_k[None, :] * stride_sk,
+            mask=mask_m[:, None],
+            other=0.0,
+        )
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        vector = tl.load(x + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N),
+            dtype=tl.bfloat16,
+        )
+        accumulator = tl.dot_scaled(
+            weight_values,
+            weight_scales,
+            "e2m1",
+            vector_tile,
+            None,
+            "bf16",
+            acc=accumulator,
+            fast_math=True,
+        )
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(y + offsets_m, result, mask=mask_m)
+
+
+@triton.jit
+def _int4_scaled_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sn: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_b = tl.arange(0, BLOCK_N)
+    packed_cols: tl.constexpr = (cols + 1) // 2
+    mask_m = offs_m < rows
+    mask_b = offs_b < packed_cols
+    packed = tl.load(
+        packed_weight
+        + offs_m[:, None] * stride_wm
+        + offs_b[None, :],
+        mask=mask_m[:, None] & mask_b[None, :],
+        other=0,
+    ).to(tl.int32)
+    quantized_low = (packed & 0x0F) - 8
+    quantized_high = ((packed >> 4) & 0x0F) - 8
+    if GROUP_SIZE >= cols:
+        scale = tl.load(
+            scales + offs_m * stride_sm,
+            mask=mask_m,
+            other=0.0,
+        ).to(tl.float32)[:, None]
+    else:
+        scale = tl.load(
+            scales
+            + offs_m[:, None] * stride_sm
+            + ((offs_b[None, :] * 2) // GROUP_SIZE) * stride_sn,
+            mask=mask_m[:, None] & mask_b[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    vector_low = tl.load(
+        x + offs_b * 2,
+        mask=mask_b,
+        other=0.0,
+    ).to(tl.float32)
+    vector_high = tl.load(
+        x + offs_b * 2 + 1,
+        mask=mask_b & (offs_b * 2 + 1 < cols),
+        other=0.0,
+    ).to(tl.float32)
+    accumulator = tl.sum(
+        (
+            quantized_low.to(tl.float32) * vector_low[None, :]
+            + quantized_high.to(tl.float32) * vector_high[None, :]
+        )
+        * scale,
+        axis=1,
+    )
+    tl.store(y + offs_m, accumulator, mask=mask_m)
+
+
+@triton.jit
+def _int4_scaled_matvec_looped_kernel(
+    packed_weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sn: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    accumulator = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    packed_cols: tl.constexpr = (cols + 1) // 2
+    for start_b in range(0, packed_cols, BLOCK_N):
+        offs_b = start_b + tl.arange(0, BLOCK_N)
+        mask_b = offs_b < packed_cols
+        packed = tl.load(
+            packed_weight
+            + offs_m[:, None] * stride_wm
+            + offs_b[None, :],
+            mask=mask_m[:, None] & mask_b[None, :],
+            other=0,
+        ).to(tl.int32)
+        quantized_low = (packed & 0x0F) - 8
+        quantized_high = ((packed >> 4) & 0x0F) - 8
+        if GROUP_SIZE >= cols:
+            scale = tl.load(
+                scales + offs_m * stride_sm,
+                mask=mask_m,
+                other=0.0,
+            ).to(tl.float32)[:, None]
+        else:
+            scale = tl.load(
+                scales
+                + offs_m[:, None] * stride_sm
+                + ((offs_b[None, :] * 2) // GROUP_SIZE) * stride_sn,
+                mask=mask_m[:, None] & mask_b[None, :],
+                other=0.0,
+            ).to(tl.float32)
+        vector_low = tl.load(
+            x + offs_b * 2,
+            mask=mask_b,
+            other=0.0,
+        ).to(tl.float32)
+        vector_high = tl.load(
+            x + offs_b * 2 + 1,
+            mask=mask_b & (offs_b * 2 + 1 < cols),
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += tl.sum(
+            (
+                quantized_low.to(tl.float32) * vector_low[None, :]
+                + quantized_high.to(tl.float32) * vector_high[None, :]
+            )
+            * scale,
+            axis=1,
+        )
+    tl.store(y + offs_m, accumulator, mask=mask_m)
+
+
+@triton.jit
+def _int4_dot_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_sm: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_OUT: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    offs_out = tl.arange(0, BLOCK_OUT)
+    accumulator = tl.zeros(
+        (BLOCK_M, BLOCK_OUT),
+        dtype=tl.float32,
+    )
+    for start_k in range(0, cols, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < cols
+        packed = tl.load(
+            packed_weight
+            + offs_m[:, None] * stride_wm
+            + (offs_k[None, :] // 2),
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.int32)
+        shift = (offs_k[None, :] & 1) * 4
+        quantized = ((packed >> shift) & 0x0F) - 8
+        vector = tl.load(
+            x + offs_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.bfloat16)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_OUT),
+            dtype=tl.bfloat16,
+        )
+        accumulator += tl.dot(
+            quantized.to(tl.bfloat16),
+            vector_tile,
+        )
+    scale = tl.load(
+        scales + offs_m * stride_sm,
+        mask=mask_m,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        y + offs_m,
+        (tl.sum(accumulator, axis=1) / BLOCK_OUT) * scale,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _multi_int4_scaled_matvec_kernel(
+    weight0,
+    weight1,
+    weight2,
+    scale0,
+    scale1,
+    scale2,
+    x,
+    out,
+    rows0: tl.constexpr,
+    rows1: tl.constexpr,
+    rows2: tl.constexpr,
+    cols: tl.constexpr,
+    stride_w0: tl.constexpr,
+    stride_w1: tl.constexpr,
+    stride_w2: tl.constexpr,
+    stride_s0: tl.constexpr,
+    stride_s1: tl.constexpr,
+    stride_s2: tl.constexpr,
+    BLOCKS0: tl.constexpr,
+    BLOCKS1: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+    in_matrix1 = pid >= BLOCKS0
+    in_matrix2 = pid >= BLOCKS0 + BLOCKS1
+    local_pid = tl.where(
+        in_matrix2,
+        pid - BLOCKS0 - BLOCKS1,
+        tl.where(in_matrix1, pid - BLOCKS0, pid),
+    )
+    rows = tl.where(in_matrix2, rows2, tl.where(in_matrix1, rows1, rows0))
+    row_base = tl.where(
+        in_matrix2,
+        rows0 + rows1,
+        tl.where(in_matrix1, rows0, 0),
+    )
+    weight = tl.where(
+        in_matrix2,
+        weight2,
+        tl.where(in_matrix1, weight1, weight0),
+    )
+    scale_ptr = tl.where(
+        in_matrix2,
+        scale2,
+        tl.where(in_matrix1, scale1, scale0),
+    )
+    stride_w = tl.where(
+        in_matrix2,
+        stride_w2,
+        tl.where(in_matrix1, stride_w1, stride_w0),
+    )
+    stride_s = tl.where(
+        in_matrix2,
+        stride_s2,
+        tl.where(in_matrix1, stride_s1, stride_s0),
+    )
+    offs_m = local_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_b = tl.arange(0, BLOCK_B)
+    packed_cols: tl.constexpr = (cols + 1) // 2
+    mask_m = offs_m < rows
+    mask_b = offs_b < packed_cols
+    packed = tl.load(
+        weight + offs_m[:, None] * stride_w + offs_b[None, :],
+        mask=mask_m[:, None] & mask_b[None, :],
+        other=0,
+    ).to(tl.int32)
+    quantized_low = (packed & 0x0F) - 8
+    quantized_high = ((packed >> 4) & 0x0F) - 8
+    vector_low = tl.load(
+        x + offs_b * 2,
+        mask=mask_b,
+        other=0.0,
+    ).to(tl.float32)
+    vector_high = tl.load(
+        x + offs_b * 2 + 1,
+        mask=mask_b & (offs_b * 2 + 1 < cols),
+        other=0.0,
+    ).to(tl.float32)
+    scale = tl.load(
+        scale_ptr + offs_m * stride_s,
+        mask=mask_m,
+        other=0.0,
+    ).to(tl.float32)
+    accumulator = tl.sum(
+        quantized_low.to(tl.float32) * vector_low[None, :]
+        + quantized_high.to(tl.float32) * vector_high[None, :],
+        axis=1,
+    )
+    tl.store(
+        out + row_base + offs_m,
+        accumulator * scale,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _multi_scaled_tensorcore_matvec_kernel(
+    weight0,
+    weight1,
+    weight2,
+    scale0,
+    scale1,
+    scale2,
+    x,
+    out,
+    rows0: tl.constexpr,
+    rows1: tl.constexpr,
+    rows2: tl.constexpr,
+    cols: tl.constexpr,
+    stride_w0: tl.constexpr,
+    stride_w1: tl.constexpr,
+    stride_w2: tl.constexpr,
+    stride_s0: tl.constexpr,
+    stride_s1: tl.constexpr,
+    stride_s2: tl.constexpr,
+    BLOCKS0: tl.constexpr,
+    BLOCKS1: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_FP8: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+    in_matrix1 = pid >= BLOCKS0
+    in_matrix2 = pid >= BLOCKS0 + BLOCKS1
+    local_pid = tl.where(
+        in_matrix2,
+        pid - BLOCKS0 - BLOCKS1,
+        tl.where(in_matrix1, pid - BLOCKS0, pid),
+    )
+    rows = tl.where(in_matrix2, rows2, tl.where(in_matrix1, rows1, rows0))
+    row_base = tl.where(
+        in_matrix2,
+        rows0 + rows1,
+        tl.where(in_matrix1, rows0, 0),
+    )
+    weight = tl.where(
+        in_matrix2,
+        weight2,
+        tl.where(in_matrix1, weight1, weight0),
+    )
+    scale_ptr = tl.where(
+        in_matrix2,
+        scale2,
+        tl.where(in_matrix1, scale1, scale0),
+    )
+    stride_w = tl.where(
+        in_matrix2,
+        stride_w2,
+        tl.where(in_matrix1, stride_w1, stride_w0),
+    )
+    stride_s = tl.where(
+        in_matrix2,
+        stride_s2,
+        tl.where(in_matrix1, stride_s1, stride_s0),
+    )
+    offsets_m = local_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        weight_pointer = (
+            weight
+            + offsets_m[:, None] * stride_w
+            + offsets_k[None, :]
+        )
+        if IS_FP8:
+            weight_values = tl.load(
+                weight_pointer,
+                mask=mask_m[:, None],
+                other=0.0,
+            )
+        else:
+            weight_values = tl.load(
+                weight_pointer,
+                mask=mask_m[:, None],
+                other=0,
+            )
+        vector = tl.load(x + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N),
+            dtype=tl.bfloat16,
+        )
+        if IS_FP8:
+            accumulator = tl.dot_scaled(
+                weight_values,
+                None,
+                "e4m3",
+                vector_tile,
+                None,
+                "bf16",
+                acc=accumulator,
+                fast_math=True,
+            )
+        else:
+            accumulator += tl.dot(
+                weight_values.to(tl.bfloat16),
+                vector_tile,
+            )
+    scale = tl.load(
+        scale_ptr + offsets_m * stride_s,
+        mask=mask_m,
+        other=0.0,
+    )
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(
+        out + row_base + offsets_m,
+        result * scale,
+        mask=mask_m,
+    )
 
 
 @triton.jit
@@ -1350,6 +2032,9 @@ class TritonDecodeBackend:
         self._persistent_argmax_partial_vals = None
         self._persistent_argmax_partial_idxs = None
         self._split_k_partials: torch.Tensor | None = None
+        self._attention_partial_max: torch.Tensor | None = None
+        self._attention_partial_den: torch.Tensor | None = None
+        self._attention_partial_acc: torch.Tensor | None = None
         self._matvec_launch_plans: dict[Any, tuple[object, ...]] = {}
         self._multi_launch_plans: dict[tuple[int, ...], tuple[int, ...]] = {}
         self._repeat_matvec_plans: dict[int, tuple[int, ...]] = {}
@@ -1738,7 +2423,9 @@ class TritonDecodeBackend:
         cols = int(weight.shape[1])
         if scales.dim() == 2:
             scale_blocks = int(scales.shape[1])
-            scale_block_n = (cols + scale_blocks - 1) // scale_blocks
+            scale_block_n = triton.next_power_of_2(
+                (cols + scale_blocks - 1) // scale_blocks
+            )
             selected_block_m, selected_warps = select_matvec_config(
                 rows,
                 cols,
@@ -1765,6 +2452,39 @@ class TritonDecodeBackend:
                 BLOCK_M=block_m,
                 BLOCK_N=scale_block_n,
                 num_warps=num_warps,
+            )
+            return out
+        if (
+            os.environ.get("THINTENSOR_TENSORCORE_MATVEC", "0") == "1"
+            and
+            x.dtype == torch.bfloat16
+            and cols % 256 == 0
+            and weight.dtype in {torch.float8_e4m3fn, torch.int8}
+        ):
+            tensorcore_kernel = (
+                _fp8_bf16_tensorcore_matvec_kernel
+                if weight.dtype == torch.float8_e4m3fn
+                else _int8_bf16_tensorcore_matvec_kernel
+            )
+            tensorcore_block_n = (
+                8 if weight.dtype == torch.float8_e4m3fn else 1
+            )
+            tensorcore_block_m = 32 if rows <= 512 else 64
+            tensorcore_kernel[
+                (triton.cdiv(rows, tensorcore_block_m),)
+            ](
+                weight,
+                scales,
+                x,
+                out,
+                rows,
+                cols,
+                int(weight.stride(0)),
+                BLOCK_M=tensorcore_block_m,
+                BLOCK_K=256,
+                BLOCK_N=tensorcore_block_n,
+                num_warps=4,
+                num_stages=3,
             )
             return out
         block_n = triton.next_power_of_2(cols)
@@ -1802,6 +2522,138 @@ class TritonDecodeBackend:
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=num_warps,
+        )
+        return out
+
+    def int4_scaled_matvec(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        rows: int,
+        cols: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        use_dot = (
+            os.environ.get("THINTENSOR_INT4_DOT", "0") == "1"
+            and group_size >= cols
+        )
+        if use_dot:
+            kernel = _int4_dot_matvec_kernel
+            block_n = 256
+            block_m = 16
+            num_warps = 4
+        elif cols > 4096:
+            kernel = _int4_scaled_matvec_looped_kernel
+            block_n = int(
+                os.environ.get("THINTENSOR_INT4_DOWN_BLOCK_N", "256")
+            )
+            block_m = int(
+                os.environ.get("THINTENSOR_INT4_DOWN_BLOCK_M", "16")
+            )
+            num_warps = int(
+                os.environ.get("THINTENSOR_INT4_DOWN_WARPS", "4")
+            )
+        else:
+            kernel = _int4_scaled_matvec_kernel
+            block_n = triton.next_power_of_2((cols + 1) // 2)
+            selected_block_m, selected_warps = select_matvec_config(
+                rows, cols
+            )
+            role = "HEAD" if rows >= 65536 else "DIRECT"
+            block_m = int(
+                os.environ.get(
+                    f"THINTENSOR_INT4_{role}_BLOCK_M",
+                    str(selected_block_m),
+                )
+            )
+            num_warps = int(
+                os.environ.get(
+                    f"THINTENSOR_INT4_{role}_WARPS",
+                    str(selected_warps),
+                )
+            )
+        if use_dot:
+            kernel[(triton.cdiv(rows, block_m),)](
+                packed_weight,
+                scales,
+                x,
+                out,
+                rows,
+                cols,
+                int(packed_weight.stride(0)),
+                int(scales.stride(0)),
+                BLOCK_M=block_m,
+                BLOCK_K=block_n,
+                BLOCK_OUT=16,
+                num_warps=num_warps,
+            )
+        else:
+            kernel[(triton.cdiv(rows, block_m),)](
+                packed_weight,
+                scales,
+                x,
+                out,
+                rows,
+                cols,
+                int(packed_weight.stride(0)),
+                int(scales.stride(0)),
+                int(scales.stride(1)),
+                GROUP_SIZE=group_size,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                num_warps=num_warps,
+            )
+        return out
+
+    def mxfp4_tensorcore_matvec(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        rows: int,
+        cols: int,
+        block_m: int = 64,
+        block_k: int = 256,
+        block_n: int = 8,
+    ) -> torch.Tensor:
+        if packed_weight.dtype != torch.uint8:
+            raise ValueError("packed FP4 weights must be uint8")
+        if scales.dtype != torch.uint8:
+            raise ValueError("MXFP4 E8M0 scales must be uint8")
+        if tuple(packed_weight.shape) != (rows, cols // 2):
+            raise ValueError(
+                "packed MXFP4 weight shape must be "
+                f"{(rows, cols // 2)}, got {tuple(packed_weight.shape)}"
+            )
+        if tuple(scales.shape) != (rows, cols // 32):
+            raise ValueError(
+                "MXFP4 scale shape must be "
+                f"{(rows, cols // 32)}, got {tuple(scales.shape)}"
+            )
+        if cols % block_k or block_k % 32:
+            raise ValueError("MXFP4 tensor-core K dimensions must be 32-aligned")
+        _mxfp4_bf16_tensorcore_matvec_kernel[
+            (triton.cdiv(rows, block_m),)
+        ](
+            packed_weight,
+            scales,
+            x,
+            out,
+            rows,
+            cols,
+            int(packed_weight.stride(0)),
+            int(scales.stride(0)),
+            int(scales.stride(1)),
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            num_warps=4,
+            num_stages=3,
         )
         return out
 
@@ -1874,6 +2726,122 @@ class TritonDecodeBackend:
         )
         return out
 
+    def multi_int4_scaled_matvec(
+        self,
+        weights: tuple[torch.Tensor, ...],
+        scales: tuple[torch.Tensor, ...],
+        rows: tuple[int, ...],
+        cols: int,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        if len(weights) not in {2, 3} or len(scales) != len(weights):
+            raise ValueError(
+                "multi INT4 matvec supports two or three matrices"
+            )
+        block_m = 16
+        num_warps = 8
+        weight0, weight1 = weights[:2]
+        weight2 = weights[2] if len(weights) == 3 else weight1
+        scale0, scale1 = scales[:2]
+        scale2 = scales[2] if len(scales) == 3 else scale1
+        rows0, rows1 = rows[:2]
+        rows2 = rows[2] if len(rows) == 3 else 0
+        blocks0 = triton.cdiv(rows0, block_m)
+        blocks1 = triton.cdiv(rows1, block_m)
+        blocks2 = triton.cdiv(rows2, block_m)
+        _multi_int4_scaled_matvec_kernel[
+            (blocks0 + blocks1 + blocks2,)
+        ](
+            weight0,
+            weight1,
+            weight2,
+            scale0,
+            scale1,
+            scale2,
+            x,
+            out,
+            rows0,
+            rows1,
+            rows2,
+            cols,
+            int(weight0.stride(0)),
+            int(weight1.stride(0)),
+            int(weight2.stride(0)),
+            int(scale0.stride(0)),
+            int(scale1.stride(0)),
+            int(scale2.stride(0)),
+            BLOCKS0=blocks0,
+            BLOCKS1=blocks1,
+            BLOCK_M=block_m,
+            BLOCK_B=triton.next_power_of_2((cols + 1) // 2),
+            num_warps=num_warps,
+        )
+        return out
+
+    def multi_scaled_tensorcore_matvec(
+        self,
+        weights: tuple[torch.Tensor, ...],
+        scales: tuple[torch.Tensor, ...],
+        rows: tuple[int, ...],
+        cols: int,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        if len(weights) not in {2, 3} or len(scales) != len(weights):
+            raise ValueError(
+                "multi scaled tensor-core matvec supports two or three matrices"
+            )
+        if cols % 256:
+            raise ValueError("tensor-core matvec columns must be divisible by 256")
+        dtype = weights[0].dtype
+        if dtype not in {torch.float8_e4m3fn, torch.int8}:
+            raise ValueError("tensor-core matvec requires E4M3 or INT8 weights")
+        if any(weight.dtype != dtype for weight in weights):
+            raise ValueError("multi tensor-core weights must share one dtype")
+        block_m = 64
+        block_n = 8 if dtype == torch.float8_e4m3fn else 1
+        weight0, weight1 = weights[:2]
+        weight2 = weights[2] if len(weights) == 3 else weight1
+        scale0, scale1 = scales[:2]
+        scale2 = scales[2] if len(scales) == 3 else scale1
+        rows0, rows1 = rows[:2]
+        rows2 = rows[2] if len(rows) == 3 else 0
+        blocks0 = triton.cdiv(rows0, block_m)
+        blocks1 = triton.cdiv(rows1, block_m)
+        blocks2 = triton.cdiv(rows2, block_m)
+        _multi_scaled_tensorcore_matvec_kernel[
+            (blocks0 + blocks1 + blocks2,)
+        ](
+            weight0,
+            weight1,
+            weight2,
+            scale0,
+            scale1,
+            scale2,
+            x,
+            out,
+            rows0,
+            rows1,
+            rows2,
+            cols,
+            int(weight0.stride(0)),
+            int(weight1.stride(0)),
+            int(weight2.stride(0)),
+            int(scale0.stride(0)),
+            int(scale1.stride(0)),
+            int(scale2.stride(0)),
+            BLOCKS0=blocks0,
+            BLOCKS1=blocks1,
+            BLOCK_M=block_m,
+            BLOCK_K=256,
+            BLOCK_N=block_n,
+            IS_FP8=dtype == torch.float8_e4m3fn,
+            num_warps=4,
+            num_stages=3,
+        )
+        return out
+
     def repeat_kv_matvec(
         self,
         weight: torch.Tensor,
@@ -1938,6 +2906,12 @@ class TritonDecodeBackend:
             )
         token_bucket = max(16, triton.next_power_of_2(tokens))
         block_d = triton.next_power_of_2(head_dim)
+        block_t = int(
+            os.environ.get("THINTENSOR_ATTENTION_BLOCK_T", "16")
+        )
+        num_warps = int(
+            os.environ.get("THINTENSOR_ATTENTION_WARPS", "4")
+        )
         _single_token_gqa_attention_kernel[(heads,)](
             query,
             keys,
@@ -1955,8 +2929,93 @@ class TritonDecodeBackend:
             head_dim=head_dim,
             scale=head_dim**-0.5,
             token_bucket=token_bucket,
-            block_t=16,
+            block_t=block_t,
             block_d=block_d,
+            num_warps=num_warps,
+        )
+        return out
+
+    def split_single_token_gqa_attention(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        out: torch.Tensor,
+        heads: int,
+        kv_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        tokens = int(keys.shape[1])
+        if tokens <= 128:
+            return self.single_token_gqa_attention(
+                query,
+                keys,
+                values,
+                out,
+                heads,
+                kv_heads,
+                head_dim,
+            )
+        token_bucket = max(16, triton.next_power_of_2(tokens))
+        splits = min(8, max(2, token_bucket // 128))
+        partial_count = heads * splits
+        partial_values = partial_count * head_dim
+        if (
+            self._attention_partial_max is None
+            or self._attention_partial_max.numel() < partial_count
+        ):
+            self._attention_partial_max = torch.empty(
+                partial_count,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self._attention_partial_den = torch.empty_like(
+                self._attention_partial_max
+            )
+        if (
+            self._attention_partial_acc is None
+            or self._attention_partial_acc.numel() < partial_values
+        ):
+            self._attention_partial_acc = torch.empty(
+                partial_values,
+                device=self.device,
+                dtype=torch.float32,
+            )
+        assert self._attention_partial_den is not None
+        block_d = triton.next_power_of_2(head_dim)
+        _split_gqa_attention_partial_kernel[(heads, splits)](
+            query,
+            keys,
+            values,
+            self._attention_partial_max,
+            self._attention_partial_den,
+            self._attention_partial_acc,
+            tokens,
+            int(keys.stride(0)),
+            int(keys.stride(1)),
+            int(keys.stride(2)),
+            int(values.stride(0)),
+            int(values.stride(1)),
+            int(values.stride(2)),
+            heads=heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            scale=head_dim**-0.5,
+            token_bucket=token_bucket,
+            SPLITS=splits,
+            BLOCK_T=16,
+            BLOCK_D=block_d,
+            num_warps=4,
+        )
+        _split_gqa_attention_reduce_kernel[(heads,)](
+            self._attention_partial_max,
+            self._attention_partial_den,
+            self._attention_partial_acc,
+            out,
+            heads=heads,
+            head_dim=head_dim,
+            SPLITS=splits,
+            BLOCK_D=block_d,
             num_warps=4,
         )
         return out

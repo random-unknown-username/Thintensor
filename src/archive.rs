@@ -29,7 +29,7 @@ pub struct Header {
     pub archive_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone)
+#[derive(Debug, Clone)]
 pub struct PageTableRecord {
     pub page_id: String,
     pub offset: u64,

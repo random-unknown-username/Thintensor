@@ -22,7 +22,6 @@ KNOWN_MODEL_TYPES = {
     "gpt_oss",
 }
 
-
 @dataclass(frozen=True)
 class ModelDescriptor:
     model_type: str

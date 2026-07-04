@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attention-backend",
-        choices=["torch", "triton_fused"],
+        choices=["torch", "sdpa", "triton_fused", "triton_split"],
         default="torch",
     )
     parser.add_argument("--lm-head-fp8", action="store_true")
@@ -110,6 +110,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qkv-fp8-layers")
     parser.add_argument("--o-fp8-layers")
     parser.add_argument("--fp8-scale-block", type=int, default=0)
+    parser.add_argument(
+        "--adaptive-body-int8-start-token",
+        type=int,
+        default=-1,
+    )
+    parser.add_argument("--body-int4-group-size", type=int, default=0)
+    parser.add_argument("--mxfp4-gate-up-layers")
+    parser.add_argument("--mxfp4-down-layers")
+    parser.add_argument("--mxfp4-qkv-layers")
+    parser.add_argument("--mxfp4-o-layers")
+    parser.add_argument("--lm-head-int4-group-size", type=int, default=0)
     parser.add_argument("--lm-head-fp8-scale-block", type=int, default=0)
     parser.add_argument("--exact-hf-mode", action="store_true")
     parser.add_argument("--dump-layer-debug", type=int)
@@ -307,6 +318,15 @@ def main() -> None:
                 lm_head_argmax_mode=args.lm_head_argmax_mode,
                 stream_weights=args.weight_residency == "stream",
                 weight_prefetch_layers=args.weight_prefetch_layers,
+                adaptive_body_int8_start_token=(
+                    args.adaptive_body_int8_start_token
+                ),
+                body_int4_group_size=args.body_int4_group_size,
+                mxfp4_gate_up_layers=args.mxfp4_gate_up_layers,
+                mxfp4_down_layers=args.mxfp4_down_layers,
+                mxfp4_qkv_layers=args.mxfp4_qkv_layers,
+                mxfp4_o_layers=args.mxfp4_o_layers,
+                lm_head_int4_group_size=args.lm_head_int4_group_size,
             )
             for step in requested_steps:
                 records.append(
@@ -492,6 +512,13 @@ def run_thin_trajectory(
     lm_head_argmax_mode: str = "torch",
     stream_weights: bool = False,
     weight_prefetch_layers: int = 1,
+    adaptive_body_int8_start_token: int = -1,
+    body_int4_group_size: int = 0,
+    mxfp4_gate_up_layers: str | None = None,
+    mxfp4_down_layers: str | None = None,
+    mxfp4_qkv_layers: str | None = None,
+    mxfp4_o_layers: str | None = None,
+    lm_head_int4_group_size: int = 0,
 ) -> dict[str, Any]:
     model = weights.manifest["model"]
     cache = PagedKVCache(
@@ -542,6 +569,13 @@ def run_thin_trajectory(
         attention_mode=attention_mode,
         attention_backend=attention_backend,
         lm_head_argmax_mode=lm_head_argmax_mode,
+        adaptive_body_int8_start_token=adaptive_body_int8_start_token,
+        body_int4_group_size=body_int4_group_size,
+        mxfp4_gate_up_layers=mxfp4_gate_up_layers,
+        mxfp4_down_layers=mxfp4_down_layers,
+        mxfp4_qkv_layers=mxfp4_qkv_layers,
+        mxfp4_o_layers=mxfp4_o_layers,
+        lm_head_int4_group_size=lm_head_int4_group_size,
     )
     hidden = None
     for position in range(int(input_ids.shape[1])):
