@@ -182,7 +182,7 @@ def main() -> None:
         args.hf_model,
         torch_dtype=dtype,
         trust_remote_code=args.trust_remote_code,
-    ).to("cpu")
+    ).to(device)
     hf_model.eval()
     hf_attention_implementation = getattr(
         hf_model.config, "_attn_implementation", "unknown"
@@ -195,7 +195,7 @@ def main() -> None:
         for prefill_len, input_ids in input_ids_by_length.items():
             hf_runs[prefill_len] = run_hf_trajectory(
                 hf_model,
-                input_ids.to("cpu"),
+                input_ids.to(device),
                 requested_steps,
                 max_steps,
             )
@@ -233,14 +233,14 @@ def main() -> None:
         if args.find_first_divergence:
             hf_layer_trace = capture_hf_layer_trace(
                 hf_model,
-                debug_sequence.to("cpu"),
+                debug_sequence.to(device),
                 token_position=debug_token,
                 descriptor=hf_descriptor,
             )
         if detailed_debug_requested:
             hf_debug = capture_hf_components(
                 hf_model,
-                debug_sequence.to("cpu"),
+                debug_sequence.to(device),
                 layer_index=debug_layer,
                 token_position=debug_token,
                 descriptor=hf_descriptor,
@@ -792,6 +792,18 @@ def capture_hf_components(
         "up_proj": getattr(mlp, "up_proj", None),
         "down_proj": getattr(mlp, "down_proj", None),
     }
+    optional = {
+        "pre_feedforward_layernorm": getattr(
+            layer,
+            "pre_feedforward_layernorm",
+            None,
+        ),
+        "post_feedforward_layernorm": getattr(
+            layer,
+            "post_feedforward_layernorm",
+            None,
+        ),
+    }
     missing = [name for name, module in required.items() if module is None]
     if missing:
         raise RuntimeError(
@@ -869,6 +881,13 @@ def capture_hf_components(
             save_output("post_attention_rmsnorm")
         )
     )
+    for name, module in optional.items():
+        if module is not None:
+            handles.append(
+                module.register_forward_hook(
+                    save_output(name.removesuffix("_layernorm") + "_rmsnorm")
+                )
+            )
     for name in ("gate_proj", "up_proj", "down_proj"):
         handles.append(
             required[name].register_forward_hook(
@@ -905,16 +924,26 @@ def capture_hf_components(
         if previous_attention is not None:
             model.config._attn_implementation = previous_attention
 
+    attention_branch = captured["o_proj_output"]
+    if "pre_feedforward_rmsnorm" in captured:
+        attention_branch = captured["post_attention_rmsnorm"]
     captured["post_attention_residual"] = (
-        captured["layer_input"] + captured["o_proj_output"]
+        captured["layer_input"] + attention_branch
     )
-    if descriptor.activation != "silu":
+    if descriptor.activation in {"silu", "swish"}:
+        gated_activation = F.silu(captured["gate_projection"])
+    elif descriptor.activation == "gelu_pytorch_tanh":
+        gated_activation = F.gelu(
+            captured["gate_projection"],
+            approximate="tanh",
+        )
+    else:
         raise RuntimeError(
             f"debug gated activation does not support {descriptor.activation!r}"
         )
-    captured["gated_activation"] = F.silu(
-        captured["gate_projection"]
-    ) * captured["up_projection"]
+    captured["gated_activation"] = (
+        gated_activation * captured["up_projection"]
+    )
     captured["final_logits"] = outputs.logits[
         0, token_position
     ].detach().clone()
@@ -970,7 +999,15 @@ def capture_hf_components(
     scores = torch.matmul(
         query.unsqueeze(1), repeated_keys.transpose(1, 2)
     ).squeeze(1)
-    scores.mul_(descriptor.head_dim**-0.5)
+    scores.mul_(
+        descriptor.query_pre_attn_scalar**-0.5
+        if descriptor.query_pre_attn_scalar is not None
+        else descriptor.head_dim**-0.5
+    )
+    if descriptor.attention_logit_softcap is not None:
+        scores.div_(descriptor.attention_logit_softcap)
+        scores.tanh_()
+        scores.mul_(descriptor.attention_logit_softcap)
     probabilities = torch.softmax(
         scores, dim=-1, dtype=torch.float32
     ).to(dtype=query.dtype)
@@ -1043,6 +1080,12 @@ def capture_hf_layer_trace(
             "post_attention_rmsnorm": getattr(
                 layer, "post_attention_layernorm", None
             ),
+            "pre_feedforward_rmsnorm": getattr(
+                layer, "pre_feedforward_layernorm", None
+            ),
+            "post_feedforward_rmsnorm": getattr(
+                layer, "post_feedforward_layernorm", None
+            ),
             "q_projection": getattr(attention, "q_proj", None),
             "k_projection": getattr(attention, "k_proj", None),
             "v_projection": getattr(attention, "v_proj", None),
@@ -1051,7 +1094,15 @@ def capture_hf_layer_trace(
             "up_projection": getattr(mlp, "up_proj", None),
             "down_projection": getattr(mlp, "down_proj", None),
         }
-        missing = [name for name, module in modules.items() if module is None]
+        optional_modules = {
+            "pre_feedforward_rmsnorm",
+            "post_feedforward_rmsnorm",
+        }
+        missing = [
+            name
+            for name, module in modules.items()
+            if module is None and name not in optional_modules
+        ]
         if missing:
             raise RuntimeError(
                 f"unsupported HF layer {type(layer).__name__} at "
@@ -1085,6 +1136,16 @@ def capture_hf_layer_trace(
                 save_output(prefix + "post_attention_rmsnorm")
             )
         )
+        for name in (
+            "pre_feedforward_rmsnorm",
+            "post_feedforward_rmsnorm",
+        ):
+            if modules[name] is not None:
+                handles.append(
+                    modules[name].register_forward_hook(
+                        save_output(prefix + name)
+                    )
+                )
         for name in ("gate_projection", "up_projection", "down_projection"):
             handles.append(
                 modules[name].register_forward_hook(save_output(prefix + name))
@@ -1115,20 +1176,30 @@ def capture_hf_layer_trace(
         if previous_attention is not None:
             model.config._attn_implementation = previous_attention
 
-    if descriptor.activation != "silu":
+    if descriptor.activation in {"silu", "swish"}:
+        gated = lambda gate, up: F.silu(gate) * up
+    elif descriptor.activation == "gelu_pytorch_tanh":
+        gated = lambda gate, up: F.gelu(
+            gate,
+            approximate="tanh",
+        ) * up
+    else:
         raise RuntimeError(
             f"layer trace gated activation does not support "
             f"{descriptor.activation!r}"
         )
     for layer_index in range(len(layers)):
         prefix = f"layer_{layer_index}."
+        attention_branch = captured[prefix + "o_proj_output"]
+        if prefix + "pre_feedforward_rmsnorm" in captured:
+            attention_branch = captured[prefix + "post_attention_rmsnorm"]
         captured[prefix + "post_attention_residual"] = (
-            captured[prefix + "layer_input"]
-            + captured[prefix + "o_proj_output"]
+            captured[prefix + "layer_input"] + attention_branch
         )
-        captured[prefix + "gated_activation"] = F.silu(
-            captured[prefix + "gate_projection"]
-        ) * captured[prefix + "up_projection"]
+        captured[prefix + "gated_activation"] = gated(
+            captured[prefix + "gate_projection"],
+            captured[prefix + "up_projection"],
+        )
     captured["final_logits"] = outputs.logits[
         0, token_position
     ].detach().clone()
@@ -1143,7 +1214,17 @@ def apply_rope_reference(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not descriptor.layer_uses_rope(layer_index):
         return q, k
-    if descriptor.rope_scaling not in (None, {}):
+    rope_scaling = descriptor.rope_scaling
+    default_rope = (
+        isinstance(rope_scaling, dict)
+        and str(
+            rope_scaling.get("rope_type")
+            or rope_scaling.get("type")
+            or "default"
+        )
+        == "default"
+    )
+    if rope_scaling not in (None, {}) and not default_rope:
         raise RuntimeError(
             f"debug RoPE scaling is unsupported: {descriptor.rope_scaling!r}"
         )
@@ -1763,7 +1844,10 @@ def build_summary(
     )
     top1_all = all(row["top1_same"] for row in records)
     top5_exact = all(row["top5_exact_order"] for row in records)
+    top5_set_exact = all(row["top5_overlap"] == 1.0 for row in records)
     top5_high = all(row["top5_overlap"] >= 0.8 for row in records)
+    minimum_cosine = min(row["cosine_similarity"] for row in records)
+    minimum_top5_overlap = min(row["top5_overlap"] for row in records)
     generated_match = all(
         row["generated_token_match_rate"] >= 0.8 for row in records
     )
@@ -1839,6 +1923,7 @@ def build_summary(
         "kv_residency": args.kv_residency,
         "exact_hf_mode": args.exact_hf_mode,
         "hf_reference_mode": "full_recompute_causal",
+        "hf_reference_device": args.device,
         "hf_attention_implementation": hf_attention_implementation,
         "fp8_scale_block": args.fp8_scale_block,
         "hf_descriptor": hf_descriptor,
@@ -1847,6 +1932,11 @@ def build_summary(
         "thin_config_summary": thin_config_summary,
         "config_mismatches": config_mismatches,
         "correctness_tier": tier,
+        "minimum_cosine_similarity": minimum_cosine,
+        "minimum_top5_overlap": minimum_top5_overlap,
+        "top1_exact_all_records": top1_all,
+        "top5_set_exact_all_records": top5_set_exact,
+        "top5_ordered_exact_all_records": top5_exact,
         "attention_equivalent": attention_equivalent,
         "ranking_equivalent": ranking_pass,
         "hf_equivalent": exact_pass,
@@ -1976,7 +2066,11 @@ def summarize_hf_config(model_dir: Path) -> dict[str, Any]:
         "hidden_act": descriptor.activation,
         "torch_dtype": str(config.get("torch_dtype", "unknown")),
         "sliding_window": config.get("sliding_window"),
-        "use_sliding_window": bool(config.get("use_sliding_window", False)),
+        "use_sliding_window": any(
+            "sliding" in layer_type.lower()
+            for layer_type in descriptor.layer_types
+        ),
+        "layer_types": list(descriptor.layer_types),
         "max_position_embeddings": config.get("max_position_embeddings"),
         "rope_variant": rope_variant or "default",
         "no_rope_layers": list(descriptor.no_rope_layers),
@@ -2008,7 +2102,6 @@ def summarize_thin_config(
             "activation",
             "attention_bias",
             "sliding_window",
-            "use_sliding_window",
             "max_position_embeddings",
         )
         if field not in model
@@ -2032,7 +2125,11 @@ def summarize_thin_config(
             model.get("source_dtype", model.get("dtype", "unknown"))
         ),
         "sliding_window": model.get("sliding_window"),
-        "use_sliding_window": bool(model.get("use_sliding_window", False)),
+        "use_sliding_window": any(
+            "sliding" in layer_type.lower()
+            for layer_type in descriptor.layer_types
+        ),
+        "layer_types": list(descriptor.layer_types),
         "max_position_embeddings": model.get("max_position_embeddings"),
         "rope_variant": rope_variant or "default",
         "no_rope_layers": list(descriptor.no_rope_layers),

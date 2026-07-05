@@ -2292,9 +2292,13 @@ class ThinGpuCausalLMRuntime:
             if self.not_hf_equivalent
             else None
         )
-        if self.descriptor.activation != "silu":
+        if self.descriptor.activation not in {
+            "silu",
+            "swish",
+            "gelu_pytorch_tanh",
+        }:
             raise RuntimeError(
-                "manual runtime currently supports gated SiLU only; "
+                "manual runtime does not support gated activation "
                 f"archive activation is {self.descriptor.activation!r}"
             )
         if self.is_moe and any(
@@ -2323,6 +2327,19 @@ class ThinGpuCausalLMRuntime:
         self.kv_heads = self.manifest_kv_heads
         self.norm_kind = self.descriptor.norm_kind
         self.norm_eps = float(self.descriptor.norm_eps)
+        self.norm_weight_offset = float(
+            self.descriptor.norm_weight_offset
+        )
+        self.embedding_scale = float(self.descriptor.embedding_scale)
+        self.attention_logit_softcap = (
+            self.descriptor.attention_logit_softcap
+        )
+        self.final_logit_softcap = self.descriptor.final_logit_softcap
+        self.attention_scale = (
+            float(self.descriptor.query_pre_attn_scalar) ** -0.5
+            if self.descriptor.query_pre_attn_scalar is not None
+            else None
+        )
         # Retained for head RMSNorm and older telemetry/call sites.
         self.rms_norm_eps = self.norm_eps
         self.partial_rotary_factor = float(
@@ -4107,6 +4124,13 @@ class ThinGpuCausalLMRuntime:
                 layer_count,
                 token_index,
             )
+        elif self.descriptor.model_type == "gemma2":
+            res = self._forward_token_pytorch_fallback(
+                embed,
+                token_id,
+                layer_count,
+                token_index,
+            )
         elif (
             self.has_fused_qkv_projection
             or self.has_fused_gate_up_projection
@@ -4384,6 +4408,7 @@ class ThinGpuCausalLMRuntime:
         )
         if (
             self.attention_backend == "sdpa"
+            and self.attention_logit_softcap is None
             and sinks is None
             and self._debug_layer is None
             and not self._debug_all_layers
@@ -4403,6 +4428,7 @@ class ThinGpuCausalLMRuntime:
             return mixed.reshape(self.heads * self.head_dim)
         if (
             self.attention_backend in {"triton_fused", "triton_split"}
+            and self.attention_logit_softcap is None
             and self.kernel_backend is not None
             and (
                 self._adaptive_switch_token_index < 0
@@ -4446,7 +4472,15 @@ class ThinGpuCausalLMRuntime:
         if lev is not None:
             lev.qk_start.record()
         scores = torch.einsum("kgd,ktd->kgt", query, keys)
-        scores.mul_(self.head_dim**-0.5)
+        scores.mul_(
+            self.attention_scale
+            if self.attention_scale is not None
+            else self.head_dim**-0.5
+        )
+        if self.attention_logit_softcap is not None:
+            scores.div_(self.attention_logit_softcap)
+            scores.tanh_()
+            scores.mul_(self.attention_logit_softcap)
         self._capture_debug(layer, "attention_scores", scores)
         if lev is not None:
             lev.qk_end.record()
@@ -4494,6 +4528,14 @@ class ThinGpuCausalLMRuntime:
         token_index: int,
     ) -> torch.Tensor:
         hidden = embed[token_id].clone()
+        if self.embedding_scale != 1.0:
+            hidden.mul_(
+                torch.tensor(
+                    self.embedding_scale,
+                    device=hidden.device,
+                    dtype=hidden.dtype,
+                )
+            )
         for layer in range(layer_count):
             self._capture_debug(layer, "layer_input", hidden)
             for distance in range(1, self.prefetch_distance + 1):
@@ -4821,6 +4863,14 @@ class ThinGpuCausalLMRuntime:
         token_index: int,
     ) -> torch.Tensor:
         hidden = embed[token_id].clone()
+        if self.embedding_scale != 1.0:
+            hidden.mul_(
+                torch.tensor(
+                    self.embedding_scale,
+                    device=hidden.device,
+                    dtype=hidden.dtype,
+                )
+            )
         buffers = (
             self.kernel_backend.buffers
             if self.kernel_backend is not None
@@ -4979,17 +5029,46 @@ class ThinGpuCausalLMRuntime:
             self._capture_debug(layer, "o_proj_output", attn_out)
             if getattr(self, "_profiler_enabled", False):
                 lev.o_proj_end.record()
+            if self.descriptor.model_type == "gemma2":
+                attn_out = self._normalization(
+                    attn_out,
+                    _layer_tensor(
+                        layer,
+                        "post_attention_layernorm.weight",
+                    ),
+                )
+                self._capture_debug(
+                    layer,
+                    "post_attention_rmsnorm",
+                    attn_out,
+                )
             hidden = hidden + attn_out
             self._capture_debug(layer, "post_attention_residual", hidden)
             if getattr(self, "_profiler_enabled", False):
                 lev.attn_end.record()
                 lev.mlp_start.record()
 
+            mlp_norm_suffix = (
+                "pre_feedforward_layernorm.weight"
+                if self.descriptor.model_type == "gemma2"
+                else "post_attention_layernorm.weight"
+            )
             normed = self._normalization(
                 hidden,
-                _layer_tensor(layer, "post_attention_layernorm.weight"),
+                _layer_tensor(layer, mlp_norm_suffix),
             )
-            self._capture_debug(layer, "post_attention_rmsnorm", normed)
+            if self.descriptor.model_type == "gemma2":
+                self._capture_debug(
+                    layer,
+                    "pre_feedforward_rmsnorm",
+                    normed,
+                )
+            else:
+                self._capture_debug(
+                    layer,
+                    "post_attention_rmsnorm",
+                    normed,
+                )
             if getattr(self, "_profiler_enabled", False):
                 lev.gate_proj_start.record()
             gate_up = self._fused_gate_up(layer, normed)
@@ -5048,7 +5127,16 @@ class ThinGpuCausalLMRuntime:
             if getattr(self, "_profiler_enabled", False):
                 lev.gate_proj_end.record()
                 lev.silu_mul_start.record()
-            if buffers is not None and self.kernel_backend is not None:
+            if self.descriptor.activation == "gelu_pytorch_tanh":
+                silu_val = torch.nn.functional.gelu(
+                    gate,
+                    approximate="tanh",
+                )
+                silu_val.mul_(up)
+                if buffers is not None:
+                    buffers.mlp_act.copy_(silu_val)
+                    silu_val = buffers.mlp_act
+            elif buffers is not None and self.kernel_backend is not None:
                 silu_val = self._runtime_silu_mul(
                     gate,
                     up,
@@ -5072,6 +5160,19 @@ class ThinGpuCausalLMRuntime:
             if down_bias is not None:
                 mlp.add_(down_bias)
             self._capture_debug(layer, "down_projection", mlp)
+            if self.descriptor.model_type == "gemma2":
+                mlp = self._normalization(
+                    mlp,
+                    _layer_tensor(
+                        layer,
+                        "post_feedforward_layernorm.weight",
+                    ),
+                )
+                self._capture_debug(
+                    layer,
+                    "post_feedforward_rmsnorm",
+                    mlp,
+                )
             if getattr(self, "_profiler_enabled", False):
                 lev.down_proj_end.record()
             hidden = hidden + mlp
@@ -5721,7 +5822,9 @@ class ThinGpuCausalLMRuntime:
                         self._logits_buffer,
                     )
                     bias = _optional_tensor(self.weights, "lm_head.bias")
-                    return result.add_(bias) if bias is not None else result
+                    if bias is not None:
+                        result.add_(bias)
+                    return self._apply_final_logit_softcap(result)
                 result = self.kernel_backend.scaled_matvec(
                     head,
                     self._lm_head_scale,
@@ -5734,7 +5837,7 @@ class ThinGpuCausalLMRuntime:
                 bias = _optional_tensor(self.weights, "lm_head.bias")
                 if bias is not None:
                     result.add_(bias)
-                return result
+                return self._apply_final_logit_softcap(result)
             if (
                 choice in {"triton", "triton_basic"}
                 or choice.startswith("triton_loop_")
@@ -5758,10 +5861,25 @@ class ThinGpuCausalLMRuntime:
                     num_warps=num_warps,
                 )
                 bias = _optional_tensor(self.weights, "lm_head.bias")
-                return result.add_(bias) if bias is not None else result
+                if bias is not None:
+                    result.add_(bias)
+                return self._apply_final_logit_softcap(result)
         result = torch.mv(head, hidden, out=self._logits_buffer)
         bias = _optional_tensor(self.weights, "lm_head.bias")
-        return result.add_(bias) if bias is not None else result
+        if bias is not None:
+            result.add_(bias)
+        return self._apply_final_logit_softcap(result)
+
+    def _apply_final_logit_softcap(
+        self,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.final_logit_softcap is None:
+            return logits
+        logits.div_(self.final_logit_softcap)
+        logits.tanh_()
+        logits.mul_(self.final_logit_softcap)
+        return logits
 
     @torch.inference_mode()
     def topk(
@@ -6961,7 +7079,12 @@ class ThinGpuCausalLMRuntime:
     ) -> torch.Tensor:
         weight = self.weights.tensor(weight_id)
         if self.norm_kind == "rms_norm":
-            return _rms_norm(x, weight, self.norm_eps)
+            return _rms_norm(
+                x,
+                weight,
+                self.norm_eps,
+                weight_offset=self.norm_weight_offset,
+            )
         bias = _optional_tensor(
             self.weights,
             weight_id.removesuffix(".weight") + ".bias",
@@ -6984,6 +7107,15 @@ class ThinGpuCausalLMRuntime:
         backend = self.kernel_backend
         assert backend is not None
         if self.norm_kind == "rms_norm":
+            if self.norm_weight_offset:
+                value = _rms_norm(
+                    x,
+                    weight,
+                    self.norm_eps,
+                    weight_offset=self.norm_weight_offset,
+                )
+                out.copy_(value)
+                return out
             return backend.rms_norm(
                 x,
                 weight,
@@ -7310,9 +7442,18 @@ def _fused_matrix_for_layer(
     return matrix
 
 
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    weight_offset: float = 0.0,
+) -> torch.Tensor:
     work = x.float()
-    return (work * torch.rsqrt(work.pow(2).mean() + eps)).to(dtype=x.dtype) * weight
+    normed = work * torch.rsqrt(work.pow(2).mean() + eps)
+    if weight_offset:
+        return (normed * (weight.float() + weight_offset)).to(dtype=x.dtype)
+    return normed.to(dtype=x.dtype) * weight
 
 
 def _head_rms_norm(

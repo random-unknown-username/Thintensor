@@ -88,7 +88,11 @@ def analyze_config(
     model_type = str(config.get("model_type") or "unknown")
     architectures = config.get("architectures") or ()
     architecture = str(architectures[0] if architectures else model_type)
-    activation = str(config.get("hidden_act") or "silu").lower()
+    activation = str(
+        config.get("hidden_act")
+        or config.get("hidden_activation")
+        or "silu"
+    ).lower()
     experts = int(
         config.get("num_local_experts")
         or config.get("num_experts")
@@ -136,7 +140,10 @@ def _semantic_reasons(
         if config.get(field) is None and config.get(archive_field) is None:
             reasons.append(f"missing required geometry field {field}")
 
-    if activation not in {"silu", "swish"}:
+    supported_activations = {"silu", "swish"}
+    if str(config.get("model_type") or "").lower() == "gemma2":
+        supported_activations.add("gelu_pytorch_tanh")
+    if activation not in supported_activations:
         reasons.append(
             f"native gated-MLP engine does not implement activation {activation!r}"
         )
@@ -192,6 +199,16 @@ def _semantic_reasons(
             )
             if not separate_mlp and not fused_mlp:
                 reasons.append("native tensor layout requires a gated MLP")
+            if str(config.get("model_type") or "").lower() == "gemma2":
+                for suffix in (
+                    "pre_feedforward_layernorm.weight",
+                    "post_feedforward_layernorm.weight",
+                ):
+                    name = f"model.layers.0.{suffix}"
+                    if name not in names:
+                        reasons.append(
+                            f"Gemma2 native layout is missing {name}"
+                        )
         elif not any(
             name.startswith("model.layers.0.mlp.experts.")
             or name.startswith("model.layers.0.block_sparse_moe.experts.")
@@ -247,7 +264,10 @@ def _result(
         capabilities.append(f"partial_rope:{partial_rotary:g}")
     if family == "decoder_dense":
         capabilities.extend(("fp8_projections", "adaptive_int8"))
-    if config.get("sliding_window") is not None or config.get("layer_types"):
+    if config.get("layer_types") or (
+        config.get("sliding_window") is not None
+        and bool(config.get("use_sliding_window", True))
+    ):
         capabilities.append("sliding_attention")
     if config.get("attention_sinks"):
         capabilities.append("attention_sinks")

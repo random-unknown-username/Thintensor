@@ -129,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_pull.add_argument("--dir", type=str, help="Target directory")
     p_pull.add_argument("--revision", type=str, default="main", help="Git revision")
     p_pull.add_argument("--token", type=str, help="HF API token")
+    p_pull.add_argument(
+        "--download-backend",
+        choices=["auto", "python", "hf-cli"],
+        default="auto",
+        help="Downloader; auto prefers an authenticated `hf` CLI session",
+    )
 
     p_run = sub.add_parser(
         "run",
@@ -526,6 +532,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
         target_dir=target_dir,
         revision=args.revision,
         token=args.token,
+        backend=args.download_backend,
     )
     from .capabilities import analyze_hf_directory
 
@@ -908,6 +915,19 @@ def cmd_bench(args: argparse.Namespace) -> None:
                             speed, (int, float)
                         ):
                             row["speedup_vs_transformers"] = speed / hf_speed
+                hf_peak = hf_result.get("gpu_peak_allocated_bytes")
+                if isinstance(hf_peak, (int, float)) and hf_peak > 0:
+                    for row in results:
+                        thin_peak = row.get("gpu_peak_allocated_bytes")
+                        if (
+                            row.get("engine") == "thintensor"
+                            and isinstance(thin_peak, (int, float))
+                        ):
+                            saved = hf_peak - thin_peak
+                            row["gpu_peak_memory_saved_bytes"] = saved
+                            row["gpu_peak_memory_reduction_fraction"] = (
+                                saved / hf_peak
+                            )
         _print_bench_table(results, json_output=args.json, out_dir=args.out)
     if args.require_faster_than_hf and not args.dry_run:
         if not args.hf_model:
@@ -1526,7 +1546,13 @@ def _archive_model(archive_path: str) -> dict[str, Any]:
         model = archive.manifest.get("model")
         if not isinstance(model, dict):
             raise ValueError("archive manifest has no model descriptor")
-        return dict(model)
+        result = dict(model)
+        result["_physical_weight_bytes"] = sum(
+            int(page.get("size") or 0)
+            for page in archive.manifest.get("pages", ())
+            if not page.get("fused_to")
+        )
+        return result
     finally:
         archive.close()
 
@@ -1585,24 +1611,54 @@ def _adapt_profile_for_device(
 ) -> dict[str, Any]:
     if device != "cpu":
         result = dict(profile)
-        tied_head_bytes = (
+        tied_head_elements = (
             int(model.get("vocab_size") or 0)
             * int(model.get("hidden_size") or 0)
+        )
+        estimated_fp8_head_bytes = (
+            tied_head_elements
+            + int(model.get("vocab_size") or 0) * 4
+        )
+        resident_weight_bytes = int(
+            model.get("_physical_weight_bytes") or 0
+        )
+        total_device_bytes = 0
+        try:
+            import torch
+
+            total_device_bytes = int(
+                torch.cuda.get_device_properties(device).total_memory
+            )
+        except Exception:
+            pass
+        reserve_bytes = max(
+            512 * 1024 * 1024,
+            total_device_bytes // 10,
+        )
+        duplicate_head_fits = bool(
+            total_device_bytes
+            and resident_weight_bytes
+            and resident_weight_bytes
+            + estimated_fp8_head_bytes
+            + reserve_bytes
+            <= total_device_bytes
         )
         if (
             result.get("lm_head_fp8")
             and bool(model.get("tie_word_embeddings"))
-            and tied_head_bytes >= 384 * 1024 * 1024
+            and not duplicate_head_fits
         ):
             # A tied embedding cannot be replaced by the FP8 execution head.
-            # Very large vocabularies would therefore require a second
-            # multi-hundred-MiB copy before body quantization frees memory.
+            # Keep the exact shared embedding and disable the acceleration
+            # copy only when the archive weights, FP8 head, and a runtime
+            # reserve do not fit together on the selected device.
             result["lm_head_fp8"] = False
             result["keep_bf16_lm_head"] = True
             result["lm_head_topk_guard"] = 0
             result["profile_adaptations"] = [
                 *result.get("profile_adaptations", []),
-                "disabled duplicate FP8 head for large tied vocabulary",
+                "disabled duplicate FP8 head because it exceeds the device "
+                "residency budget",
             ]
         return result
     if requested_name.strip().lower() == "auto":
@@ -2889,6 +2945,7 @@ def _print_inspect_from_archive(archive, archive_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 _tokenizer_cache: dict[str, Any] = {}
+_eos_token_cache: dict[str, frozenset[int]] = {}
 
 
 def _get_tokenizer(
@@ -3060,20 +3117,65 @@ def _is_eos(
     tokenizer_source: Optional[str] = None,
 ) -> bool:
     """Check if a token is EOS."""
+    cache_key = f"{archive_path}\0{tokenizer_source or ''}"
+    cached = _eos_token_cache.get(cache_key)
+    if cached is not None:
+        return token_id in cached
+
     tokenizer = _get_tokenizer(
         archive_path,
         manifest,
         tokenizer_source=tokenizer_source,
     )
 
-    if tokenizer is not None:
-        eos_id = getattr(tokenizer, "eos_token_id", None)
-        if eos_id is not None:
-            if isinstance(eos_id, (list, tuple)):
-                return token_id in eos_id
-            return token_id == eos_id
+    eos_ids: set[int] = set()
 
-    return False
+    def add_ids(value: Any) -> None:
+        if isinstance(value, int):
+            eos_ids.add(value)
+        elif isinstance(value, (list, tuple)):
+            eos_ids.update(int(item) for item in value if isinstance(item, int))
+
+    if tokenizer is not None:
+        add_ids(getattr(tokenizer, "eos_token_id", None))
+    add_ids(manifest.get("model", {}).get("eos_token_id"))
+
+    source_paths: list[Path] = []
+    if tokenizer_source and Path(tokenizer_source).is_dir():
+        source_paths.append(Path(tokenizer_source))
+    if tokenizer is not None:
+        name_or_path = Path(str(getattr(tokenizer, "name_or_path", "")))
+        if name_or_path.is_dir():
+            source_paths.append(name_or_path)
+    source_paths.append(Path(archive_path).parent)
+    try:
+        from .model_cache import cached_model_path
+
+        source_paths.append(
+            cached_model_path(Path(archive_path).stem.replace("--", "/"))
+        )
+    except Exception:
+        pass
+
+    seen: set[Path] = set()
+    for source in source_paths:
+        source = source.resolve()
+        if source in seen:
+            continue
+        seen.add(source)
+        for filename in ("generation_config.json", "config.json"):
+            config_path = source / filename
+            if not config_path.is_file():
+                continue
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            add_ids(config.get("eos_token_id"))
+
+    frozen = frozenset(eos_ids)
+    _eos_token_cache[cache_key] = frozen
+    return token_id in frozen
 
 
 # ---------------------------------------------------------------------------

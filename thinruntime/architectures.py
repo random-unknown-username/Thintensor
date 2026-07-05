@@ -96,7 +96,22 @@ ARCHITECTURES: tuple[ArchitectureStatus, ...] = (
         attention="mha_or_gqa_rope",
         mlp="swiglu",
         native_status="candidate",
-        blockers=("matched correctness and HF speed gates not recorded",),
+        minimum_cosine=0.997788191,
+        top1_exact=True,
+        top5_set_exact=False,
+        top5_ordered_exact=False,
+        thin_tokens_per_s=180.284765,
+        hf_tokens_per_s=132.364647,
+        speedup_vs_hf=1.362031,
+        evidence_scope=(
+            "TinyLlama-1.1B-Chat-v1.0, RTX 5050 Laptop GPU, all public "
+            "profiles at 200 tokens plus 1000-token prefill/50-step full-KV "
+            "retention; max profile is faster but not promoted"
+        ),
+        blockers=(
+            "strict short-suite top-5 set equality misses one BF16 cutoff tie",
+            "a larger Llama checkpoint still needs an independent gate",
+        ),
     ),
     ArchitectureStatus(
         name="mistral",
@@ -110,15 +125,37 @@ ARCHITECTURES: tuple[ArchitectureStatus, ...] = (
         blockers=("matched correctness and HF speed gates not recorded",),
     ),
     ArchitectureStatus(
-        name="qwen",
-        aliases=("qwen2", "qwen2_5", "qwen3"),
+        name="qwen2",
+        aliases=("qwen2", "qwen2_5"),
         family="dense_decoder",
         tensor_schema="hf_separate_qkv_gated_mlp",
         normalization="rms_norm",
-        attention="gqa_rope_optional_qk_norm",
+        attention="gqa_rope",
+        mlp="swiglu",
+        native_status="verified",
+        validated_profile="max-performance",
+        minimum_cosine=0.998892486,
+        top1_exact=True,
+        top5_set_exact=True,
+        top5_ordered_exact=True,
+        thin_tokens_per_s=93.079443,
+        hf_tokens_per_s=48.183090,
+        speedup_vs_hf=1.931787,
+        evidence_scope=(
+            "Qwen2.5-3B-Instruct, RTX 5050 Laptop GPU, repeated 500-token "
+            "warmed full-causal decode plus all public profiles at 200 tokens"
+        ),
+    ),
+    ArchitectureStatus(
+        name="qwen3",
+        aliases=("qwen3",),
+        family="dense_decoder",
+        tensor_schema="hf_separate_qkv_gated_mlp",
+        normalization="rms_norm_with_qk_norm",
+        attention="gqa_rope_qk_norm",
         mlp="swiglu",
         native_status="candidate",
-        blockers=("per-architecture matched HF speed gates are incomplete",),
+        blockers=("matched Qwen3 correctness and HF speed gates are incomplete",),
     ),
     ArchitectureStatus(
         name="phi",
@@ -166,17 +203,51 @@ ARCHITECTURES: tuple[ArchitectureStatus, ...] = (
         blockers=("separate-expert repack and matched performance gate pending",),
     ),
     ArchitectureStatus(
-        name="gemma",
-        aliases=("gemma", "gemma2", "gemma3", "gemma3_text"),
+        name="gemma2",
+        aliases=("gemma2",),
         family="dense_decoder",
         tensor_schema="hf_separate_qkv_gated_mlp",
-        normalization="rms_norm",
+        normalization="unit_offset_rms_norm",
+        attention="gqa_interleaved_local_global",
+        mlp="geglu",
+        native_status="verified",
+        validated_profile="max-performance",
+        minimum_cosine=0.999554813,
+        top1_exact=True,
+        top5_set_exact=True,
+        top5_ordered_exact=True,
+        thin_tokens_per_s=57.289261,
+        hf_tokens_per_s=53.580533,
+        speedup_vs_hf=1.069218,
+        evidence_scope=(
+            "Gemma-2-2B-IT, RTX 5050 Laptop GPU, repeated 200-token warmed "
+            "full-causal decode plus all public profiles; targeted 128-token "
+            "prefill and 50-step adaptive-path validation, full BF16 KV"
+        ),
+    ),
+    ArchitectureStatus(
+        name="gemma",
+        aliases=("gemma",),
+        family="dense_decoder",
+        tensor_schema="hf_separate_qkv_gated_mlp",
+        normalization="unit_offset_rms_norm",
+        attention="gqa_rope",
+        mlp="geglu",
+        native_status="fallback",
+        blockers=("Gemma 1 semantics need an independent correctness gate",),
+    ),
+    ArchitectureStatus(
+        name="gemma3",
+        aliases=("gemma3", "gemma3_text"),
+        family="dense_decoder",
+        tensor_schema="hf_separate_qkv_gated_mlp",
+        normalization="unit_offset_rms_norm_with_qk_norm",
         attention="gqa_interleaved_local_global",
         mlp="geglu",
         native_status="fallback",
         blockers=(
-            "native GeGLU activation is not implemented",
-            "Gemma-specific scaling and attention semantics need validation",
+            "Gemma 3 QK normalization and scaling need native implementation",
+            "matched correctness and HF speed gates not recorded",
         ),
     ),
     ArchitectureStatus(

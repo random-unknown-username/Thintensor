@@ -11,9 +11,9 @@ import os
 from typing import Any, Mapping
 
 
-DENSE_SILU_CAPABILITY = {
+DENSE_GATED_CAPABILITY = {
     "architecture_family": "decoder_dense",
-    "activation": "silu",
+    "activation": ("silu", "swish", "gelu_pytorch_tanh"),
 }
 
 
@@ -65,7 +65,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "fused_scaled_mlp": False,
         "fused_residual_norm": False,
         "experimental": False,
-        "required_capabilities": DENSE_SILU_CAPABILITY,
+        "required_capabilities": DENSE_GATED_CAPABILITY,
         "intent": "Use native kernels for speed without approximate weight storage.",
         "quality_contract": (
             "No weight quantization. Kernel-order rounding is possible; full "
@@ -73,7 +73,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         ),
         "retention_contract": "Full causal history; no KV compression or eviction.",
         "speed_contract": "Model and hardware dependent; run `thintensor bench`.",
-        "recommended_for": "Portable default for supported dense SiLU decoders.",
+        "recommended_for": "Portable default for supported dense gated decoders.",
         "tradeoffs": (
             "Requires a CUDA/Triton-compatible native decoder.",
             "Not every HF architecture has a native ThinTensor engine yet.",
@@ -82,7 +82,7 @@ PROFILES: dict[str, dict[str, Any]] = {
     "max-performance": {
         "label": "Maximum single-stream performance",
         "description": (
-            "Portable opt-in speed profile for compatible dense SiLU decoders: "
+            "Portable opt-in speed profile for compatible dense gated decoders: "
             "exact prefill and early generated tokens, adaptive INT8 body "
             "weights, fused causal attention, guarded FP8 head, and guarded "
             "INT8 tensor-core dispatch."
@@ -105,7 +105,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "fused_scaled_mlp": False,
         "fused_residual_norm": False,
         "experimental": True,
-        "required_capabilities": DENSE_SILU_CAPABILITY,
+        "required_capabilities": DENSE_GATED_CAPABILITY,
         "intent": "Minimize single-stream weight bandwidth on supported GPUs.",
         "quality_contract": (
             "Prefill and the first 18 generated-token positions use exact body "
@@ -260,7 +260,12 @@ def geometry_matches(
     expected: Mapping[str, Any],
 ) -> bool:
     """Backward-compatible capability matcher."""
-    return all(_model_value(model, key) == value for key, value in expected.items())
+    return all(
+        _model_value(model, key) in value
+        if isinstance(value, (tuple, list, set, frozenset))
+        else _model_value(model, key) == value
+        for key, value in expected.items()
+    )
 
 
 def profile_compatibility(
@@ -272,7 +277,14 @@ def profile_compatibility(
         return True, None
     if geometry_matches(model, expected):
         return True, None
-    expected_text = ", ".join(f"{key}={value}" for key, value in expected.items())
+    expected_text = ", ".join(
+        (
+            f"{key} in {tuple(value)}"
+            if isinstance(value, (tuple, list, set, frozenset))
+            else f"{key}={value}"
+        )
+        for key, value in expected.items()
+    )
     actual_text = ", ".join(
         f"{key}={_model_value(model, key)!r}" for key in expected
     )

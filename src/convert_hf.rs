@@ -278,15 +278,42 @@ fn build_model_spec(
             .cloned(),
         source_dtype,
         vocab_size: optional_u64(config, "vocab_size"),
-        tie_word_embeddings: config.get("tie_word_embeddings").and_then(Value::as_bool),
-        activation: optional_string(config, "hidden_act"),
+        tie_word_embeddings: Some(
+            config
+                .get("tie_word_embeddings")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    matches!(
+                        config.get("model_type").and_then(Value::as_str),
+                        Some("gemma" | "gemma2")
+                    )
+                }),
+        ),
+        activation: optional_string(config, "hidden_act")
+            .or_else(|| optional_string(config, "hidden_activation")),
         qkv_bias: config
             .get("qkv_bias")
             .or_else(|| config.get("attention_bias"))
             .and_then(Value::as_bool),
         attention_bias: config.get("attention_bias").and_then(Value::as_bool),
         tensor_naming_scheme: Some("hf_decoder_layers".to_string()),
-        attention_variants: vec!["causal_kv".to_string(), "current_only_smoke".to_string()],
+        attention_variants: {
+            let mut variants = vec!["causal_kv".to_string(), "current_only_smoke".to_string()];
+            let has_layer_types = config
+                .get("layer_types")
+                .and_then(Value::as_array)
+                .is_some_and(|values| !values.is_empty());
+            let uses_sliding_window = config
+                .get("use_sliding_window")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if has_layer_types
+                || optional_u64(config, "sliding_window").is_some() && uses_sliding_window
+            {
+                variants.push("sliding_causal_kv".to_string());
+            }
+            variants
+        },
         supported_precision_modes,
         no_rope_layers: config
             .get("no_rope_layers")
@@ -302,10 +329,7 @@ fn build_model_spec(
         sliding_window: optional_u64(config, "sliding_window"),
         use_sliding_window: config.get("use_sliding_window").and_then(Value::as_bool),
         max_position_embeddings: optional_u64(config, "max_position_embeddings"),
-        original_max_position_embeddings: optional_u64(
-            config,
-            "original_max_position_embeddings",
-        ),
+        original_max_position_embeddings: optional_u64(config, "original_max_position_embeddings"),
         rope_variant: config
             .get("rope_scaling")
             .and_then(|value| value.get("rope_type").or_else(|| value.get("type")))
@@ -331,12 +355,40 @@ fn build_model_spec(
                     .map(ToOwned::to_owned)
                     .collect()
             })
-            .unwrap_or_default(),
+            .unwrap_or_else(|| {
+                if config.get("model_type").and_then(Value::as_str) == Some("gemma2") {
+                    (0..layers)
+                        .map(|layer| {
+                            if layer % 2 == 0 {
+                                "sliding_attention"
+                            } else {
+                                "full_attention"
+                            }
+                            .to_string()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }),
         attention_sinks: Some(attention_sinks),
         num_local_experts,
         num_experts_per_token,
         swiglu_alpha: optional_f64(config, "swiglu_alpha"),
         swiglu_limit: optional_f64(config, "swiglu_limit"),
+        norm_weight_offset: if config.get("model_type").and_then(Value::as_str) == Some("gemma2") {
+            Some(1.0)
+        } else {
+            None
+        },
+        embedding_scale: if config.get("model_type").and_then(Value::as_str) == Some("gemma2") {
+            Some((hidden_size as f64).sqrt())
+        } else {
+            None
+        },
+        query_pre_attn_scalar: optional_f64(config, "query_pre_attn_scalar"),
+        attention_logit_softcap: optional_f64(config, "attn_logit_softcapping"),
+        final_logit_softcap: optional_f64(config, "final_logit_softcapping"),
         rope_parameters: config
             .get("rope_parameters")
             .or_else(|| config.get("rope_scaling"))
@@ -478,6 +530,8 @@ fn build_execution_tape(
         let k_norm = layer_tensor(layer, "self_attn.k_norm.weight");
         let o_proj = layer_tensor(layer, "self_attn.o_proj.weight");
         let post_norm = layer_tensor(layer, "post_attention_layernorm.weight");
+        let pre_feedforward_norm = layer_tensor(layer, "pre_feedforward_layernorm.weight");
+        let post_feedforward_norm = layer_tensor(layer, "post_feedforward_layernorm.weight");
         let gate_proj = layer_tensor(layer, "mlp.gate_proj.weight");
         let up_proj = layer_tensor(layer, "mlp.up_proj.weight");
         let fused_gate_up = layer_tensor(layer, "mlp.gate_up_proj.weight");
@@ -525,10 +579,7 @@ fn build_execution_tape(
             &mut input_norm_refs,
             layer_tensor(layer, "input_layernorm.bias"),
         );
-        stages.push(stage(
-            format!("layer_{layer}_input_norm"),
-            input_norm_refs,
-        ));
+        stages.push(stage(format!("layer_{layer}_input_norm"), input_norm_refs));
 
         let mut qkv_refs = if let Some(refs) = fused_qkv_refs {
             refs
@@ -579,6 +630,12 @@ fn build_execution_tape(
             format!("layer_{layer}_post_attn_norm"),
             post_norm_refs,
         ));
+        if tensors.contains_key(&pre_feedforward_norm) {
+            stages.push(stage(
+                format!("layer_{layer}_pre_feedforward_norm"),
+                vec![pre_feedforward_norm],
+            ));
+        }
         if let (Some(router), Some(packed_gate_up), Some(packed_down)) =
             (router.clone(), packed_gate_up, packed_down)
         {
@@ -650,6 +707,12 @@ fn build_execution_tape(
             }));
             stages.push(stage(format!("layer_{layer}_mlp_down"), down_refs));
         }
+        if tensors.contains_key(&post_feedforward_norm) {
+            stages.push(stage(
+                format!("layer_{layer}_post_feedforward_norm"),
+                vec![post_feedforward_norm],
+            ));
+        }
     }
 
     if missing_q_norm > 0 {
@@ -665,11 +728,7 @@ fn build_execution_tape(
 
     if tensors.contains_key(FINAL_NORM) {
         let mut final_norm_refs = vec![FINAL_NORM.to_string()];
-        push_if_present(
-            tensors,
-            &mut final_norm_refs,
-            "model.norm.bias".to_string(),
-        );
+        push_if_present(tensors, &mut final_norm_refs, "model.norm.bias".to_string());
         stages.push(stage("final_norm", final_norm_refs));
     }
     if tensors.contains_key(LM_HEAD) {
@@ -702,6 +761,8 @@ fn warn_unknown_tensors(
             "self_attn.q_norm.weight",
             "self_attn.k_norm.weight",
             "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
             "mlp.gate_proj.weight",
             "mlp.up_proj.weight",
             "mlp.down_proj.weight",
@@ -915,6 +976,10 @@ fn op_from_tensor(name: &str) -> &str {
         "attn_k_norm"
     } else if name.ends_with("post_attention_layernorm.weight") {
         "post_attention_layernorm"
+    } else if name.ends_with("pre_feedforward_layernorm.weight") {
+        "pre_feedforward_layernorm"
+    } else if name.ends_with("post_feedforward_layernorm.weight") {
+        "post_feedforward_layernorm"
     } else if name.ends_with("self_attn.sinks") {
         "attention_sinks"
     } else if name.ends_with("mlp.router.weight") || name.ends_with("block_sparse_moe.gate.weight")

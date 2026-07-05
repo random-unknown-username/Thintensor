@@ -5,8 +5,9 @@ benchmarking, and validating causal language models.
 
 The CLI routes by model capability rather than repository name:
 
-- compatible RMSNorm + gated-SiLU decoder models use the native ThinTensor
-  runtime;
+- registered gated-decoder semantics use the native ThinTensor runtime,
+  including standard SiLU blocks and Gemma2's unit-offset RMSNorm, GeGLU, and
+  interleaved local/global attention;
 - other Transformers causal-LM architectures remain runnable through a
   clearly labelled compatibility engine;
 - compatibility-engine measurements are never reported as ThinTensor speedups.
@@ -60,6 +61,18 @@ thintensor convert ~/.cache/thintensor/models/Qwen--Qwen3-0.6B \
 thintensor inspect Qwen3-0.6B.thin --verify
 ```
 
+For gated models, authenticate with the official Hugging Face CLI and accept
+the model license once on the Hub:
+
+```bash
+hf auth login
+thintensor pull meta-llama/Llama-3.2-1B-Instruct \
+  --download-backend hf-cli
+```
+
+`auto` prefers an authenticated `hf` CLI session. Explicit tokens are passed
+through the environment rather than command-line arguments.
+
 Conversion is deterministic and followed by archive verification unless
 `--no-verify` is explicitly selected.
 
@@ -110,10 +123,18 @@ Architecture status is stricter than load compatibility:
 Current matched verified results on the development RTX 5050 Laptop GPU:
 
 - SmolLM3-3B: 94.00 tok/s versus Transformers 47.54 tok/s at 500 tokens.
+- Qwen2.5-3B-Instruct: 93.08 tok/s versus Transformers 48.18 tok/s at
+  500 tokens.
 - Phi-4-mini-instruct: 53.80 tok/s versus Transformers 39.09 tok/s at
   200 tokens, with fused QKV and fused gate/up native dispatch.
 - StableLM-3B-4E1T: 55.76 tok/s versus Transformers 48.28 tok/s at
   200 tokens.
+- Gemma-2-2B-IT: 57.29 tok/s versus Transformers 53.58 tok/s at 200
+  tokens, with exact ordered top-5 in the retained validation suite.
+
+The full speed, peak-memory, cosine, ranking, and retention matrix is in
+[BENCHMARKS.md](BENCHMARKS.md). It also records candidate results that were
+not promoted to verified status.
 
 ## Benchmark and validate
 

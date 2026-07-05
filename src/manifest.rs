@@ -96,6 +96,16 @@ pub struct ModelSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swiglu_limit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm_weight_offset: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_pre_attn_scalar: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_logit_softcap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_logit_softcap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_parameters: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization_config: Option<serde_json::Value>,

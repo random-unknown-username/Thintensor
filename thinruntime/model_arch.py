@@ -20,6 +20,8 @@ KNOWN_MODEL_TYPES = {
     "tinyllama",
     "phi3",
     "gpt_oss",
+    "gemma",
+    "gemma2",
 }
 
 @dataclass(frozen=True)
@@ -61,6 +63,11 @@ class ModelDescriptor:
     num_experts_per_token: int = 0
     swiglu_alpha: float = 1.0
     swiglu_limit: float | None = None
+    norm_weight_offset: float = 0.0
+    embedding_scale: float = 1.0
+    query_pre_attn_scalar: float | None = None
+    attention_logit_softcap: float | None = None
+    final_logit_softcap: float | None = None
     required_operators: tuple[str, ...] = ()
     quantization: QuantizationDescriptor = field(
         default_factory=lambda: descriptor_from_config({})
@@ -135,7 +142,12 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         num_key_value_heads=kv_heads,
         head_dim=head_dim,
         vocab_size=_required_int(config, "vocab_size"),
-        tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+        tie_word_embeddings=bool(
+            config.get(
+                "tie_word_embeddings",
+                model_type in {"gemma", "gemma2"},
+            )
+        ),
         rope_theta=float(config.get("rope_theta", 10_000.0)),
         rope_scaling=config.get("rope_scaling") or config.get("rope_parameters"),
         rms_norm_eps=float(
@@ -158,7 +170,11 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         partial_rotary_factor=float(
             config.get("partial_rotary_factor") or 1.0
         ),
-        activation=str(config.get("hidden_act", "silu")),
+        activation=str(
+            config.get("hidden_act")
+            or config.get("hidden_activation")
+            or "silu"
+        ),
         qkv_bias=bool(
             config.get("attention_bias", config.get("qkv_bias", False))
         ),
@@ -188,6 +204,25 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         swiglu_limit=(
             float(config["swiglu_limit"])
             if config.get("swiglu_limit") is not None
+            else None
+        ),
+        norm_weight_offset=(1.0 if model_type == "gemma2" else 0.0),
+        embedding_scale=(
+            hidden**0.5 if model_type == "gemma2" else 1.0
+        ),
+        query_pre_attn_scalar=(
+            float(config["query_pre_attn_scalar"])
+            if config.get("query_pre_attn_scalar") is not None
+            else None
+        ),
+        attention_logit_softcap=(
+            float(config["attn_logit_softcapping"])
+            if config.get("attn_logit_softcapping") is not None
+            else None
+        ),
+        final_logit_softcap=(
+            float(config["final_logit_softcapping"])
+            if config.get("final_logit_softcapping") is not None
             else None
         ),
         required_operators=traits["required_operators"],
@@ -292,7 +327,7 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         ),
         mlp_kind=str(model.get("mlp_kind") or traits["mlp_kind"]),
         layer_types=tuple(model.get("layer_types") or traits["layer_types"]),
-        sliding_window=_optional_int(model.get("sliding_window")),
+        sliding_window=traits["sliding_window"],
         max_position_embeddings=_optional_int(
             model.get("max_position_embeddings")
         ),
@@ -322,6 +357,31 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         swiglu_limit=(
             float(model["swiglu_limit"])
             if model.get("swiglu_limit") is not None
+            else None
+        ),
+        norm_weight_offset=float(
+            model.get("norm_weight_offset")
+            if model.get("norm_weight_offset") is not None
+            else (1.0 if model_type == "gemma2" else 0.0)
+        ),
+        embedding_scale=float(
+            model.get("embedding_scale")
+            if model.get("embedding_scale") is not None
+            else (hidden**0.5 if model_type == "gemma2" else 1.0)
+        ),
+        query_pre_attn_scalar=(
+            float(model["query_pre_attn_scalar"])
+            if model.get("query_pre_attn_scalar") is not None
+            else None
+        ),
+        attention_logit_softcap=(
+            float(model["attention_logit_softcap"])
+            if model.get("attention_logit_softcap") is not None
+            else None
+        ),
+        final_logit_softcap=(
+            float(model["final_logit_softcap"])
+            if model.get("final_logit_softcap") is not None
             else None
         ),
         required_operators=tuple(
@@ -369,6 +429,10 @@ def _normalize_model_type(value: str) -> str:
         return "phi3"
     if "gptoss" in compact:
         return "gpt_oss"
+    if "gemma2" in compact:
+        return "gemma2"
+    if "gemma" in compact:
+        return "gemma"
     if "llama" in compact:
         return "llama"
     return value.lower()
@@ -399,6 +463,14 @@ def _semantic_traits(
     layer_types = tuple(
         str(value) for value in (config.get("layer_types") or ())
     )
+    raw_model_type = _normalize_model_type(
+        str(config.get("model_type") or _raw_arch(config))
+    )
+    if not layer_types and raw_model_type == "gemma2":
+        layer_types = tuple(
+            "sliding_attention" if layer % 2 == 0 else "full_attention"
+            for layer in range(layers)
+        )
     if not layer_types and config.get("sliding_window") is not None:
         use_sliding = bool(config.get("use_sliding_window", True))
         if use_sliding:
@@ -415,7 +487,10 @@ def _semantic_traits(
             rope_parameters.get("rope_type") or rope_parameters.get("type")
         )
     attention_variants = ["causal_kv", "current_only_smoke"]
-    if layer_types or config.get("sliding_window") is not None:
+    use_sliding = bool(config.get("use_sliding_window", True))
+    if layer_types or (
+        config.get("sliding_window") is not None and use_sliding
+    ):
         attention_variants.append("sliding_causal_kv")
     required = [
         "embedding",
@@ -451,7 +526,11 @@ def _semantic_traits(
         ),
         "mlp_kind": mlp_kind,
         "layer_types": layer_types,
-        "sliding_window": _optional_int(config.get("sliding_window")),
+        "sliding_window": (
+            _optional_int(config.get("sliding_window"))
+            if layer_types or use_sliding
+            else None
+        ),
         "rope_variant": str(rope_variant) if rope_variant else None,
         "rope_parameters": rope_parameters,
         "attention_sinks": attention_sinks,
