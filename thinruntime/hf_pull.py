@@ -34,6 +34,7 @@ def pull_model(
     target_dir: Optional[str | Path] = None,
     revision: str = "main",
     token: Optional[str] = None,
+    quiet: bool = False,
 ) -> Path:
     """Download a HuggingFace model.
 
@@ -65,11 +66,12 @@ def pull_model(
             "HUGGING_FACE_HUB_TOKEN"
         )
 
-    print(f"Pulling {model_id} \u2192 {target_dir}")
-    print(f"  Revision: {revision}")
-    if token:
-        print("  Token: ****")
-    print()
+    if not quiet:
+        print(f"Pulling {model_id} \u2192 {target_dir}")
+        print(f"  Revision: {revision}")
+        if token:
+            print("  Token: ****")
+        print()
 
     try:
         result_path = snapshot_download(
@@ -77,10 +79,11 @@ def pull_model(
             local_dir=str(target_dir),
             revision=revision,
             token=token,
-            local_dir_use_symlinks=False,
         )
-        print(f"\u2713 Downloaded to {result_path}")
+        if not quiet:
+            print(f"\u2713 Downloaded to {result_path}")
         return Path(result_path)
     except Exception as e:
-        print(f"\u2717 Download failed: {e}")
+        if not quiet:
+            print(f"\u2717 Download failed: {e}")
         raise

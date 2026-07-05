@@ -36,7 +36,13 @@ pub struct ModelSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rms_norm_eps: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm_eps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_theta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_rotary_factor: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_scaling: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +73,8 @@ pub struct ModelSpec {
     pub use_sliding_window: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_position_embeddings: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_max_position_embeddings: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_variant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

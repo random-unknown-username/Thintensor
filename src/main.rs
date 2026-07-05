@@ -16,8 +16,8 @@ use thintensor::verify::verify_archive;
 use thintensor::{Archive, Plan, Report};
 
 #[derive(Debug, Parser)]
-#[command(name = "thintensor")]
-#[command(about = "Pack, verify, extract, and plan ThinTensor .thin archives")]
+#[command(name = "thintensor-core")]
+#[command(about = "Internal archive core used by the thintensor CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

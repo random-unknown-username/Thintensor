@@ -36,6 +36,9 @@ class ModelDescriptor:
     rope_theta: float
     rope_scaling: dict[str, Any] | None
     rms_norm_eps: float
+    norm_kind: str
+    norm_eps: float
+    partial_rotary_factor: float
     activation: str
     qkv_bias: bool
     tensor_naming_scheme: str
@@ -48,6 +51,7 @@ class ModelDescriptor:
     layer_types: tuple[str, ...] = ()
     sliding_window: int | None = None
     max_position_embeddings: int | None = None
+    original_max_position_embeddings: int | None = None
     rope_variant: str | None = None
     rope_parameters: dict[str, Any] | None = None
     attention_bias: bool = False
@@ -134,7 +138,26 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
         rope_theta=float(config.get("rope_theta", 10_000.0)),
         rope_scaling=config.get("rope_scaling") or config.get("rope_parameters"),
-        rms_norm_eps=float(config.get("rms_norm_eps", 1e-6)),
+        rms_norm_eps=float(
+            config.get("rms_norm_eps")
+            or config.get("layer_norm_eps")
+            or 1e-6
+        ),
+        norm_kind=(
+            "rms_norm"
+            if config.get("rms_norm_eps") is not None
+            else "layer_norm"
+            if config.get("layer_norm_eps") is not None
+            else "rms_norm"
+        ),
+        norm_eps=float(
+            config.get("rms_norm_eps")
+            or config.get("layer_norm_eps")
+            or 1e-6
+        ),
+        partial_rotary_factor=float(
+            config.get("partial_rotary_factor") or 1.0
+        ),
         activation=str(config.get("hidden_act", "silu")),
         qkv_bias=bool(
             config.get("attention_bias", config.get("qkv_bias", False))
@@ -150,6 +173,9 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         sliding_window=traits["sliding_window"],
         max_position_embeddings=_optional_int(
             config.get("max_position_embeddings")
+        ),
+        original_max_position_embeddings=_optional_int(
+            config.get("original_max_position_embeddings")
         ),
         rope_variant=traits["rope_variant"],
         rope_parameters=traits["rope_parameters"],
@@ -220,7 +246,30 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         tie_word_embeddings=bool(model.get("tie_word_embeddings", False)),
         rope_theta=float(model.get("rope_theta") or 10_000.0),
         rope_scaling=model.get("rope_scaling") or model.get("rope_parameters"),
-        rms_norm_eps=float(model.get("rms_norm_eps") or 1e-6),
+        rms_norm_eps=float(
+            model.get("norm_eps")
+            or model.get("rms_norm_eps")
+            or 1e-6
+        ),
+        norm_kind=str(
+            model.get("norm_kind")
+            or (
+                "rms_norm"
+                if model.get("rms_norm_eps") is not None
+                else "layer_norm"
+                if model.get("layer_norm_eps") is not None
+                else "rms_norm"
+            )
+        ),
+        norm_eps=float(
+            model.get("norm_eps")
+            or model.get("rms_norm_eps")
+            or model.get("layer_norm_eps")
+            or 1e-6
+        ),
+        partial_rotary_factor=float(
+            model.get("partial_rotary_factor") or 1.0
+        ),
         activation=str(model.get("activation") or "silu"),
         qkv_bias=bool(model.get("qkv_bias", False)),
         tensor_naming_scheme=str(
@@ -246,6 +295,9 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         sliding_window=_optional_int(model.get("sliding_window")),
         max_position_embeddings=_optional_int(
             model.get("max_position_embeddings")
+        ),
+        original_max_position_embeddings=_optional_int(
+            model.get("original_max_position_embeddings")
         ),
         rope_variant=str(
             model.get("rope_variant") or traits["rope_variant"] or ""

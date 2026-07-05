@@ -261,7 +261,17 @@ fn build_model_spec(
         dtype,
         intermediate_size: optional_u64(config, "intermediate_size"),
         rms_norm_eps: optional_f64(config, "rms_norm_eps"),
+        norm_kind: if optional_f64(config, "rms_norm_eps").is_some() {
+            Some("rms_norm".to_string())
+        } else if optional_f64(config, "layer_norm_eps").is_some() {
+            Some("layer_norm".to_string())
+        } else {
+            None
+        },
+        norm_eps: optional_f64(config, "rms_norm_eps")
+            .or_else(|| optional_f64(config, "layer_norm_eps")),
         rope_theta: optional_f64(config, "rope_theta"),
+        partial_rotary_factor: optional_f64(config, "partial_rotary_factor"),
         rope_scaling: config
             .get("rope_scaling")
             .filter(|value| !value.is_null())
@@ -292,6 +302,10 @@ fn build_model_spec(
         sliding_window: optional_u64(config, "sliding_window"),
         use_sliding_window: config.get("use_sliding_window").and_then(Value::as_bool),
         max_position_embeddings: optional_u64(config, "max_position_embeddings"),
+        original_max_position_embeddings: optional_u64(
+            config,
+            "original_max_position_embeddings",
+        ),
         rope_variant: config
             .get("rope_scaling")
             .and_then(|value| value.get("rope_type").or_else(|| value.get("type")))
@@ -505,7 +519,16 @@ fn build_execution_tape(
         let o_projection_refs = tensor_group(tensors, &o_proj)?;
         require_tensor(tensors, &post_norm)?;
 
-        stages.push(stage(format!("layer_{layer}_input_norm"), vec![input_norm]));
+        let mut input_norm_refs = vec![input_norm.clone()];
+        push_if_present(
+            tensors,
+            &mut input_norm_refs,
+            layer_tensor(layer, "input_layernorm.bias"),
+        );
+        stages.push(stage(
+            format!("layer_{layer}_input_norm"),
+            input_norm_refs,
+        ));
 
         let mut qkv_refs = if let Some(refs) = fused_qkv_refs {
             refs
@@ -546,9 +569,15 @@ fn build_execution_tape(
             o_refs.push(o_bias);
         }
         stages.push(stage(format!("layer_{layer}_attn_out"), o_refs));
+        let mut post_norm_refs = vec![post_norm];
+        push_if_present(
+            tensors,
+            &mut post_norm_refs,
+            layer_tensor(layer, "post_attention_layernorm.bias"),
+        );
         stages.push(stage(
             format!("layer_{layer}_post_attn_norm"),
-            vec![post_norm],
+            post_norm_refs,
         ));
         if let (Some(router), Some(packed_gate_up), Some(packed_down)) =
             (router.clone(), packed_gate_up, packed_down)
@@ -635,7 +664,13 @@ fn build_execution_tape(
     }
 
     if tensors.contains_key(FINAL_NORM) {
-        stages.push(stage("final_norm", vec![FINAL_NORM.to_string()]));
+        let mut final_norm_refs = vec![FINAL_NORM.to_string()];
+        push_if_present(
+            tensors,
+            &mut final_norm_refs,
+            "model.norm.bias".to_string(),
+        );
+        stages.push(stage("final_norm", final_norm_refs));
     }
     if tensors.contains_key(LM_HEAD) {
         stages.push(stage("lm_head", vec![LM_HEAD.to_string()]));

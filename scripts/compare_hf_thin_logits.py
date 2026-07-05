@@ -97,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--down-proj-fp8", action="store_true")
     parser.add_argument("--gate-up-fp8", action="store_true")
     parser.add_argument("--fused-scaled-mlp", action="store_true")
+    parser.add_argument("--fused-rope", action="store_true")
+    parser.add_argument(
+        "--exact-prefill",
+        action="store_true",
+        help="Run prompt prefill in BF16 before constructing adaptive weights",
+    )
     parser.add_argument("--split-k-down-proj", action="store_true")
     parser.add_argument("--attn-proj-fp8", action="store_true")
     parser.add_argument("--qkv-fp8", action="store_true")
@@ -120,9 +126,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mxfp4-down-layers")
     parser.add_argument("--mxfp4-qkv-layers")
     parser.add_argument("--mxfp4-o-layers")
+    parser.add_argument("--mxfp4-hadamard", action="store_true")
+    parser.add_argument("--mxfp4-hadamard-size", type=int, default=0)
+    parser.add_argument("--mxfp4-hadamard-seed", type=int, default=0)
+    parser.add_argument("--mxfp4-residual-terms", type=int, default=0)
+    parser.add_argument("--mxfp4-binary-residual", action="store_true")
+    parser.add_argument("--mxfp4-int8-row-fraction", type=float, default=0.0)
+    parser.add_argument("--mxfp4-row-postscale", action="store_true")
     parser.add_argument("--lm-head-int4-group-size", type=int, default=0)
     parser.add_argument("--lm-head-fp8-scale-block", type=int, default=0)
     parser.add_argument("--exact-hf-mode", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--dump-layer-debug", type=int)
     parser.add_argument("--dump-token-debug", type=int)
     parser.add_argument("--compare-attention", action="store_true")
@@ -152,7 +166,10 @@ def main() -> None:
         else args.attention_mode
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.hf_model,
+        trust_remote_code=args.trust_remote_code,
+    )
     input_ids_by_length = {
         length: prompt_ids(tokenizer, args.prompt, length)
         for length in prefill_lens
@@ -164,7 +181,7 @@ def main() -> None:
     hf_model = AutoModelForCausalLM.from_pretrained(
         args.hf_model,
         torch_dtype=dtype,
-        trust_remote_code=True,
+        trust_remote_code=args.trust_remote_code,
     ).to("cpu")
     hf_model.eval()
     hf_attention_implementation = getattr(
@@ -195,6 +212,12 @@ def main() -> None:
         raise ValueError(
             "component debug capture currently requires --weight-residency all"
         )
+    if debug_requested and args.exact_prefill:
+        raise ValueError(
+            "component debug capture cannot be combined with --exact-prefill"
+        )
+    if args.exact_prefill and args.weight_residency != "all":
+        raise ValueError("--exact-prefill currently requires all-resident weights")
     hf_debug: dict[str, torch.Tensor] | None = None
     hf_layer_trace: dict[str, torch.Tensor] | None = None
     debug_sequence: torch.Tensor | None = None
@@ -280,7 +303,15 @@ def main() -> None:
 
     records: list[dict[str, Any]] = []
     with torch.inference_mode():
-        for prefill_len, input_ids in input_ids_by_length.items():
+        for run_index, (prefill_len, input_ids) in enumerate(
+            input_ids_by_length.items()
+        ):
+            if args.exact_prefill and run_index:
+                weights = ThinGpuWeights(
+                    args.archive,
+                    device=args.device,
+                    dtype=dtype,
+                )
             hf_run = hf_runs[prefill_len]
             thin_run = run_thin_trajectory(
                 weights=weights,
@@ -314,6 +345,8 @@ def main() -> None:
                 kv_prefetch_pages=args.kv_prefetch_pages,
                 lm_head_backend=args.lm_head_backend,
                 fused_scaled_mlp=args.fused_scaled_mlp,
+                fused_rope=args.fused_rope,
+                exact_prefill=args.exact_prefill,
                 split_k_down_proj=args.split_k_down_proj,
                 lm_head_argmax_mode=args.lm_head_argmax_mode,
                 stream_weights=args.weight_residency == "stream",
@@ -326,6 +359,13 @@ def main() -> None:
                 mxfp4_down_layers=args.mxfp4_down_layers,
                 mxfp4_qkv_layers=args.mxfp4_qkv_layers,
                 mxfp4_o_layers=args.mxfp4_o_layers,
+                mxfp4_hadamard=args.mxfp4_hadamard,
+                mxfp4_hadamard_size=args.mxfp4_hadamard_size,
+                mxfp4_hadamard_seed=args.mxfp4_hadamard_seed,
+                mxfp4_residual_terms=args.mxfp4_residual_terms,
+                mxfp4_binary_residual=args.mxfp4_binary_residual,
+                mxfp4_int8_row_fraction=args.mxfp4_int8_row_fraction,
+                mxfp4_row_postscale=args.mxfp4_row_postscale,
                 lm_head_int4_group_size=args.lm_head_int4_group_size,
             )
             for step in requested_steps:
@@ -343,6 +383,12 @@ def main() -> None:
                         kv_read_bytes=thin_run["kv_read_bytes"][step],
                     )
                 )
+            if args.exact_prefill:
+                weights.close()
+                del weights
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
     debug_report = None
     first_divergence_report = None
     if detailed_debug_requested:
@@ -366,6 +412,7 @@ def main() -> None:
             o_fp8_layer_spec=args.o_fp8_layers,
             kernel_backend=args.kernel_backend,
             exact_hf_mode=args.exact_hf_mode,
+            fused_rope=args.fused_rope,
             fp8_scale_block=args.fp8_scale_block,
             dtype=dtype,
         )
@@ -396,6 +443,7 @@ def main() -> None:
             o_fp8_layer_spec=args.o_fp8_layers,
             kernel_backend=args.kernel_backend,
             exact_hf_mode=args.exact_hf_mode,
+            fused_rope=args.fused_rope,
             fp8_scale_block=args.fp8_scale_block,
             dtype=dtype,
         )
@@ -411,7 +459,8 @@ def main() -> None:
             debug_report,
             first_divergence_report=first_divergence_report,
         )
-    weights.close()
+    if not args.exact_prefill:
+        weights.close()
 
     summary = build_summary(
         args,
@@ -508,6 +557,8 @@ def run_thin_trajectory(
     kv_prefetch_pages: int,
     lm_head_backend: str | None,
     fused_scaled_mlp: bool,
+    fused_rope: bool,
+    exact_prefill: bool,
     split_k_down_proj: bool,
     lm_head_argmax_mode: str = "torch",
     stream_weights: bool = False,
@@ -518,6 +569,13 @@ def run_thin_trajectory(
     mxfp4_down_layers: str | None = None,
     mxfp4_qkv_layers: str | None = None,
     mxfp4_o_layers: str | None = None,
+    mxfp4_hadamard: bool = False,
+    mxfp4_hadamard_size: int = 0,
+    mxfp4_hadamard_seed: int = 0,
+    mxfp4_residual_terms: int = 0,
+    mxfp4_binary_residual: bool = False,
+    mxfp4_int8_row_fraction: float = 0.0,
+    mxfp4_row_postscale: bool = False,
     lm_head_int4_group_size: int = 0,
 ) -> dict[str, Any]:
     model = weights.manifest["model"]
@@ -538,52 +596,122 @@ def run_thin_trajectory(
         gpu_recent_tokens=kv_gpu_recent_tokens,
         prefetch_pages=kv_prefetch_pages,
     )
-    runtime = ThinGpuQwenRuntime(
-        weights,
-        kv_cache=cache,
-        prefetch_distance=weight_prefetch_layers if stream_weights else 0,
-        evict_completed_layers=stream_weights,
-        kernel_backend=(
-            "torch"
-            if exact_hf_mode or weights.device.type != "cuda"
-            else kernel_backend
-        ),
-        lm_head_fp8=lm_head_fp8,
-        lm_head_topk_guard=lm_head_topk_guard,
-        lm_head_backend=lm_head_backend,
-        mlp_fp8=mlp_fp8,
-        down_proj_fp8=down_proj_fp8,
-        gate_up_fp8=gate_up_fp8,
-        fused_scaled_mlp=fused_scaled_mlp,
-        split_k_down_proj=split_k_down_proj,
-        attn_proj_fp8=attn_proj_fp8,
-        qkv_fp8=qkv_fp8,
-        o_proj_fp8=o_proj_fp8,
-        fp8_layer_spec=fp8_layer_spec,
-        down_fp8_layer_spec=down_fp8_layer_spec,
-        qkv_fp8_layer_spec=qkv_fp8_layer_spec,
-        o_fp8_layer_spec=o_fp8_layer_spec,
-        exact_hf_mode=exact_hf_mode,
-        fp8_scale_block=fp8_scale_block,
-        lm_head_fp8_scale_block=lm_head_fp8_scale_block,
-        attention_mode=attention_mode,
-        attention_backend=attention_backend,
-        lm_head_argmax_mode=lm_head_argmax_mode,
-        adaptive_body_int8_start_token=adaptive_body_int8_start_token,
-        body_int4_group_size=body_int4_group_size,
-        mxfp4_gate_up_layers=mxfp4_gate_up_layers,
-        mxfp4_down_layers=mxfp4_down_layers,
-        mxfp4_qkv_layers=mxfp4_qkv_layers,
-        mxfp4_o_layers=mxfp4_o_layers,
-        lm_head_int4_group_size=lm_head_int4_group_size,
-    )
+    prefill_runtime = None
+    if exact_prefill:
+        prefill_runtime = ThinGpuQwenRuntime(
+            weights,
+            kv_cache=cache,
+            kernel_backend="torch",
+            attention_mode=attention_mode,
+            attention_backend="torch",
+            exact_hf_mode=True,
+        )
+    runtime = None
+    if prefill_runtime is None:
+        runtime = ThinGpuQwenRuntime(
+            weights,
+            kv_cache=cache,
+            prefetch_distance=weight_prefetch_layers if stream_weights else 0,
+            evict_completed_layers=stream_weights,
+            kernel_backend=(
+                "torch"
+                if exact_hf_mode or weights.device.type != "cuda"
+                else kernel_backend
+            ),
+            lm_head_fp8=lm_head_fp8,
+            lm_head_topk_guard=lm_head_topk_guard,
+            lm_head_backend=lm_head_backend,
+            mlp_fp8=mlp_fp8,
+            down_proj_fp8=down_proj_fp8,
+            gate_up_fp8=gate_up_fp8,
+            fused_scaled_mlp=fused_scaled_mlp,
+            fused_rope=fused_rope,
+            split_k_down_proj=split_k_down_proj,
+            attn_proj_fp8=attn_proj_fp8,
+            qkv_fp8=qkv_fp8,
+            o_proj_fp8=o_proj_fp8,
+            fp8_layer_spec=fp8_layer_spec,
+            down_fp8_layer_spec=down_fp8_layer_spec,
+            qkv_fp8_layer_spec=qkv_fp8_layer_spec,
+            o_fp8_layer_spec=o_fp8_layer_spec,
+            exact_hf_mode=exact_hf_mode,
+            fp8_scale_block=fp8_scale_block,
+            lm_head_fp8_scale_block=lm_head_fp8_scale_block,
+            attention_mode=attention_mode,
+            attention_backend=attention_backend,
+            lm_head_argmax_mode=lm_head_argmax_mode,
+            adaptive_body_int8_start_token=adaptive_body_int8_start_token,
+            body_int4_group_size=body_int4_group_size,
+            mxfp4_gate_up_layers=mxfp4_gate_up_layers,
+            mxfp4_down_layers=mxfp4_down_layers,
+            mxfp4_qkv_layers=mxfp4_qkv_layers,
+            mxfp4_o_layers=mxfp4_o_layers,
+            mxfp4_hadamard=mxfp4_hadamard,
+            mxfp4_hadamard_size=mxfp4_hadamard_size,
+            mxfp4_hadamard_seed=mxfp4_hadamard_seed,
+            mxfp4_residual_terms=mxfp4_residual_terms,
+            mxfp4_binary_residual=mxfp4_binary_residual,
+            mxfp4_int8_row_fraction=mxfp4_int8_row_fraction,
+            mxfp4_row_postscale=mxfp4_row_postscale,
+            lm_head_int4_group_size=lm_head_int4_group_size,
+        )
     hidden = None
     for position in range(int(input_ids.shape[1])):
-        hidden = runtime.forward_token(
+        assert prefill_runtime is not None or runtime is not None
+        hidden = (prefill_runtime or runtime).forward_token(
             input_ids[0, position],
             token_index=position,
         )
     assert hidden is not None
+    if prefill_runtime is not None:
+        del prefill_runtime
+        gc.collect()
+        if weights.device.type == "cuda":
+            torch.cuda.empty_cache()
+        runtime = ThinGpuQwenRuntime(
+            weights,
+            kv_cache=cache,
+            prefetch_distance=weight_prefetch_layers if stream_weights else 0,
+            evict_completed_layers=stream_weights,
+            kernel_backend=kernel_backend,
+            lm_head_fp8=lm_head_fp8,
+            lm_head_topk_guard=lm_head_topk_guard,
+            lm_head_backend=lm_head_backend,
+            mlp_fp8=mlp_fp8,
+            down_proj_fp8=down_proj_fp8,
+            gate_up_fp8=gate_up_fp8,
+            fused_scaled_mlp=fused_scaled_mlp,
+            fused_rope=fused_rope,
+            split_k_down_proj=split_k_down_proj,
+            attn_proj_fp8=attn_proj_fp8,
+            qkv_fp8=qkv_fp8,
+            o_proj_fp8=o_proj_fp8,
+            fp8_layer_spec=fp8_layer_spec,
+            down_fp8_layer_spec=down_fp8_layer_spec,
+            qkv_fp8_layer_spec=qkv_fp8_layer_spec,
+            o_fp8_layer_spec=o_fp8_layer_spec,
+            fp8_scale_block=fp8_scale_block,
+            lm_head_fp8_scale_block=lm_head_fp8_scale_block,
+            attention_mode=attention_mode,
+            attention_backend=attention_backend,
+            lm_head_argmax_mode=lm_head_argmax_mode,
+            adaptive_body_int8_start_token=adaptive_body_int8_start_token,
+            body_int4_group_size=body_int4_group_size,
+            mxfp4_gate_up_layers=mxfp4_gate_up_layers,
+            mxfp4_down_layers=mxfp4_down_layers,
+            mxfp4_qkv_layers=mxfp4_qkv_layers,
+            mxfp4_o_layers=mxfp4_o_layers,
+            mxfp4_hadamard=mxfp4_hadamard,
+            mxfp4_hadamard_size=mxfp4_hadamard_size,
+            mxfp4_hadamard_seed=mxfp4_hadamard_seed,
+            mxfp4_residual_terms=mxfp4_residual_terms,
+            mxfp4_binary_residual=mxfp4_binary_residual,
+            mxfp4_int8_row_fraction=mxfp4_int8_row_fraction,
+            mxfp4_row_postscale=mxfp4_row_postscale,
+            lm_head_int4_group_size=lm_head_int4_group_size,
+        )
+    assert runtime is not None
+    runtime.begin_decode(int(input_ids.shape[1]))
 
     captured: dict[int, torch.Tensor] = {}
     tokens: list[torch.Tensor] = []
@@ -1054,6 +1182,7 @@ def capture_thin_components(
     o_fp8_layer_spec: str | None,
     kernel_backend: str,
     exact_hf_mode: bool,
+    fused_rope: bool,
     fp8_scale_block: int,
     dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
@@ -1091,6 +1220,7 @@ def capture_thin_components(
         o_fp8_layer_spec=o_fp8_layer_spec,
         attention_mode=attention_mode,
         exact_hf_mode=exact_hf_mode,
+        fused_rope=fused_rope,
         fp8_scale_block=fp8_scale_block,
     )
     result = {}
@@ -1125,6 +1255,7 @@ def capture_thin_all_components(
     o_fp8_layer_spec: str | None,
     kernel_backend: str,
     exact_hf_mode: bool,
+    fused_rope: bool,
     fp8_scale_block: int,
     dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
@@ -1162,6 +1293,7 @@ def capture_thin_all_components(
         o_fp8_layer_spec=o_fp8_layer_spec,
         attention_mode=attention_mode,
         exact_hf_mode=exact_hf_mode,
+        fused_rope=fused_rope,
         fp8_scale_block=fp8_scale_block,
     )
     result = {}
@@ -1534,10 +1666,23 @@ def comparison_record(
     thin_top5 = top_entries(thin_values, thin_indices)
     hf_ids = {entry["token_id"] for entry in hf_top5}
     thin_ids = {entry["token_id"] for entry in thin_top5}
-    equivalent_attention = attention_mode == "causal_kv"
+    exact_top5 = (
+        [entry["token_id"] for entry in hf_top5]
+        == [entry["token_id"] for entry in thin_top5]
+    )
+    expected_kv_tokens = prefill_len + step - 1
+    exact_kv_retention = kv_tokens_attended == expected_kv_tokens
+    equivalent_attention = (
+        attention_mode == "causal_kv" and exact_kv_retention
+    )
     reason = None
-    if not equivalent_attention:
+    if attention_mode != "causal_kv":
         reason = "historical KV is not read in current_only_smoke mode"
+    elif not exact_kv_retention:
+        reason = (
+            "causal KV history length mismatch: "
+            f"expected {expected_kv_tokens}, attended {kv_tokens_attended}"
+        )
     return {
         "model_name": str(args.hf_model),
         "prompt": args.prompt,
@@ -1546,6 +1691,7 @@ def comparison_record(
         "hf_top5": hf_top5,
         "thin_top5": thin_top5,
         "top1_same": hf_top5[0]["token_id"] == thin_top5[0]["token_id"],
+        "top5_exact_order": exact_top5,
         "top5_overlap": len(hf_ids & thin_ids) / 5.0,
         "max_abs_logit_error": float(difference.max()),
         "mean_abs_logit_error": float(difference.mean()),
@@ -1562,6 +1708,8 @@ def comparison_record(
         "token_trajectory": "hf_greedy_teacher_forced",
         "attention_mode": attention_mode,
         "kv_tokens_attended": kv_tokens_attended,
+        "kv_tokens_expected": expected_kv_tokens,
+        "kv_retention_exact": exact_kv_retention,
         "kv_cache_read_bytes_per_token": kv_read_bytes,
         "not_hf_equivalent": not equivalent_attention,
         "reason_not_equivalent": reason,
@@ -1579,7 +1727,7 @@ def build_summary(
     hf_attention_implementation: str,
 ) -> dict[str, Any]:
     attention_equivalent = all(not row["not_hf_equivalent"] for row in records)
-    any_fp8 = any(
+    any_quantization = any(
         (
             args.lm_head_fp8,
             args.mlp_fp8,
@@ -1588,9 +1736,16 @@ def build_summary(
             args.attn_proj_fp8,
             args.qkv_fp8,
             args.o_proj_fp8,
+            args.adaptive_body_int8_start_token >= 0,
+            args.body_int4_group_size > 0,
+            args.mxfp4_gate_up_layers is not None,
+            args.mxfp4_down_layers is not None,
+            args.mxfp4_qkv_layers is not None,
+            args.mxfp4_o_layers is not None,
+            args.lm_head_int4_group_size > 0,
         )
     )
-    body_fp8 = any(
+    body_quantized = any(
         (
             args.mlp_fp8,
             args.down_proj_fp8,
@@ -1598,9 +1753,16 @@ def build_summary(
             args.attn_proj_fp8,
             args.qkv_fp8,
             args.o_proj_fp8,
+            args.adaptive_body_int8_start_token >= 0,
+            args.body_int4_group_size > 0,
+            args.mxfp4_gate_up_layers is not None,
+            args.mxfp4_down_layers is not None,
+            args.mxfp4_qkv_layers is not None,
+            args.mxfp4_o_layers is not None,
         )
     )
     top1_all = all(row["top1_same"] for row in records)
+    top5_exact = all(row["top5_exact_order"] for row in records)
     top5_high = all(row["top5_overlap"] >= 0.8 for row in records)
     generated_match = all(
         row["generated_token_match_rate"] >= 0.8 for row in records
@@ -1610,15 +1772,15 @@ def build_summary(
     )
     exact_pass = (
         attention_equivalent
-        and not any_fp8
+        and not any_quantization
         and top1_all
-        and top5_high
+        and top5_exact
         and generated_match
         and strict_cosine
         and not config_mismatches
     )
     ranking_pass = (
-        attention_equivalent and top1_all and top5_high and generated_match
+        attention_equivalent and top1_all and top5_exact and generated_match
     )
     if exact_pass:
         tier = "exact_pass"
@@ -1655,6 +1817,26 @@ def build_summary(
         "down_fp8_layers": args.down_fp8_layers or args.fp8_layers or "all",
         "qkv_fp8_layers": args.qkv_fp8_layers or args.fp8_layers or "all",
         "o_fp8_layers": args.o_fp8_layers or args.fp8_layers or "all",
+        "adaptive_body_int8_start_token": (
+            args.adaptive_body_int8_start_token
+        ),
+        "body_int4_group_size": args.body_int4_group_size,
+        "mxfp4_gate_up_layers": args.mxfp4_gate_up_layers,
+        "mxfp4_down_layers": args.mxfp4_down_layers,
+        "mxfp4_qkv_layers": args.mxfp4_qkv_layers,
+        "mxfp4_o_layers": args.mxfp4_o_layers,
+        "mxfp4_hadamard": args.mxfp4_hadamard,
+        "mxfp4_hadamard_size": args.mxfp4_hadamard_size,
+        "mxfp4_hadamard_seed": args.mxfp4_hadamard_seed,
+        "mxfp4_residual_terms": args.mxfp4_residual_terms,
+        "mxfp4_binary_residual": args.mxfp4_binary_residual,
+        "mxfp4_int8_row_fraction": args.mxfp4_int8_row_fraction,
+        "mxfp4_row_postscale": args.mxfp4_row_postscale,
+        "lm_head_int4_group_size": args.lm_head_int4_group_size,
+        "attention_mode": args.attention_mode,
+        "attention_backend": args.attention_backend,
+        "kv_block_size": args.kv_block_size,
+        "kv_residency": args.kv_residency,
         "exact_hf_mode": args.exact_hf_mode,
         "hf_reference_mode": "full_recompute_causal",
         "hf_attention_implementation": hf_attention_implementation,
@@ -1668,10 +1850,11 @@ def build_summary(
         "attention_equivalent": attention_equivalent,
         "ranking_equivalent": ranking_pass,
         "hf_equivalent": exact_pass,
-        "quantized_experimental": body_fp8,
+        "quantized_experimental": body_quantized,
         "acceptance": {
             "attention_equivalent": attention_equivalent,
             "top1_same_all_records": top1_all,
+            "top5_exact_order_all_records": top5_exact,
             "top5_overlap_high_all_records": top5_high,
             "strict_cosine_all_records": strict_cosine,
             "short_generation_mostly_matches": generated_match,

@@ -15,6 +15,7 @@ def main():
     ap.add_argument("--prompt", default="Hello")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bf16")
+    ap.add_argument("--trust-remote-code", action="store_true")
     args = ap.parse_args()
 
     dtype = {
@@ -28,14 +29,18 @@ def main():
 
     load_t0 = time.perf_counter()
 
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=dtype,
-        device_map=args.device,
-        trust_remote_code=True,
+        dtype=dtype,
+        low_cpu_mem_usage=True,
+        trust_remote_code=args.trust_remote_code,
         attn_implementation="sdpa",
     )
+    model.to(args.device)
     model.eval()
 
     torch.cuda.synchronize()

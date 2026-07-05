@@ -1,24 +1,28 @@
-"""Validated runtime profiles shared by the ThinTensor CLI workflows."""
+"""Portable runtime profiles and their user-facing contracts.
+
+Profiles describe intent and semantic capabilities, not one model's tensor
+dimensions.  Model-specific benchmark results may be attached as evidence, but
+they never define whether another compatible decoder is allowed to run.
+"""
 
 from __future__ import annotations
 
+import os
 from typing import Any, Mapping
 
 
-SMOLLM3_3B_GEOMETRY = {
-    "model_type": "smollm3",
-    "layers": 36,
-    "hidden_size": 2048,
-    "intermediate_size": 11008,
+DENSE_SILU_CAPABILITY = {
+    "architecture_family": "decoder_dense",
+    "activation": "silu",
 }
 
 
 PROFILES: dict[str, dict[str, Any]] = {
-    "bf16": {
-        "label": "BF16 reference precision",
+    "safe": {
+        "label": "Safe BF16",
         "description": (
-            "Universal BF16 execution profile with BF16 weights and "
-            "exact-value BF16 KV storage."
+            "Portable BF16 profile with full causal history and no weight "
+            "quantization."
         ),
         "kernel_backend": "triton-matvec",
         "gate_up_fp8": False,
@@ -32,57 +36,115 @@ PROFILES: dict[str, dict[str, Any]] = {
         "fused_scaled_mlp": False,
         "fused_residual_norm": False,
         "experimental": False,
-        "validated_geometry": None,
+        "required_capabilities": None,
+        "intent": "Highest fidelity and broadest native-runtime compatibility.",
+        "quality_contract": (
+            "BF16 weights and BF16 KV values. Different kernel reduction order "
+            "can still produce small differences from Transformers."
+        ),
+        "retention_contract": "Full causal history; no KV compression or eviction.",
+        "speed_contract": "Portable baseline; benchmark against HF on this machine.",
+        "recommended_for": "First run, new architectures, and correctness checks.",
+        "tradeoffs": ("Highest weight bandwidth and VRAM use.",),
     },
-    "quality": {
-        "label": "SmolLM3 quality FP8",
+    "balanced": {
+        "label": "Balanced native kernels",
         "description": (
-            "Validated SmolLM3-3B profile: FP8 gate/up in every layer and "
-            "FP8 down projection in layers 8:28; attention, O-proj, KV, and "
-            "LM head remain BF16."
+            "Portable BF16-weight profile using ThinTensor matvec and fused "
+            "causal-attention kernels without quantizing model weights."
         ),
         "kernel_backend": "triton",
-        "gate_up_fp8": True,
-        "down_proj_fp8": True,
-        "down_fp8_layer_spec": "8:28",
+        "gate_up_fp8": False,
+        "down_proj_fp8": False,
         "o_proj_fp8": False,
         "qkv_fp8": False,
         "lm_head_fp8": False,
         "keep_bf16_lm_head": True,
         "lm_head_topk_guard": 0,
-        "attention_backend": "torch",
+        "attention_backend": "triton_fused",
         "fused_scaled_mlp": False,
         "fused_residual_norm": False,
         "experimental": False,
-        "validated_geometry": SMOLLM3_3B_GEOMETRY,
+        "required_capabilities": DENSE_SILU_CAPABILITY,
+        "intent": "Use native kernels for speed without approximate weight storage.",
+        "quality_contract": (
+            "No weight quantization. Kernel-order rounding is possible; full "
+            "model validation is still required before claiming HF equivalence."
+        ),
+        "retention_contract": "Full causal history; no KV compression or eviction.",
+        "speed_contract": "Model and hardware dependent; run `thintensor bench`.",
+        "recommended_for": "Portable default for supported dense SiLU decoders.",
+        "tradeoffs": (
+            "Requires a CUDA/Triton-compatible native decoder.",
+            "Not every HF architecture has a native ThinTensor engine yet.",
+        ),
     },
-    "quality-guarded": {
-        "label": "SmolLM3 quality FP8 + guarded head",
+    "max-performance": {
+        "label": "Maximum single-stream performance",
         "description": (
-            "The quality profile plus an FP8 shortlist execution head and "
-            "exact BF16 verification over the top 64 candidates."
+            "Portable opt-in speed profile for compatible dense SiLU decoders: "
+            "exact prefill and early generated tokens, adaptive INT8 body "
+            "weights, fused causal attention, guarded FP8 head, and guarded "
+            "INT8 tensor-core dispatch."
         ),
         "kernel_backend": "triton",
-        "gate_up_fp8": True,
-        "down_proj_fp8": True,
-        "down_fp8_layer_spec": "8:28",
+        "gate_up_fp8": False,
+        "down_proj_fp8": False,
         "o_proj_fp8": False,
         "qkv_fp8": False,
         "lm_head_fp8": True,
         "keep_bf16_lm_head": True,
         "lm_head_backend": "triton",
         "lm_head_topk_guard": 64,
-        "attention_backend": "torch",
+        "attention_backend": "triton_fused",
+        "kv_block_size": 512,
+        "fused_rope": True,
+        "exact_prefill": True,
+        "adaptive_body_int8_start_token": 18,
+        "experimental_int8_tensorcore": True,
         "fused_scaled_mlp": False,
         "fused_residual_norm": False,
-        "experimental": False,
-        "validated_geometry": SMOLLM3_3B_GEOMETRY,
+        "experimental": True,
+        "required_capabilities": DENSE_SILU_CAPABILITY,
+        "intent": "Minimize single-stream weight bandwidth on supported GPUs.",
+        "quality_contract": (
+            "Prefill and the first 18 generated-token positions use exact body "
+            "weights; later positions use approximate INT8 body weights. "
+            "Quality must be validated per model; exact ordered top-5 is not "
+            "promised."
+        ),
+        "retention_contract": "Full uncompressed BF16 KV history.",
+        "speed_contract": (
+            "No portable tok/s promise. The retained matched 3B run measured "
+            "94.00 tok/s at 500 tokens versus 47.54 tok/s in Transformers."
+        ),
+        "measured_results": {
+            "scope": "one retained 3B dense-SiLU model on the development Blackwell laptop",
+            "tokens_per_second": {"500": 94.000319},
+            "transformers_tokens_per_second": {"500": 47.540605},
+            "speedup_vs_transformers": {"500": 1.977264},
+            "minimum_short_cosine": 0.997369766,
+            "long_1000_cosine": 0.999871254,
+            "short_top1_exact": True,
+            "short_top5_set_exact": True,
+            "ordered_top5_exact": False,
+            "kv_retention": "full_uncompressed_bf16",
+        },
+        "recommended_for": (
+            "Opt-in local tuning after `thintensor validate`; never assume the "
+            "retained measurement transfers to another model."
+        ),
+        "tradeoffs": (
+            "Quality is model-dependent.",
+            "Tensor-core gains are shape and GPU dependent.",
+            "Throughput declines as full causal attention grows.",
+        ),
     },
-    "experimental": {
+    "lab": {
         "label": "Experimental workbench",
         "description": (
-            "Starts from BF16 and permits explicit experimental overrides. "
-            "It does not silently stack rejected optimizations."
+            "Portable BF16 starting point that permits explicit low-level "
+            "experimental overrides."
         ),
         "kernel_backend": "triton-matvec",
         "gate_up_fp8": False,
@@ -96,17 +158,60 @@ PROFILES: dict[str, dict[str, Any]] = {
         "fused_scaled_mlp": False,
         "fused_residual_norm": False,
         "experimental": True,
-        "validated_geometry": None,
+        "required_capabilities": None,
+        "intent": "Manual kernel and precision experiments.",
+        "quality_contract": "No quality or performance guarantee.",
+        "retention_contract": "Depends on explicit overrides.",
+        "speed_contract": "No speed guarantee.",
+        "recommended_for": "Developers running an explicit validation plan.",
+        "tradeoffs": ("Every override must be benchmarked and correctness-gated.",),
     },
 }
 
-# Compatibility alias retained for the first CLI prototype. It resolves to the
-# measured guarded profile instead of pretending to be a distinct mode.
-PROFILE_ALIASES = {"fast": "quality-guarded"}
+# Preserve the exact behavior of previously published opt-in names without
+# making model-era presets the primary product interface.
+PROFILES["legacy-fast-60"] = {
+    **PROFILES["max-performance"],
+    "label": "Legacy adaptive INT8 profile",
+    "description": (
+        "Compatibility preset for the original fast-60 CLI behavior."
+    ),
+    "experimental_int8_tensorcore": False,
+    "speed_contract": "Legacy opt-in; no portable throughput promise.",
+    "hidden": True,
+}
+PROFILES["legacy-fast-80"] = {
+    **PROFILES["legacy-fast-60"],
+    "label": "Legacy MXFP4 profile",
+    "description": (
+        "Compatibility preset for the original fast-80 MXFP4 experiment."
+    ),
+    "mxfp4_gate_up_layers": "6:12",
+    "quality_contract": (
+        "Known model-specific short-context regression; retained only for "
+        "reproducibility."
+    ),
+    "hidden": True,
+}
+
+
+# Old names remain accepted so existing commands/scripts do not break. Public
+# documentation leads with the four intent-based names above.
+PROFILE_ALIASES = {
+    "bf16": "safe",
+    "quality": "balanced",
+    "quality-guarded": "balanced",
+    "fast": "balanced",
+    "fast-60": "legacy-fast-60",
+    "fast-80": "legacy-fast-80",
+    "speed": "max-performance",
+    "fast-90": "max-performance",
+    "experimental": "lab",
+}
 
 EXPERIMENTAL_WARNING = (
-    "Experimental overrides can change logits or regress decode speed. "
-    "Benchmark and validate them before making claims."
+    "This profile can change logits or regress decode speed on a different "
+    "model. Benchmark and validate it locally before deployment."
 )
 
 CPU_KV_WARNING = (
@@ -127,31 +232,53 @@ def _canonical_name(name: str) -> str:
     return PROFILE_ALIASES.get(normalized, normalized)
 
 
+def _model_value(model: Mapping[str, Any], key: str) -> Any:
+    if key == "activation":
+        return model.get("activation") or model.get("hidden_act") or "silu"
+    if key == "architecture_family":
+        if model.get(key):
+            return model[key]
+        experts = int(
+            model.get("num_local_experts")
+            or model.get("num_experts")
+            or 0
+        )
+        return "decoder_moe" if experts else "decoder_dense"
+    if key == "norm_kind":
+        if model.get("norm_kind"):
+            return model["norm_kind"]
+        if model.get("rms_norm_eps") is not None:
+            return "rms_norm"
+        if model.get("layer_norm_eps") is not None:
+            return "layer_norm"
+        return "unknown"
+    return model.get(key)
+
+
 def geometry_matches(
     model: Mapping[str, Any],
     expected: Mapping[str, Any],
 ) -> bool:
-    return all(model.get(key) == value for key, value in expected.items())
+    """Backward-compatible capability matcher."""
+    return all(_model_value(model, key) == value for key, value in expected.items())
 
 
 def profile_compatibility(
     profile: Mapping[str, Any],
     model: Mapping[str, Any],
 ) -> tuple[bool, str | None]:
-    expected = profile.get("validated_geometry")
+    expected = profile.get("required_capabilities")
     if expected is None:
         return True, None
     if geometry_matches(model, expected):
         return True, None
-    expected_text = ", ".join(
-        f"{key}={value}" for key, value in expected.items()
-    )
+    expected_text = ", ".join(f"{key}={value}" for key, value in expected.items())
     actual_text = ", ".join(
-        f"{key}={model.get(key, '?')}" for key in expected
+        f"{key}={_model_value(model, key)!r}" for key in expected
     )
     return (
         False,
-        f"profile is validated for {expected_text}; archive has {actual_text}",
+        f"profile requires {expected_text}; model exposes {actual_text}",
     )
 
 
@@ -161,14 +288,15 @@ def get_profile(
     model: Mapping[str, Any] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Resolve a named or automatic profile and enforce its validation scope."""
+    """Resolve a named profile and enforce semantic capability requirements."""
     normalized = name.strip().lower()
+    requested_auto = normalized == "auto"
     if normalized == "auto":
         normalized = (
-            "quality-guarded"
+            "safe"
             if model is not None
-            and geometry_matches(model, SMOLLM3_3B_GEOMETRY)
-            else "bf16"
+            and _model_value(model, "norm_kind") == "layer_norm"
+            else "balanced"
         )
     canonical = _canonical_name(normalized)
     if canonical not in PROFILES:
@@ -182,10 +310,15 @@ def get_profile(
         result["alias_used"] = normalized
     if model is not None:
         compatible, reason = profile_compatibility(result, model)
-        if not compatible and not force:
+        if not compatible and requested_auto:
+            result = dict(PROFILES["safe"])
+            result["name"] = "safe"
+            result["auto_fallback_reason"] = reason
+        elif not compatible and not force:
             raise ValueError(
-                f"profile {canonical!r} is not compatible with this archive: "
-                f"{reason}. Use --force-profile only for an explicit experiment."
+                f"profile {canonical!r} is not compatible with this model: "
+                f"{reason}. Use --profile safe or --force-profile for an "
+                "explicit experiment."
             )
         result["compatibility_warning"] = reason if not compatible else None
     return result
@@ -200,7 +333,6 @@ def apply_overrides(
     fused_residual_norm: bool = False,
     allow_experimental: bool = False,
 ) -> dict[str, Any]:
-    """Apply explicit unsafe overrides without silently changing a safe profile."""
     requested = {
         "head8": head8,
         "o_proj_fp8": o_proj_fp8,
@@ -214,14 +346,9 @@ def apply_overrides(
             f"{flags} require --allow-experimental because they are not "
             "validated defaults"
         )
-
     result = dict(profile)
     if head8:
-        result.update(
-            lm_head_fp8=True,
-            keep_bf16_lm_head=False,
-            lm_head_topk_guard=0,
-        )
+        result.update(lm_head_fp8=True, keep_bf16_lm_head=False, lm_head_topk_guard=0)
     if o_proj_fp8:
         result["o_proj_fp8"] = True
     if fused_scaled_mlp:
@@ -235,7 +362,6 @@ def apply_overrides(
 
 
 def profile_to_runtime_kwargs(profile: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert a profile into ThinGpuQwenRuntime constructor arguments."""
     keys = (
         "kernel_backend",
         "gate_up_fp8",
@@ -248,6 +374,12 @@ def profile_to_runtime_kwargs(profile: Mapping[str, Any]) -> dict[str, Any]:
         "lm_head_backend",
         "lm_head_topk_guard",
         "attention_backend",
+        "fused_rope",
+        "adaptive_body_int8_start_token",
+        "mxfp4_gate_up_layers",
+        "mxfp4_down_layers",
+        "mxfp4_qkv_layers",
+        "mxfp4_o_layers",
         "fused_scaled_mlp",
         "fused_residual_norm",
     )
@@ -255,7 +387,6 @@ def profile_to_runtime_kwargs(profile: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def profile_to_runtime_flags(profile: Mapping[str, Any]) -> list[str]:
-    """Translate a profile into scripts/thin_runtime.py CLI flags."""
     flags: list[str] = [
         "--kernel-backend",
         str(profile.get("kernel_backend", "triton")),
@@ -273,15 +404,100 @@ def profile_to_runtime_flags(profile: Mapping[str, Any]) -> list[str]:
         "keep_bf16_lm_head": "--keep-bf16-lm-head",
         "fused_scaled_mlp": "--fused-scaled-mlp",
         "fused_residual_norm": "--fused-residual-norm",
+        "fused_rope": "--fused-rope",
+        "exact_prefill": "--exact-prefill",
     }
     for key, flag in booleans.items():
         if profile.get(key):
             flags.append(flag)
     if profile.get("down_fp8_layer_spec"):
-        flags.extend(
-            ["--down-fp8-layers", str(profile["down_fp8_layer_spec"])]
-        )
+        flags.extend(["--down-fp8-layers", str(profile["down_fp8_layer_spec"])])
     guard = int(profile.get("lm_head_topk_guard") or 0)
     if guard:
         flags.extend(["--lm-head-topk-guard", str(guard)])
+    adaptive_start = int(profile.get("adaptive_body_int8_start_token", -1))
+    if adaptive_start >= 0:
+        flags.extend(["--adaptive-body-int8-start-token", str(adaptive_start)])
+    kv_block_size = int(profile.get("kv_block_size") or 0)
+    if kv_block_size > 0:
+        flags.extend(["--kv-block-size", str(kv_block_size)])
+    for key, flag in (
+        ("mxfp4_gate_up_layers", "--mxfp4-gate-up-layers"),
+        ("mxfp4_down_layers", "--mxfp4-down-layers"),
+        ("mxfp4_qkv_layers", "--mxfp4-qkv-layers"),
+        ("mxfp4_o_layers", "--mxfp4-o-layers"),
+    ):
+        value = profile.get(key)
+        if value is not None:
+            flags.extend([flag, str(value)])
     return flags
+
+
+_PROFILE_ENV_KEYS = (
+    "THINTENSOR_INT8_TENSORCORE",
+    "THINTENSOR_INT8_TC_BLOCK_N",
+    "THINTENSOR_INT8_TC_BLOCK_M",
+    "THINTENSOR_INT8_TC_BLOCK_K",
+)
+
+
+def profile_environment(profile: Mapping[str, Any]) -> dict[str, str]:
+    if not profile.get("experimental_int8_tensorcore"):
+        return {}
+    return {
+        "THINTENSOR_INT8_TENSORCORE": "1",
+        "THINTENSOR_INT8_TC_BLOCK_N": "2",
+        "THINTENSOR_INT8_TC_BLOCK_M": "64",
+        "THINTENSOR_INT8_TC_BLOCK_K": "256",
+    }
+
+
+def activate_profile_environment(profile: Mapping[str, Any]) -> None:
+    for key in _PROFILE_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.update(profile_environment(profile))
+
+
+def subprocess_environment(profile: Mapping[str, Any]) -> dict[str, str]:
+    environment = dict(os.environ)
+    for key in _PROFILE_ENV_KEYS:
+        environment.pop(key, None)
+    environment.update(profile_environment(profile))
+    return environment
+
+
+def profile_public_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "name",
+        "label",
+        "description",
+        "intent",
+        "quality_contract",
+        "retention_contract",
+        "speed_contract",
+        "recommended_for",
+        "tradeoffs",
+        "experimental",
+        "required_capabilities",
+        "measured_results",
+    )
+    return {key: profile.get(key) for key in keys if key in profile}
+
+
+def recommend_profile(
+    goal: str,
+    *,
+    model: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized = goal.strip().lower()
+    names = {
+        "quality": "safe",
+        "balanced": "balanced",
+        "speed": "max-performance",
+    }
+    if normalized not in names:
+        raise ValueError("goal must be one of: quality, balanced, speed")
+    try:
+        return get_profile(names[normalized], model=model)
+    except ValueError:
+        return get_profile("safe", model=model)

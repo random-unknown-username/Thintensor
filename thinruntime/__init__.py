@@ -13,6 +13,11 @@ __version__ = "0.1.0"
 
 _EXPORTS = {
     "ThinArchive": (".archive", "ThinArchive"),
+    "NativeSupport": (".capabilities", "NativeSupport"),
+    "analyze_hf_directory": (".capabilities", "analyze_hf_directory"),
+    "analyze_archive_model": (".capabilities", "analyze_archive_model"),
+    "ArchitectureStatus": (".architectures", "ArchitectureStatus"),
+    "architecture_status": (".architectures", "architecture_status"),
     "ModelDescriptor": (".model_arch", "ModelDescriptor"),
     "descriptor_from_hf_config": (".model_arch", "descriptor_from_hf_config"),
     "descriptor_from_manifest": (".model_arch", "descriptor_from_manifest"),

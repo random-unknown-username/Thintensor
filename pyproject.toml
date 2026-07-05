@@ -22,9 +22,6 @@ cli = [
   "huggingface-hub",
   "rich",
 ]
-tui = [
-  "textual",
-]
 dev = [
   "pytest",
   "ruff",
@@ -33,20 +30,24 @@ all = [
   "huggingface-hub",
   "rich",
   "safetensors",
-  "textual",
   "torch",
   "transformers",
   "triton",
 ]
 
 [project.scripts]
+thintensor = "thinruntime.cli:main"
 thin = "thinruntime.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["thinruntime*"]
 
+[tool.setuptools.package-data]
+thinruntime = ["bin/*"]
+
 [tool.setuptools.data-files]
 "share/thintensor/scripts" = [
+  "scripts/bench_hf_transformers_decode.py",
   "scripts/compare_hf_thin_logits.py",
   "scripts/optimize_runtime_one_by_one.py",
   "scripts/stress_validate_thin.py",

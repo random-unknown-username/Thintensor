@@ -2,19 +2,15 @@
 """ThinTensor CLI — unified command-line interface.
 
 Usage:
-    thin convert ./SmolLM3-3B --out SmolLM3-3B.thin
-    thin run SmolLM3-3B.thin --prompt "Hello" --profile bf16
-    thin chat SmolLM3-3B.thin --profile quality
-    thin pull HuggingFaceTB/SmolLM3-3B
-    thin bench SmolLM3-3B.thin --profiles bf16,quality
-    thin inspect SmolLM3-3B.thin
-    thin doctor
-    thin tui
+    thintensor convert ./SmolLM3-3B --out SmolLM3-3B.thin
+    thintensor run SmolLM3-3B.thin --prompt "Hello" --profile balanced
+    thintensor explain max-performance
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import subprocess
@@ -85,8 +81,14 @@ def _kv(key: str, value: Any) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="thin",
-        description="ThinTensor model conversion, inference, validation, and optimization",
+        prog="thintensor",
+        description=(
+            "Convert, run, benchmark, and validate .thin models from one CLI"
+        ),
+        epilog=(
+            "Start: thintensor doctor | thintensor profiles list | "
+            "thintensor explain --goal balanced"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--version", action="store_true", help="Show version")
@@ -151,12 +153,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p_run.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p_run.add_argument(
+        "--engine",
+        choices=["auto", "native", "transformers"],
+        default="auto",
+        help=(
+            "Execution engine; auto uses native ThinTensor when semantic and "
+            "tensor capabilities match, otherwise Transformers"
+        ),
+    )
+    p_run.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom Hugging Face model code in Transformers fallback",
+    )
+    p_run.add_argument(
         "--profile", default="auto",
-        help="Runtime profile (auto/bf16/quality/quality-guarded/experimental)",
+        help="Runtime profile (auto/safe/balanced/max-performance/lab)",
     )
     p_run.add_argument(
         "--force-profile", action="store_true",
-        help="Run a model-specific profile on an unvalidated model geometry",
+        help="Bypass semantic capability checks for an explicit experiment",
     )
     p_run.add_argument(
         "--residency", choices=["all", "stream"], default="all",
@@ -175,6 +191,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument("--kv-gpu-recent-tokens", type=int, default=256)
     p_run.add_argument("--tokenizer", help="Tokenizer directory or Hugging Face model id")
+    p_run.add_argument(
+        "--hf-source",
+        help=(
+            "Original HF directory/config for running a non-native .thin "
+            "archive through Transformers"
+        ),
+    )
     p_run.add_argument("--head8", action="store_true", help="[experimental] head8 mode")
     p_run.add_argument(
         "--o-proj-fp8", action="store_true", help="[experimental] FP8 O-projection"
@@ -208,9 +231,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--seed", type=int, default=0)
     p_chat.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p_chat.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    p_chat.add_argument(
+        "--engine",
+        choices=["auto", "native", "transformers"],
+        default="auto",
+    )
+    p_chat.add_argument("--trust-remote-code", action="store_true")
     p_chat.add_argument("--profile", default="auto")
     p_chat.add_argument("--force-profile", action="store_true")
     p_chat.add_argument("--tokenizer")
+    p_chat.add_argument("--hf-source")
     p_chat.add_argument("--allow-experimental", action="store_true")
 
     p_bench = sub.add_parser(
@@ -220,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bench.add_argument("model", type=str, help=".thin archive path")
     p_bench.add_argument(
-        "--profiles", default="bf16,auto",
+        "--profiles", default="safe,balanced",
         help="Comma-separated profiles to benchmark",
     )
     p_bench.add_argument("--steps", type=int, default=200, help="Steps per profile")
@@ -232,6 +262,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--json", action="store_true")
     p_bench.add_argument("--out", type=str, help="Write JSON results to this file or directory")
     p_bench.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    p_bench.add_argument(
+        "--hf-model",
+        help="Also benchmark this original HF model/directory as the baseline",
+    )
+    p_bench.add_argument(
+        "--require-faster-than-hf",
+        action="store_true",
+        help="Exit nonzero unless at least one ThinTensor profile beats HF",
+    )
+    p_bench.add_argument("--trust-remote-code", action="store_true")
 
     p_validate = sub.add_parser(
         "validate",
@@ -258,6 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Markdown report path; a JSON sibling is written too",
     )
     p_validate.add_argument("--json", action="store_true")
+    p_validate.add_argument("--trust-remote-code", action="store_true")
     p_validate.add_argument("--dry-run", action="store_true")
 
     p_optimize = sub.add_parser(
@@ -290,6 +331,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_profiles_show.add_argument("--json", action="store_true")
 
+    p_explain = sub.add_parser(
+        "explain",
+        help="Explain profile quality, retention, speed, and tradeoffs",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p_explain.add_argument(
+        "profile",
+        nargs="?",
+        help="Profile to explain; omit to compare all profiles",
+    )
+    p_explain.add_argument(
+        "--goal",
+        choices=["quality", "balanced", "speed"],
+        help="Recommend a profile for this priority",
+    )
+    p_explain.add_argument(
+        "--model",
+        "--archive",
+        dest="model",
+        help="Analyze an HF directory or .thin archive",
+    )
+    p_explain.add_argument("--json", action="store_true")
+
+    p_architectures = sub.add_parser(
+        "architectures",
+        help="Show native architecture correctness/performance coverage",
+    )
+    architecture_sub = p_architectures.add_subparsers(
+        dest="architecture_command",
+        metavar="ACTION",
+    )
+    p_arch_list = architecture_sub.add_parser("list", help="List coverage")
+    p_arch_list.add_argument("--json", action="store_true")
+    p_arch_show = architecture_sub.add_parser("show", help="Show one family")
+    p_arch_show.add_argument("name")
+    p_arch_show.add_argument("--json", action="store_true")
+    p_arch_audit = architecture_sub.add_parser(
+        "audit",
+        help="Audit an HF directory or .thin archive",
+    )
+    p_arch_audit.add_argument("model")
+    p_arch_audit.add_argument("--json", action="store_true")
+
     p_inspect = sub.add_parser("inspect", help="Inspect a .thin archive")
     p_inspect.add_argument("archive", type=str, help=".thin archive path")
     p_inspect.add_argument("--verify", action="store_true", help="Verify archive hashes first")
@@ -301,8 +385,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict", action="store_true",
         help="Exit nonzero if a required runtime component is unavailable",
     )
-
-    sub.add_parser("tui", help="Launch terminal UI")
 
     p_cache = sub.add_parser("cache", help="Inspect the local model/archive cache")
     cache_sub = p_cache.add_subparsers(dest="cache_command", metavar="ACTION")
@@ -361,6 +443,15 @@ def cmd_convert(args: argparse.Namespace) -> None:
     _kv("Output", str(out_path))
     if args.arch:
         _kv("Architecture", args.arch)
+    from .capabilities import analyze_hf_directory
+
+    support = analyze_hf_directory(hf_dir)
+    _kv(
+        "Runtime route",
+        "native ThinTensor" if support.supported else "Transformers compatibility",
+    )
+    if support.reasons:
+        _kv("Native blockers", "; ".join(support.reasons))
 
     print()
     include_tokenizer = args.include_tokenizer_hashes and not args.no_tokenizer_hashes
@@ -430,11 +521,22 @@ def cmd_pull(args: argparse.Namespace) -> None:
 
     _header("ThinTensor Pull")
     target_dir = args.dir if args.dir else None
-    pull_model(
+    path = pull_model(
         args.model_id,
         target_dir=target_dir,
         revision=args.revision,
         token=args.token,
+    )
+    from .capabilities import analyze_hf_directory
+
+    support = analyze_hf_directory(path)
+    print()
+    _kv("Engine", support.engine)
+    if support.reasons:
+        _kv("Native blockers", "; ".join(support.reasons))
+    _kv(
+        "Next",
+        f"thintensor run {args.model_id} --prompt \"Hello\"",
     )
 
 
@@ -458,11 +560,79 @@ def cmd_run(args: argparse.Namespace) -> None:
     if "error" in resolved:
         _print(f"\u2717 {resolved['error']}")
         raise SystemExit(1)
+    _validate_generation_args(args)
+    _require_greedy_sampling(args)
+
+    if resolved["kind"] != "archive":
+        hf_source = _ensure_hf_source(resolved, quiet=args.json)
+        from .capabilities import analyze_hf_directory
+
+        support = analyze_hf_directory(hf_source)
+        use_transformers = (
+            args.engine == "transformers"
+            or (args.engine == "auto" and not support.supported)
+        )
+        if use_transformers:
+            if not args.json:
+                _header("ThinTensor Run")
+                _kv("Engine", "Transformers compatibility fallback")
+                _kv("Model", hf_source)
+                if support.reasons:
+                    _kv("Native engine skipped", "; ".join(support.reasons))
+                print()
+            _run_transformers_inference(
+                model_source=hf_source,
+                prompt=args.prompt,
+                max_new_tokens=args.max_new_tokens,
+                context=args.context,
+                device=args.device,
+                dtype=args.dtype,
+                tokenizer_source=args.tokenizer,
+                trust_remote_code=args.trust_remote_code,
+                json_output=args.json,
+            )
+            return
+        if args.engine == "native" and not support.supported:
+            raise SystemExit(
+                "model is not supported by the native engine: "
+                + "; ".join(support.reasons)
+            )
+    else:
+        archive_model = _archive_model(resolved["path"])
+        from .capabilities import analyze_archive_model
+
+        support = analyze_archive_model(archive_model)
+        use_transformers = (
+            args.engine == "transformers"
+            or (args.engine == "auto" and not support.supported)
+        )
+        if use_transformers:
+            if not args.hf_source:
+                raise SystemExit(
+                    "this archive requires the Transformers compatibility "
+                    "engine; pass --hf-source ORIGINAL_HF_DIRECTORY"
+                )
+            _run_transformers_inference(
+                model_source=args.hf_source,
+                archive_path=resolved["path"],
+                prompt=args.prompt,
+                max_new_tokens=args.max_new_tokens,
+                context=args.context,
+                device=args.device,
+                dtype=args.dtype,
+                tokenizer_source=args.tokenizer,
+                trust_remote_code=args.trust_remote_code,
+                json_output=args.json,
+            )
+            return
+        if args.engine == "native" and not support.supported:
+            raise SystemExit(
+                "archive is not supported by the native engine: "
+                + "; ".join(support.reasons)
+            )
 
     archive_path = _ensure_archive(resolved, args)
     model = _archive_model(archive_path)
-    _validate_generation_args(args)
-    _require_greedy_sampling(args)
 
     try:
         profile = get_profile(
@@ -543,11 +713,63 @@ def cmd_chat(args: argparse.Namespace) -> None:
     if "error" in resolved:
         _print(f"\u2717 {resolved['error']}")
         raise SystemExit(1)
-
-    archive_path = _ensure_archive(resolved, args)
-    model = _archive_model(archive_path)
     _validate_generation_args(args)
     _require_greedy_sampling(args)
+
+    if resolved["kind"] != "archive":
+        hf_source = _ensure_hf_source(resolved, quiet=False)
+        from .capabilities import analyze_hf_directory
+
+        support = analyze_hf_directory(hf_source)
+        if args.engine == "transformers" or (
+            args.engine == "auto" and not support.supported
+        ):
+            _run_transformers_chat(
+                model_source=hf_source,
+                max_new_tokens=args.max_new_tokens,
+                context=args.context,
+                device=args.device,
+                dtype=args.dtype,
+                tokenizer_source=args.tokenizer,
+                trust_remote_code=args.trust_remote_code,
+            )
+            return
+        if args.engine == "native" and not support.supported:
+            raise SystemExit(
+                "model is not supported by the native engine: "
+                + "; ".join(support.reasons)
+            )
+    else:
+        archive_model = _archive_model(resolved["path"])
+        from .capabilities import analyze_archive_model
+
+        support = analyze_archive_model(archive_model)
+        if args.engine == "transformers" or (
+            args.engine == "auto" and not support.supported
+        ):
+            if not args.hf_source:
+                raise SystemExit(
+                    "this archive requires the Transformers compatibility "
+                    "engine; pass --hf-source ORIGINAL_HF_DIRECTORY"
+                )
+            _run_transformers_chat(
+                model_source=args.hf_source,
+                archive_path=resolved["path"],
+                max_new_tokens=args.max_new_tokens,
+                context=args.context,
+                device=args.device,
+                dtype=args.dtype,
+                tokenizer_source=args.tokenizer,
+                trust_remote_code=args.trust_remote_code,
+            )
+            return
+        if args.engine == "native" and not support.supported:
+            raise SystemExit(
+                "archive is not supported by the native engine: "
+                + "; ".join(support.reasons)
+            )
+    archive_path = _ensure_archive(resolved, args)
+    model = _archive_model(archive_path)
 
     try:
         profile = get_profile(
@@ -665,13 +887,51 @@ def cmd_bench(args: argparse.Namespace) -> None:
             print()
 
     if results:
+        if args.hf_model:
+            hf_result = _run_transformers_benchmark(
+                model=args.hf_model,
+                steps=args.steps,
+                warmup=args.warmup,
+                device=args.device,
+                dtype=args.dtype,
+                trust_remote_code=args.trust_remote_code,
+                dry_run=args.dry_run,
+                quiet=args.json,
+            )
+            if hf_result:
+                results.append(hf_result)
+                hf_speed = hf_result.get("tokens_per_s")
+                if isinstance(hf_speed, (int, float)) and hf_speed > 0:
+                    for row in results:
+                        speed = row.get("tokens_per_s")
+                        if row.get("engine") == "thintensor" and isinstance(
+                            speed, (int, float)
+                        ):
+                            row["speedup_vs_transformers"] = speed / hf_speed
         _print_bench_table(results, json_output=args.json, out_dir=args.out)
+    if args.require_faster_than_hf and not args.dry_run:
+        if not args.hf_model:
+            raise SystemExit("--require-faster-than-hf requires --hf-model")
+        wins = [
+            row
+            for row in results
+            if row.get("engine") == "thintensor"
+            and float(row.get("speedup_vs_transformers") or 0) > 1.0
+        ]
+        if not wins:
+            raise SystemExit(
+                "no ThinTensor profile beat the Transformers baseline"
+            )
     if any("error" in row for row in results):
         raise SystemExit(1)
 
 
 def cmd_validate(args: argparse.Namespace) -> None:
-    from .profile_presets import get_profile, profile_to_runtime_flags
+    from .profile_presets import (
+        get_profile,
+        profile_to_runtime_flags,
+        subprocess_environment,
+    )
 
     archive = Path(args.archive).resolve()
     if not archive.is_file():
@@ -721,12 +981,15 @@ def cmd_validate(args: argparse.Namespace) -> None:
         "--json",
         *runtime_flags,
     ]
+    if args.trust_remote_code:
+        command.append("--trust-remote-code")
     if args.dry_run:
         _emit_command(command, json_output=args.json)
         return
     completed = subprocess.run(
         command,
         cwd=Path.cwd(),
+        env=subprocess_environment(profile),
         text=True,
         capture_output=True,
         check=False,
@@ -807,7 +1070,12 @@ def cmd_optimize(args: argparse.Namespace) -> None:
 
 
 def cmd_profiles(args: argparse.Namespace) -> None:
-    from .profile_presets import PROFILES, PROFILE_ALIASES, get_profile
+    from .profile_presets import (
+        PROFILES,
+        PROFILE_ALIASES,
+        get_profile,
+        profile_public_summary,
+    )
 
     action = args.profile_command or "list"
     json_output = getattr(args, "json", False)
@@ -815,7 +1083,7 @@ def cmd_profiles(args: argparse.Namespace) -> None:
         model = _archive_model(args.archive) if args.archive else None
         if args.name == "auto" and model is None:
             raise SystemExit(
-                "'auto' depends on archive geometry; pass --archive MODEL.thin"
+                "'auto' depends on model capabilities; pass --archive MODEL.thin"
             )
         try:
             payload = get_profile(args.name, model=model)
@@ -828,25 +1096,28 @@ def cmd_profiles(args: argparse.Namespace) -> None:
             _kv("Name", payload["name"])
             _kv("Description", payload["description"])
             _kv("Experimental", payload["experimental"])
-            _kv("Validated geometry", payload["validated_geometry"] or "universal")
+            _kv(
+                "Required capabilities",
+                payload.get("required_capabilities") or "portable fallback",
+            )
+            _kv("Quality", payload["quality_contract"])
+            _kv("Retention", payload["retention_contract"])
+            _kv("Performance", payload["speed_contract"])
             print()
             for key, value in payload.items():
                 if key not in {
                     "name", "label", "description", "experimental",
-                    "validated_geometry",
+                    "required_capabilities", "intent", "quality_contract",
+                    "retention_contract", "speed_contract", "recommended_for",
+                    "tradeoffs", "measured_results",
                 }:
                     _kv(key.replace("_", " "), value)
         return
 
     payload = [
-        {
-            "name": name,
-            "label": profile["label"],
-            "description": profile["description"],
-            "experimental": profile["experimental"],
-            "validated_geometry": profile["validated_geometry"],
-        }
+        profile_public_summary({**profile, "name": name})
         for name, profile in PROFILES.items()
+        if not profile.get("hidden")
     ]
     for alias, target in PROFILE_ALIASES.items():
         payload.append({"name": alias, "alias_for": target})
@@ -854,13 +1125,200 @@ def cmd_profiles(args: argparse.Namespace) -> None:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         _header("Runtime Profiles")
-        _kv("auto", "quality-guarded on validated SmolLM3-3B geometry; BF16 otherwise")
+        _kv("auto", "select a native kernel family from model semantics")
         for row in payload:
             if "alias_for" in row:
                 _kv(row["name"], f"alias for {row['alias_for']}")
             else:
                 marker = " [experimental]" if row["experimental"] else ""
                 _kv(row["name"], row["label"] + marker)
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    from .profile_presets import (
+        PROFILES,
+        get_profile,
+        profile_compatibility,
+        profile_public_summary,
+        recommend_profile,
+    )
+
+    model = None
+    native_support = None
+    if args.model:
+        candidate = Path(args.model)
+        if candidate.suffix == ".thin":
+            model = _archive_model(args.model)
+            from .capabilities import analyze_archive_model
+
+            native_support = analyze_archive_model(model)
+        else:
+            from .capabilities import analyze_hf_directory
+
+            native_support = analyze_hf_directory(candidate)
+            config_path = candidate / "config.json"
+            if config_path.is_file():
+                model = json.loads(config_path.read_text(encoding="utf-8"))
+    if args.goal:
+        profile = recommend_profile(args.goal, model=model)
+        payload = profile_public_summary(profile)
+        payload["recommendation_goal"] = args.goal
+        payload["recommendation_reason"] = profile["recommended_for"]
+        if native_support is not None:
+            payload["engine_decision"] = native_support.as_dict()
+        rows = [payload]
+    elif args.profile:
+        try:
+            profile = get_profile(args.profile, model=model)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        payload = profile_public_summary(profile)
+        if native_support is not None:
+            payload["engine_decision"] = native_support.as_dict()
+        rows = [payload]
+    else:
+        rows = []
+        for name, definition in PROFILES.items():
+            if definition.get("hidden"):
+                continue
+            profile = {**definition, "name": name}
+            payload = profile_public_summary(profile)
+            if model is not None:
+                compatible, reason = profile_compatibility(profile, model)
+                payload["compatible"] = compatible
+                payload["compatibility_reason"] = reason
+            rows.append(payload)
+
+    if args.json:
+        print(json.dumps(rows[0] if len(rows) == 1 else rows, indent=2))
+        return
+
+    if len(rows) == 1:
+        row = rows[0]
+        _header(row["label"])
+        _kv("Profile", row["name"])
+        _kv("Purpose", row["intent"])
+        _kv("Quality", row["quality_contract"])
+        _kv("Context retention", row["retention_contract"])
+        _kv("Performance", row["speed_contract"])
+        _kv("Use it for", row["recommended_for"])
+        _kv("Status", "experimental opt-in" if row["experimental"] else "supported")
+        engine_decision = row.get("engine_decision")
+        if engine_decision:
+            _kv("Engine", engine_decision["engine"])
+            if engine_decision["reasons"]:
+                _kv("Native blockers", "; ".join(engine_decision["reasons"]))
+        tradeoffs = row.get("tradeoffs") or ()
+        if tradeoffs:
+            print("\nTradeoffs:")
+            for item in tradeoffs:
+                print(f"  - {item}")
+        print(f"\nRun: thintensor run MODEL.thin --profile {row['name']}")
+        return
+
+    _header("Profile Decision Guide")
+    print("  safe       -> portable BF16 and highest fidelity")
+    print("  balanced   -> native kernels without approximate weight storage")
+    print("  max-performance -> fastest validated single-stream model profile")
+    print()
+    if _RICH_AVAILABLE and _console:
+        table = Table(show_lines=True)
+        table.add_column("Profile", style="bold cyan")
+        table.add_column("Status")
+        table.add_column("Purpose")
+        table.add_column("Performance contract")
+        for row in rows:
+            table.add_row(
+                row["name"],
+                "experimental" if row["experimental"] else "supported",
+                row["intent"],
+                row["speed_contract"],
+            )
+        _console.print(table)
+    else:
+        for row in rows:
+            status = "experimental" if row["experimental"] else "supported"
+            print(f"  {row['name']:<18} {status:<12} {row['intent']}")
+    print("\nInspect one: thintensor explain PROFILE")
+
+
+def cmd_architectures(args: argparse.Namespace) -> None:
+    from .architectures import (
+        architecture_rows,
+        architecture_status,
+    )
+
+    action = args.architecture_command or "list"
+    if action == "show":
+        entry = architecture_status(args.name)
+        if entry is None:
+            raise SystemExit(f"architecture is not registered: {args.name}")
+        payload = entry.as_dict()
+    elif action == "audit":
+        candidate = Path(args.model)
+        if candidate.suffix == ".thin":
+            model = _archive_model(args.model)
+            from .capabilities import analyze_archive_model
+
+            support = analyze_archive_model(model)
+            raw_name = str(
+                model.get("model_type")
+                or model.get("raw_arch")
+                or model.get("arch")
+                or "unknown"
+            )
+        else:
+            from .capabilities import analyze_hf_directory
+
+            support = analyze_hf_directory(candidate)
+            raw_name = support.model_type or support.architecture
+        entry = architecture_status(raw_name)
+        payload = {
+            "model": str(candidate),
+            "detected": support.as_dict(),
+            "registry": entry.as_dict() if entry else None,
+            "performance_supported": bool(
+                entry is not None and entry.native_status == "verified"
+            ),
+            "next_gate": (
+                None
+                if entry is not None and entry.native_status == "verified"
+                else "run matched conversion, correctness, and HF speed gates"
+            ),
+        }
+    else:
+        payload = architecture_rows()
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if action == "list":
+        _header("Architecture Coverage")
+        if _RICH_AVAILABLE and _console:
+            table = Table(show_lines=True)
+            table.add_column("Architecture", style="bold cyan")
+            table.add_column("Native status")
+            table.add_column("Schema")
+            table.add_column("Validated profile")
+            table.add_column("vs HF")
+            for row in payload:
+                speedup = row.get("speedup_vs_hf")
+                table.add_row(
+                    row["name"],
+                    row["native_status"],
+                    row["tensor_schema"],
+                    row.get("validated_profile") or "-",
+                    f"{speedup:.3f}x" if speedup is not None else "-",
+                )
+            _console.print(table)
+        else:
+            for row in payload:
+                print(
+                    f"{row['name']:<14} {row['native_status']:<10} "
+                    f"{row['tensor_schema']}"
+                )
+        return
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def cmd_inspect(args: argparse.Namespace) -> None:
@@ -982,13 +1440,6 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
     add("Rich", _RICH_AVAILABLE, "installed" if _RICH_AVAILABLE else "not installed (pip install rich)", required=False)
 
-    try:
-        import textual  # noqa: F401
-
-        add("Textual", True, "installed", required=False)
-    except ImportError:
-        add("Textual", False, "not installed (pip install textual)", required=False)
-
     from .model_cache import cache_root
 
     cache = cache_root()
@@ -1014,18 +1465,6 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             status = "\u2713" if row["ok"] else "\u2717"
             print(f"  {status} {row['component']}: {row['detail']}")
     if args.strict and not passed:
-        raise SystemExit(1)
-
-
-def cmd_tui(args: argparse.Namespace) -> None:
-    try:
-        from .tui import run_tui
-
-        run_tui()
-    except ImportError as e:
-        _print("\u2717 TUI requires the 'textual' package.")
-        _print("  Install with: pip install textual")
-        _print(f"  Error: {e}")
         raise SystemExit(1)
 
 
@@ -1145,7 +1584,27 @@ def _adapt_profile_for_device(
     device: str,
 ) -> dict[str, Any]:
     if device != "cpu":
-        return profile
+        result = dict(profile)
+        tied_head_bytes = (
+            int(model.get("vocab_size") or 0)
+            * int(model.get("hidden_size") or 0)
+        )
+        if (
+            result.get("lm_head_fp8")
+            and bool(model.get("tie_word_embeddings"))
+            and tied_head_bytes >= 384 * 1024 * 1024
+        ):
+            # A tied embedding cannot be replaced by the FP8 execution head.
+            # Very large vocabularies would therefore require a second
+            # multi-hundred-MiB copy before body quantization frees memory.
+            result["lm_head_fp8"] = False
+            result["keep_bf16_lm_head"] = True
+            result["lm_head_topk_guard"] = 0
+            result["profile_adaptations"] = [
+                *result.get("profile_adaptations", []),
+                "disabled duplicate FP8 head for large tied vocabulary",
+            ]
+        return result
     if requested_name.strip().lower() == "auto":
         from .profile_presets import get_profile
 
@@ -1274,22 +1733,53 @@ def _optimizer_plan_template(archive: str, hf_model: str) -> dict[str, Any]:
     }
 
 
+def _ensure_hf_source(
+    resolved: dict[str, Any],
+    *,
+    quiet: bool,
+) -> str:
+    """Return a local HF directory, downloading a model id when required."""
+    if resolved["kind"] == "hf_dir":
+        return str(Path(resolved["path"]).resolve())
+    if resolved["kind"] != "hf_model_id":
+        raise ValueError("a Hugging Face directory or model id is required")
+    model_path = Path(resolved["model_path"])
+    if resolved.get("needs_pull") or not model_path.exists():
+        if not quiet:
+            _print(
+                "Pulling model..."
+                if not _RICH_AVAILABLE
+                else "[yellow]Pulling model...[/yellow]"
+            )
+        from .hf_pull import pull_model
+
+        pull_model(resolved["path"], target_dir=model_path, quiet=quiet)
+    return str(model_path.resolve())
+
+
 def _ensure_archive(resolved: dict, args: argparse.Namespace) -> str:
     """Ensure we have a .thin archive, pulling/converting if needed."""
+    quiet = bool(getattr(args, "json", False))
     if resolved["kind"] == "archive":
         return resolved["path"]
 
     if resolved["kind"] == "hf_model_id":
         if resolved.get("needs_pull"):
-            _print("Pulling model..." if not _RICH_AVAILABLE else "[yellow]Pulling model...[/yellow]")
+            if not quiet:
+                _print("Pulling model..." if not _RICH_AVAILABLE else "[yellow]Pulling model...[/yellow]")
             from .hf_pull import pull_model
 
-            pull_model(resolved["path"], target_dir=resolved.get("model_path"))
+            pull_model(
+                resolved["path"],
+                target_dir=resolved.get("model_path"),
+                quiet=quiet,
+            )
 
         # Check if archive already cached
         archive_path = resolved.get("archive_path", "")
         if Path(archive_path).exists():
-            _print(f"Using cached archive: {archive_path}")
+            if not quiet:
+                _print(f"Using cached archive: {archive_path}")
             return archive_path
 
         # Convert
@@ -1298,7 +1788,8 @@ def _ensure_archive(resolved: dict, args: argparse.Namespace) -> str:
             _print(f"\u2717 Model directory not found: {model_path}")
             raise SystemExit(1)
 
-        _print("Converting to .thin..." if not _RICH_AVAILABLE else "[yellow]Converting to .thin...[/yellow]")
+        if not quiet:
+            _print("Converting to .thin..." if not _RICH_AVAILABLE else "[yellow]Converting to .thin...[/yellow]")
         from .command_runner import convert_hf_model
 
         success = convert_hf_model(model_path, archive_path)
@@ -1310,10 +1801,12 @@ def _ensure_archive(resolved: dict, args: argparse.Namespace) -> str:
     if resolved["kind"] == "hf_dir":
         archive_path = resolved.get("archive_path", "")
         if Path(archive_path).exists():
-            _print(f"Using cached archive: {archive_path}")
+            if not quiet:
+                _print(f"Using cached archive: {archive_path}")
             return archive_path
 
-        _print("Converting to .thin..." if not _RICH_AVAILABLE else "[yellow]Converting to .thin...[/yellow]")
+        if not quiet:
+            _print("Converting to .thin..." if not _RICH_AVAILABLE else "[yellow]Converting to .thin...[/yellow]")
         from .command_runner import convert_hf_model
 
         success = convert_hf_model(resolved["path"], archive_path)
@@ -1336,6 +1829,204 @@ def _parse_dtype(value: str):
         "fp32": torch.float32,
     }
     return mapping.get(value, torch.bfloat16)
+
+
+def _load_transformers_model(
+    *,
+    model_source: str,
+    archive_path: Optional[str] = None,
+    tokenizer_source: Optional[str],
+    device: str,
+    dtype: str,
+    trust_remote_code: bool,
+):
+    """Load the compatibility engine without importing Transformers at startup."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    source = tokenizer_source or model_source
+    tokenizer = AutoTokenizer.from_pretrained(
+        source,
+        trust_remote_code=trust_remote_code,
+    )
+    if archive_path:
+        from .hf_loader import load_thin_model
+
+        model, _diagnostics = load_thin_model(
+            archive_path,
+            model_source,
+            device=device,
+            dtype=_parse_dtype(dtype),
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_source,
+            dtype=_parse_dtype(dtype),
+            low_cpu_mem_usage=True,
+            trust_remote_code=trust_remote_code,
+        )
+        model.to(torch.device(device))
+    model.eval()
+    return model, tokenizer
+
+
+def _run_transformers_inference(
+    *,
+    model_source: str,
+    archive_path: Optional[str] = None,
+    prompt: str,
+    max_new_tokens: int,
+    context: int,
+    device: str,
+    dtype: str,
+    tokenizer_source: Optional[str],
+    trust_remote_code: bool,
+    json_output: bool,
+) -> None:
+    """Compatibility path for causal-LM architectures not yet native."""
+    import torch
+
+    load_start = time.perf_counter()
+    model, tokenizer = _load_transformers_model(
+        model_source=model_source,
+        archive_path=archive_path,
+        tokenizer_source=tokenizer_source,
+        device=device,
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+    )
+    load_s = time.perf_counter() - load_start
+    encoded = tokenizer(prompt, return_tensors="pt")
+    encoded = {key: value.to(device) for key, value in encoded.items()}
+    prompt_tokens = int(encoded["input_ids"].shape[-1])
+    if prompt_tokens + max_new_tokens > context:
+        raise ValueError(
+            f"prompt ({prompt_tokens} tokens) plus --max-new-tokens "
+            f"({max_new_tokens}) exceeds --context ({context})"
+        )
+    if device == "cuda":
+        torch.cuda.synchronize()
+    started = time.perf_counter()
+    with torch.inference_mode():
+        output = model.generate(
+            **encoded,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=(
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else tokenizer.eos_token_id
+            ),
+        )
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - started
+    generated = output[0, prompt_tokens:]
+    generated_count = int(generated.numel())
+    text = tokenizer.decode(generated, skip_special_tokens=True)
+    result = {
+        "engine": "transformers",
+        "native_optimized": False,
+        "model": archive_path or model_source,
+        "hf_source": model_source,
+        "load_s": load_s,
+        "generated_tokens": generated_count,
+        "decode_s": elapsed,
+        "tokens_per_s": generated_count / elapsed if elapsed else 0.0,
+        "text": text,
+        "warning": (
+            "Compatibility fallback: this result is not evidence that "
+            "ThinTensor outperforms Transformers."
+        ),
+    }
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        print(text)
+        print()
+        _kv("Engine", "Transformers compatibility fallback")
+        _kv("Speed", f"{result['tokens_per_s']:.2f} tok/s")
+        _kv("Load time", f"{load_s:.2f}s")
+
+
+def _run_transformers_chat(
+    *,
+    model_source: str,
+    archive_path: Optional[str] = None,
+    max_new_tokens: int,
+    context: int,
+    device: str,
+    dtype: str,
+    tokenizer_source: Optional[str],
+    trust_remote_code: bool,
+) -> None:
+    """Interactive compatibility chat using the model's chat template."""
+    import torch
+
+    model, tokenizer = _load_transformers_model(
+        model_source=model_source,
+        archive_path=archive_path,
+        tokenizer_source=tokenizer_source,
+        device=device,
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+    )
+    messages: list[dict[str, str]] = []
+    _header("ThinTensor Chat")
+    _kv("Engine", "Transformers compatibility fallback")
+    _kv("Commands", "/reset, /exit")
+    print()
+    while True:
+        try:
+            prompt = input("you> ").strip()
+        except EOFError:
+            break
+        if not prompt:
+            continue
+        if prompt in {"/exit", "/quit"}:
+            break
+        if prompt == "/reset":
+            messages.clear()
+            print("context cleared")
+            continue
+        messages.append({"role": "user", "content": prompt})
+        if getattr(tokenizer, "chat_template", None):
+            encoded = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(device)
+        else:
+            encoded = tokenizer(
+                "\n".join(
+                    f"{item['role']}: {item['content']}" for item in messages
+                )
+                + "\nassistant:",
+                return_tensors="pt",
+            )["input_ids"].to(device)
+        if int(encoded.shape[-1]) + max_new_tokens > context:
+            messages.pop()
+            print("context limit reached; use /reset or increase --context")
+            continue
+        with torch.inference_mode():
+            output = model.generate(
+                input_ids=encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=(
+                    tokenizer.pad_token_id
+                    if tokenizer.pad_token_id is not None
+                    else tokenizer.eos_token_id
+                ),
+            )
+        response = tokenizer.decode(
+            output[0, encoded.shape[-1]:],
+            skip_special_tokens=True,
+        )
+        print(f"assistant> {response}")
+        messages.append({"role": "assistant", "content": response})
 
 
 def _run_inference(
@@ -1363,7 +2054,12 @@ def _run_inference(
 ) -> None:
     """Run greedy causal inference with explicit weight and KV residency."""
     import torch
-    from .profile_presets import profile_to_runtime_kwargs
+    from .profile_presets import (
+        activate_profile_environment,
+        profile_to_runtime_kwargs,
+    )
+
+    activate_profile_environment(profile)
 
     torch_dtype = _parse_dtype(dtype)
 
@@ -1379,7 +2075,7 @@ def _run_inference(
     from .gpu_runtime import (
         PagedKVCache,
         ThinGpuPagePool,
-        ThinGpuQwenRuntime,
+        ThinGpuCausalLMRuntime,
         ThinGpuWeights,
     )
 
@@ -1419,18 +2115,37 @@ def _run_inference(
         head_dim=head_dim,
         device=torch.device(device),
         dtype=torch_dtype,
+        block_size=int(profile.get("kv_block_size") or 16),
         residency=kv_residency,
         gpu_recent_tokens=kv_gpu_recent_tokens,
     )
 
     runtime_kwargs = profile_to_runtime_kwargs(profile)
-    runtime = ThinGpuQwenRuntime(
-        weights,
-        kv_cache=kv_cache,
-        prefetch_distance=prefetch_layers if weight_residency == "stream" else 0,
-        evict_completed_layers=weight_residency == "stream",
-        **runtime_kwargs,
-    )
+    exact_prefill = bool(profile.get("exact_prefill"))
+    if exact_prefill and weight_residency != "all":
+        weights.close()
+        raise ValueError("exact prefill currently requires all-resident weights")
+    prefill_runtime = None
+    runtime = None
+    if exact_prefill:
+        prefill_runtime = ThinGpuCausalLMRuntime(
+            weights,
+            kv_cache=kv_cache,
+            kernel_backend="torch",
+            attention_mode="causal_kv",
+            attention_backend="torch",
+            exact_hf_mode=True,
+        )
+    else:
+        runtime = ThinGpuCausalLMRuntime(
+            weights,
+            kv_cache=kv_cache,
+            prefetch_distance=(
+                prefetch_layers if weight_residency == "stream" else 0
+            ),
+            evict_completed_layers=weight_residency == "stream",
+            **runtime_kwargs,
+        )
 
     if device == "cuda":
         torch.cuda.synchronize()
@@ -1462,7 +2177,25 @@ def _run_inference(
     decoded_text = ""
 
     for i, tid in enumerate(token_ids):
-        hidden = runtime.forward_token(tid, token_index=i)
+        assert prefill_runtime is not None or runtime is not None
+        hidden = (prefill_runtime or runtime).forward_token(
+            tid,
+            token_index=i,
+        )
+    if prefill_runtime is not None:
+        del prefill_runtime
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        runtime = ThinGpuCausalLMRuntime(
+            weights,
+            kv_cache=kv_cache,
+            prefetch_distance=0,
+            evict_completed_layers=False,
+            **runtime_kwargs,
+        )
+    assert runtime is not None
+    runtime.begin_decode(len(token_ids))
     if device == "cuda":
         torch.cuda.synchronize()
     t_gen = time.perf_counter()
@@ -1510,11 +2243,14 @@ def _run_inference(
 
     if json_output:
         result = {
+            "engine": "thintensor",
+            "native_optimized": True,
             "profile": profile["name"],
             "weight_residency": weight_residency,
             "kv_residency": kv_residency,
             "prompt_tokens": len(token_ids),
             "generated_token_ids": generated_ids,
+            "text": decoded_text,
             "tokens_generated": tokens_generated,
             "tokens_per_s": tok_per_s,
             "ms_per_token": ms_per_tok,
@@ -1557,7 +2293,12 @@ def _run_chat_loop(
 ) -> None:
     """Interactive chat loop."""
     import torch
-    from .profile_presets import profile_to_runtime_kwargs
+    from .profile_presets import (
+        activate_profile_environment,
+        profile_to_runtime_kwargs,
+    )
+
+    activate_profile_environment(profile)
 
     torch_dtype = _parse_dtype(dtype)
 
@@ -1567,7 +2308,11 @@ def _run_chat_loop(
     _print("Loading model..." if not _RICH_AVAILABLE else "[yellow]Loading model...[/yellow]")
     t0 = time.perf_counter()
 
-    from .gpu_runtime import ThinGpuWeights, ThinGpuQwenRuntime, PagedKVCache
+    from .gpu_runtime import (
+        PagedKVCache,
+        ThinGpuCausalLMRuntime,
+        ThinGpuWeights,
+    )
 
     weights = ThinGpuWeights(archive_path, device=device, dtype=torch_dtype)
     manifest = weights.manifest
@@ -1582,10 +2327,27 @@ def _run_chat_loop(
         head_dim=head_dim,
         device=torch.device(device),
         dtype=torch_dtype,
+        block_size=int(profile.get("kv_block_size") or 16),
     )
 
     runtime_kwargs = profile_to_runtime_kwargs(profile)
-    runtime = ThinGpuQwenRuntime(weights, kv_cache=kv_cache, **runtime_kwargs)
+    exact_prefill = bool(profile.get("exact_prefill"))
+    if exact_prefill:
+        runtime = ThinGpuCausalLMRuntime(
+            weights,
+            kv_cache=kv_cache,
+            kernel_backend="torch",
+            attention_mode="causal_kv",
+            attention_backend="torch",
+            exact_hf_mode=True,
+        )
+    else:
+        runtime = ThinGpuCausalLMRuntime(
+            weights,
+            kv_cache=kv_cache,
+            **runtime_kwargs,
+        )
+    adaptive_weights_active = False
 
     load_time = time.perf_counter() - t0
     _kv("Loaded in", f"{load_time:.2f}s")
@@ -1669,11 +2431,43 @@ def _run_chat_loop(
         # Rebuild the exact chat-template context each turn. This is more
         # expensive than incremental string concatenation, but it preserves
         # role/control tokens and avoids corrupting the conversation prefix.
+        if exact_prefill and adaptive_weights_active:
+            del runtime
+            weights.close()
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            weights = ThinGpuWeights(
+                archive_path,
+                device=device,
+                dtype=torch_dtype,
+            )
+            runtime = ThinGpuCausalLMRuntime(
+                weights,
+                kv_cache=kv_cache,
+                kernel_backend="torch",
+                attention_mode="causal_kv",
+                attention_backend="torch",
+                exact_hf_mode=True,
+            )
+            adaptive_weights_active = False
         kv_cache.reset(reuse_pages=True)
         token_index = 0
         for tid in token_ids:
             hidden = runtime.forward_token(tid, token_index=token_index)
             token_index += 1
+        if exact_prefill:
+            del runtime
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            runtime = ThinGpuCausalLMRuntime(
+                weights,
+                kv_cache=kv_cache,
+                **runtime_kwargs,
+            )
+            adaptive_weights_active = True
+        runtime.begin_decode(token_index)
         if device == "cuda":
             torch.cuda.synchronize()
         t_gen = time.perf_counter()
@@ -1747,8 +2541,16 @@ def _run_benchmark_profile(
     quiet: bool,
 ) -> Optional[dict]:
     """Run the trusted real causal-KV decode benchmark in a fresh process."""
-    from .profile_presets import profile_to_runtime_flags
+    from .profile_presets import (
+        profile_to_runtime_flags,
+        subprocess_environment,
+    )
 
+    runtime_flags = [
+        flag
+        for flag in profile_to_runtime_flags(profile)
+        if flag != "--exact-prefill"
+    ]
     command = [
         sys.executable,
         str(_tool_script("thin_runtime.py")),
@@ -1769,13 +2571,21 @@ def _run_benchmark_profile(
         "--max-gpu-temp",
         str(max_gpu_temp),
         "--json",
-        *profile_to_runtime_flags(profile),
+        *runtime_flags,
     ]
+    if profile.get("experimental_int8_tensorcore"):
+        command.append("--experimental-int8-tensorcore")
     if dry_run:
-        return {"profile": profile_name, "command": command, "dry_run": True}
+        return {
+            "profile": profile_name,
+            "engine": "thintensor",
+            "command": command,
+            "dry_run": True,
+        }
     completed = subprocess.run(
         command,
         cwd=Path.cwd(),
+        env=subprocess_environment(profile),
         text=True,
         capture_output=True,
         check=False,
@@ -1798,6 +2608,7 @@ def _run_benchmark_profile(
         }
     return {
         "profile": profile_name,
+        "engine": "thintensor",
         "tokens_per_s": raw.get("tokens_per_s"),
         "ms_per_token": raw.get("ms_per_token"),
         "resident_weight_bytes": raw.get("resident_weight_bytes"),
@@ -1814,6 +2625,84 @@ def _run_benchmark_profile(
             if steps >= 200 and warmup >= 10
             else "smoke run only; use at least 10 warmup and 200 measured steps"
         ),
+        "raw": raw,
+    }
+
+
+def _run_transformers_benchmark(
+    *,
+    model: str,
+    steps: int,
+    warmup: int,
+    device: str,
+    dtype: str,
+    trust_remote_code: bool,
+    dry_run: bool,
+    quiet: bool,
+) -> dict[str, Any]:
+    """Benchmark the same single-stream greedy loop through Transformers."""
+    command = [
+        sys.executable,
+        str(_tool_script("bench_hf_transformers_decode.py")),
+        "--model",
+        model,
+        "--steps",
+        str(steps),
+        "--warmup-steps",
+        str(warmup),
+        "--device",
+        device,
+        "--dtype",
+        dtype,
+    ]
+    if trust_remote_code:
+        command.append("--trust-remote-code")
+    if dry_run:
+        return {
+            "profile": "transformers",
+            "engine": "transformers",
+            "command": command,
+            "dry_run": True,
+        }
+    completed = subprocess.run(
+        command,
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        if completed.stderr and not quiet:
+            print(completed.stderr, file=sys.stderr, end="")
+        return {
+            "profile": "transformers",
+            "engine": "transformers",
+            "error": (
+                "Transformers benchmark exited with status "
+                f"{completed.returncode}"
+            ),
+            "command": command,
+        }
+    try:
+        raw = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "profile": "transformers",
+            "engine": "transformers",
+            "error": f"Transformers benchmark returned invalid JSON: {exc}",
+            "command": command,
+        }
+    return {
+        "profile": "transformers",
+        "engine": "transformers",
+        "tokens_per_s": raw.get("tokens_per_s"),
+        "ms_per_token": raw.get("ms_per_token"),
+        "resident_weight_bytes": 0,
+        "gpu_peak_allocated_bytes": raw.get("gpu_peak_allocated_bytes"),
+        "steps": raw.get("steps"),
+        "warmup_steps": warmup,
+        "attention_mode": "causal_kv",
+        "steady_state_eligible": steps >= 200 and warmup >= 10,
         "raw": raw,
     }
 
@@ -1848,17 +2737,20 @@ def _print_bench_table(results: list[dict], json_output: bool = False, out_dir: 
         table.add_column("ms/token", justify="right")
         table.add_column("Resident Weights", justify="right")
         table.add_column("Peak GPU", justify="right")
+        table.add_column("vs HF", justify="right")
 
         for r in results:
             if "error" in r:
-                table.add_row(r["profile"], "ERROR", "ERROR", "-", "-")
+                table.add_row(r["profile"], "ERROR", "ERROR", "-", "-", "-")
                 continue
+            speedup = r.get("speedup_vs_transformers")
             table.add_row(
                 r["profile"],
                 f"{r['tokens_per_s']:.1f}",
                 f"{r['ms_per_token']:.1f}",
                 _format_bytes(r.get("resident_weight_bytes", 0)),
                 _format_bytes(r.get("gpu_peak_allocated_bytes", 0)),
+                f"{speedup:.2f}x" if speedup is not None else "-",
             )
 
         _console.print(table)
@@ -2217,9 +3109,10 @@ def main() -> None:
         "validate": cmd_validate,
         "optimize": cmd_optimize,
         "profiles": cmd_profiles,
+        "explain": cmd_explain,
+        "architectures": cmd_architectures,
         "inspect": cmd_inspect,
         "doctor": cmd_doctor,
-        "tui": cmd_tui,
         "cache": cmd_cache,
         "core": cmd_core,
     }

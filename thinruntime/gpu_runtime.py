@@ -1,5 +1,6 @@
 import ctypes
 import gc
+import hashlib
 import math
 import os
 import resource
@@ -1981,8 +1982,8 @@ class LayerProfileEvents:
         self.layer_end = torch.cuda.Event(enable_timing=True)
 
 
-class ThinGpuQwenRuntime:
-    """Manual single-token Qwen/Llama forward path over ThinGpuWeights."""
+class ThinGpuCausalLMRuntime:
+    """Manual single-token decoder runtime over canonical ThinTensor roles."""
 
     def __init__(
         self,
@@ -2033,6 +2034,13 @@ class ThinGpuQwenRuntime:
         mxfp4_down_layers: Optional[str] = None,
         mxfp4_qkv_layers: Optional[str] = None,
         mxfp4_o_layers: Optional[str] = None,
+        mxfp4_hadamard: bool = False,
+        mxfp4_hadamard_size: int = 0,
+        mxfp4_hadamard_seed: int = 0,
+        mxfp4_residual_terms: int = 0,
+        mxfp4_binary_residual: bool = False,
+        mxfp4_int8_row_fraction: float = 0.0,
+        mxfp4_row_postscale: bool = False,
     ) -> None:
         self.weights = weights
         self.exact_hf_mode = exact_hf_mode
@@ -2040,6 +2048,11 @@ class ThinGpuQwenRuntime:
             adaptive_body_int8_start_token
         )
         self._adaptive_body_int8 = self._adaptive_fp8_start_token >= 0
+        # Until a caller identifies the generation boundary, retain the
+        # historical absolute-token behavior used by decode microbenchmarks.
+        # Interactive and validation paths call begin_decode() after prefill
+        # so prompt length cannot silently consume the exact-token budget.
+        self._adaptive_switch_token_index = self._adaptive_fp8_start_token
         self.body_int4_group_size = int(body_int4_group_size)
         self._body_int4 = self.body_int4_group_size > 0
         model_layers = int(weights.manifest["model"]["layers"])
@@ -2071,6 +2084,26 @@ class ThinGpuQwenRuntime:
                 self.mxfp4_o_layers,
             )
         )
+        self.mxfp4_hadamard_size = int(mxfp4_hadamard_size)
+        if mxfp4_hadamard and self.mxfp4_hadamard_size == 0:
+            self.mxfp4_hadamard_size = 32
+        if self.mxfp4_hadamard_size and (
+            self.mxfp4_hadamard_size < 2
+            or self.mxfp4_hadamard_size > 2048
+            or self.mxfp4_hadamard_size
+            & (self.mxfp4_hadamard_size - 1)
+        ):
+            raise ValueError(
+                "mxfp4_hadamard_size must be 0 or a power of two in [2, 2048]"
+            )
+        self.mxfp4_hadamard = self.mxfp4_hadamard_size > 0
+        self.mxfp4_hadamard_seed = int(mxfp4_hadamard_seed)
+        self.mxfp4_residual_terms = max(0, int(mxfp4_residual_terms))
+        self.mxfp4_binary_residual = bool(mxfp4_binary_residual)
+        self.mxfp4_int8_row_fraction = float(mxfp4_int8_row_fraction)
+        if not 0.0 <= self.mxfp4_int8_row_fraction <= 1.0:
+            raise ValueError("mxfp4_int8_row_fraction must be in [0, 1]")
+        self.mxfp4_row_postscale = bool(mxfp4_row_postscale)
         if self._body_int4 and (
             self.body_int4_group_size & (self.body_int4_group_size - 1)
         ):
@@ -2192,7 +2225,15 @@ class ThinGpuQwenRuntime:
             else fp8_layer_spec,
             int(weights.manifest["model"]["layers"]),
         )
-        if self._adaptive_body_int8 or self._body_int4:
+        if self._adaptive_body_int8:
+            all_layers = set(range(int(weights.manifest["model"]["layers"])))
+            if down_fp8_layer_spec is None:
+                self.down_fp8_layers = all_layers
+            if qkv_fp8_layer_spec is None:
+                self.qkv_fp8_layers = all_layers
+            if o_fp8_layer_spec is None:
+                self.o_fp8_layers = all_layers
+        elif self._body_int4:
             all_layers = set(range(int(weights.manifest["model"]["layers"])))
             self.fp8_layers = all_layers
             self.down_fp8_layers = all_layers
@@ -2280,7 +2321,15 @@ class ThinGpuQwenRuntime:
         )
         self.heads = self.manifest_heads
         self.kv_heads = self.manifest_kv_heads
-        self.rms_norm_eps = float(self.model.get("rms_norm_eps", 1e-6))
+        self.norm_kind = self.descriptor.norm_kind
+        self.norm_eps = float(self.descriptor.norm_eps)
+        # Retained for head RMSNorm and older telemetry/call sites.
+        self.rms_norm_eps = self.norm_eps
+        self.partial_rotary_factor = float(
+            self.descriptor.partial_rotary_factor
+        )
+        if self.norm_kind == "layer_norm":
+            self.fused_residual_norm_enabled = False
         self.device = weights.device
         self.kv_cache = kv_cache
         self.prefetch_distance = max(0, prefetch_distance)
@@ -2540,7 +2589,16 @@ class ThinGpuQwenRuntime:
 
         self._weight_scales: Dict[int, torch.Tensor] = {}
         self._int4_metadata: Dict[int, tuple[int, int, int]] = {}
-        self._mxfp4_metadata: Dict[int, tuple[int, int]] = {}
+        self._mxfp4_metadata: Dict[int, tuple[int, int, int]] = {}
+        self._mxfp4_hadamard_buffers: Dict[int, torch.Tensor] = {}
+        self._mxfp4_hadamard_signs: Dict[int, torch.Tensor] = {}
+        self._mxfp4_binary_residuals: Dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._mxfp4_int8_row_overrides: Dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._mxfp4_row_postscales: Dict[int, torch.Tensor] = {}
         if self.lm_head_int4_enabled:
             assert self._lm_head_tensor is not None
             self._int4_metadata[id(self._lm_head_tensor)] = (
@@ -2557,6 +2615,18 @@ class ThinGpuQwenRuntime:
             int(env_residual_terms)
             if env_residual_terms is not None
             else int(fp8_residual_terms),
+        )
+        if self._adaptive_body_int8 and self.has_fused_gate_up_projection:
+            # One exact sparse correction per output row is enough to recover
+            # Phi-style fused-projection top-5 ordering in the quick gate while
+            # adding only a few MiB, not another full BF16 matrix.
+            self._fp8_sparse_residual_terms = max(
+                1,
+                self._fp8_sparse_residual_terms,
+            )
+        self._gate_up_sparse_residual_terms = max(
+            0,
+            int(os.environ.get("THINTENSOR_GATE_UP_RESIDUAL_TERMS", "0")),
         )
         residual_dtype_name = os.environ.get(
             "THINTENSOR_FP8_RESIDUAL_DTYPE", fp8_residual_dtype
@@ -2600,16 +2670,29 @@ class ThinGpuQwenRuntime:
                     )
                     self._weight_scales[id(q_w)] = q_s
                 if self.gate_up_fp8 and layer in self.fp8_layers:
-                    for suffix in ("mlp.gate_proj.weight", "mlp.up_proj.weight"):
+                    gate_up_suffixes = (
+                        ("mlp.gate_up_proj.weight",)
+                        if self.has_fused_gate_up_projection
+                        else ("mlp.gate_proj.weight", "mlp.up_proj.weight")
+                    )
+                    for suffix in gate_up_suffixes:
                         page_id = _layer_tensor(layer, suffix)
-                        q_w, q_s = self._quantize_weight_page(page_id)
+                        q_w, q_s = self._quantize_weight_page(
+                            page_id,
+                            residual_layer=layer,
+                        )
                         self._weight_scales[id(q_w)] = q_s
                 if self.qkv_fp8 and layer in self.qkv_fp8_layers:
-                    for suffix in (
-                        "self_attn.q_proj.weight",
-                        "self_attn.k_proj.weight",
-                        "self_attn.v_proj.weight",
-                    ):
+                    qkv_suffixes = (
+                        ("self_attn.qkv_proj.weight",)
+                        if self.has_fused_qkv_projection
+                        else (
+                            "self_attn.q_proj.weight",
+                            "self_attn.k_proj.weight",
+                            "self_attn.v_proj.weight",
+                        )
+                    )
+                    for suffix in qkv_suffixes:
                         page_id = _layer_tensor(layer, suffix)
                         q_w, q_s = self._quantize_weight_page(page_id)
                         self._weight_scales[id(q_w)] = q_s
@@ -2634,7 +2717,7 @@ class ThinGpuQwenRuntime:
                         rows, cols, _ = int4_meta
                         self.body_fp8_original_bytes += rows * cols * 2
                     elif weight_id in self._mxfp4_metadata:
-                        rows, cols = self._mxfp4_metadata[weight_id]
+                        rows, cols, _ = self._mxfp4_metadata[weight_id]
                         self.body_fp8_original_bytes += rows * cols * 2
                     else:
                         self.body_fp8_original_bytes += quantized.numel() * 2
@@ -2644,6 +2727,21 @@ class ThinGpuQwenRuntime:
             self.body_fp8_resident_bytes += sum(
                 _tensor_nbytes(values) + _tensor_nbytes(indices)
                 for values, indices in self._sparse_residual_sidecars.values()
+            )
+            self.body_fp8_resident_bytes += sum(
+                _tensor_nbytes(signs) + _tensor_nbytes(scales)
+                for signs, scales in self._mxfp4_binary_residuals.values()
+            )
+            self.body_fp8_resident_bytes += sum(
+                _tensor_nbytes(weight)
+                + _tensor_nbytes(scales)
+                + _tensor_nbytes(indices)
+                for weight, scales, indices
+                in self._mxfp4_int8_row_overrides.values()
+            )
+            self.body_fp8_resident_bytes += sum(
+                _tensor_nbytes(scale)
+                for scale in self._mxfp4_row_postscales.values()
             )
         elif isinstance(self.weights, ThinGpuPagePool):
             for quantized, scale in self.weights._fp8_cpu_cache.values():
@@ -2665,6 +2763,21 @@ class ThinGpuQwenRuntime:
             _tensor_nbytes(values) + _tensor_nbytes(indices)
             for values, indices in self._sparse_residual_sidecars.values()
         )
+        self.mxfp4_binary_residual_bytes = sum(
+            _tensor_nbytes(signs) + _tensor_nbytes(scales)
+            for signs, scales in self._mxfp4_binary_residuals.values()
+        )
+        self.mxfp4_int8_row_override_bytes = sum(
+            _tensor_nbytes(weight)
+            + _tensor_nbytes(scales)
+            + _tensor_nbytes(indices)
+            for weight, scales, indices
+            in self._mxfp4_int8_row_overrides.values()
+        )
+        self.mxfp4_row_postscale_bytes = sum(
+            _tensor_nbytes(scale)
+            for scale in self._mxfp4_row_postscales.values()
+        )
         self._layer_plan: Optional[list[LayerPlan]] = None
         if (
             isinstance(self.weights, ThinGpuWeights)
@@ -2677,11 +2790,17 @@ class ThinGpuQwenRuntime:
         elif isinstance(self.weights, ThinGpuPagePool):
             self._layer_plan = [LayerPlan(layer, pool=self.weights) for layer in range(self.layers)]
         if (
+            self.device.type == "cuda"
+            and self.body_fp8_original_bytes > 0
+        ):
+            # In-place quantization releases multi-gigabyte BF16 pages, but
+            # PyTorch's allocator otherwise keeps those blocks reserved. Give
+            # the memory back to CUDA before Triton requests driver scratch.
+            torch.cuda.empty_cache()
+        if (
             self.kernel_backend is not None
             and self.use_triton_matvec
             and not self.is_moe
-            and not self.has_fused_qkv_projection
-            and not self.has_fused_gate_up_projection
         ):
             self._autotuning = True
             try:
@@ -2754,8 +2873,20 @@ class ThinGpuQwenRuntime:
                 raise RuntimeError(
                     f"MXFP4 scales for {page_id} were not retained"
                 )
-            rows, cols = mxfp4_cache[page_id]
-            self._mxfp4_metadata[id(source)] = (rows, cols)
+            metadata = mxfp4_cache[page_id]
+            rows, cols = metadata[:2]
+            hadamard_size = int(metadata[2]) if len(metadata) > 2 else 0
+            self._mxfp4_metadata[id(source)] = (
+                rows,
+                cols,
+                hadamard_size,
+            )
+            signs_cache = getattr(
+                self.weights, "_mxfp4_hadamard_signs_by_page", {}
+            )
+            signs = signs_cache.get(page_id)
+            if signs is not None:
+                self._mxfp4_hadamard_signs[id(source)] = signs
             return source, q_s
         page_layer = self.weights.page_specs[page_id].get("layer")
         layer = int(page_layer) if page_layer is not None else None
@@ -2796,6 +2927,7 @@ class ThinGpuQwenRuntime:
                 "self_attn.q_proj.weight" in page_id
                 or "self_attn.k_proj.weight" in page_id
                 or "self_attn.v_proj.weight" in page_id
+                or "self_attn.qkv_proj.weight" in page_id
                 or "self_attn.o_proj.weight" in page_id
                 or (
                     page_id.endswith("mlp.down_proj.weight")
@@ -2803,6 +2935,10 @@ class ThinGpuQwenRuntime:
                     and not 8 <= residual_layer < 28
                 )
             )
+        )
+        fused_gate_up_int8 = (
+            self._adaptive_body_int8
+            and page_id.endswith("mlp.gate_up_proj.weight")
         )
         if source.dtype in {torch.float8_e4m3fn, torch.int8}:
             q_s = self.weights._weight_scales.get(page_id)
@@ -2829,12 +2965,102 @@ class ThinGpuQwenRuntime:
             return source, q_s
         scale_block_size = self.fp8_scale_block
         if mxfp4_selected:
-            q_w, q_s = self._quantize_mxfp4_rows(source)
+            signs = None
+            if (
+                self.mxfp4_hadamard_size > 0
+                and self.mxfp4_hadamard_seed != 0
+            ):
+                digest = hashlib.blake2b(
+                    page_id.encode("utf-8"),
+                    digest_size=8,
+                ).digest()
+                page_seed = int.from_bytes(digest, "little") ^ (
+                    self.mxfp4_hadamard_seed & ((1 << 63) - 1)
+                )
+                generator = torch.Generator(device=source.device)
+                generator.manual_seed(page_seed)
+                signs = (
+                    torch.randint(
+                        0,
+                        2,
+                        (int(source.shape[1]),),
+                        device=source.device,
+                        generator=generator,
+                        dtype=torch.int8,
+                    )
+                    .mul_(2)
+                    .sub_(1)
+                    .to(source.dtype)
+                )
+            q_w, q_s = self._quantize_mxfp4_rows(
+                source,
+                hadamard_size=self.mxfp4_hadamard_size,
+                signs=signs,
+                binary_residual=self.mxfp4_binary_residual,
+            )
             rows, cols = int(source.shape[0]), int(source.shape[1])
-            self._mxfp4_metadata[id(q_w)] = (rows, cols)
+            self._mxfp4_metadata[id(q_w)] = (
+                rows,
+                cols,
+                self.mxfp4_hadamard_size,
+            )
             if not hasattr(self.weights, "_mxfp4_metadata_by_page"):
                 self.weights._mxfp4_metadata_by_page = {}
-            self.weights._mxfp4_metadata_by_page[page_id] = (rows, cols)
+            self.weights._mxfp4_metadata_by_page[page_id] = (
+                rows,
+                cols,
+                self.mxfp4_hadamard_size,
+            )
+            if signs is not None:
+                self._mxfp4_hadamard_signs[id(q_w)] = signs
+                if not hasattr(
+                    self.weights, "_mxfp4_hadamard_signs_by_page"
+                ):
+                    self.weights._mxfp4_hadamard_signs_by_page = {}
+                self.weights._mxfp4_hadamard_signs_by_page[page_id] = signs
+            if self.mxfp4_residual_terms > 0:
+                self._sparse_residual_sidecars[id(q_w)] = (
+                    self._build_mxfp4_residual(
+                        source,
+                        q_w,
+                        q_s,
+                        hadamard_size=self.mxfp4_hadamard_size,
+                        signs=signs,
+                        terms=self.mxfp4_residual_terms,
+                        dtype=self._fp8_sparse_residual_dtype,
+                    )
+                )
+            if self.mxfp4_binary_residual:
+                self._mxfp4_binary_residuals[id(q_w)] = (
+                    self._build_mxfp4_binary_residual(
+                        source,
+                        q_w,
+                        q_s,
+                        hadamard_size=self.mxfp4_hadamard_size,
+                        signs=signs,
+                    )
+                )
+            if self.mxfp4_int8_row_fraction > 0:
+                self._mxfp4_int8_row_overrides[id(q_w)] = (
+                    self._build_mxfp4_int8_row_overrides(
+                        source,
+                        q_w,
+                        q_s,
+                        fraction=self.mxfp4_int8_row_fraction,
+                        hadamard_size=self.mxfp4_hadamard_size,
+                        signs=signs,
+                    )
+                )
+            if self.mxfp4_row_postscale:
+                self._mxfp4_row_postscales[id(q_w)] = (
+                    self._build_mxfp4_row_postscale(
+                        source,
+                        q_w,
+                        q_s,
+                        hadamard_size=self.mxfp4_hadamard_size,
+                        signs=signs,
+                    )
+                )
         elif self._body_int4:
             q_w, q_s = self._quantize_int4_rows(
                 source,
@@ -2853,7 +3079,10 @@ class ThinGpuQwenRuntime:
                 cols,
                 self.body_int4_group_size,
             )
-        elif adaptive_extra and self._adaptive_body_int8:
+        elif (
+            (adaptive_extra or fused_gate_up_int8)
+            and self._adaptive_body_int8
+        ):
             q_w, q_s = self._quantize_int8_rows(
                 source,
                 scale_block_size=scale_block_size,
@@ -2874,18 +3103,52 @@ class ThinGpuQwenRuntime:
                 else "triton"
             )
         if (
-            page_id.endswith("mlp.down_proj.weight")
+            (
+                page_id.endswith("mlp.down_proj.weight")
+                or page_id.endswith("mlp.gate_up_proj.weight")
+                or page_id.endswith("mlp.gate_proj.weight")
+                or page_id.endswith("mlp.up_proj.weight")
+            )
             and q_s.ndim == 1
             and residual_layer in self._fp8_sparse_residual_layers
         ):
-            if self._fp8_sparse_residual_terms > 0:
-                reconstructed = q_w.float().mul(q_s[:, None])
-                error = source.float().sub(reconstructed)
-                terms = min(
-                    self._fp8_sparse_residual_terms, int(source.shape[1])
+            is_gate_up = page_id.endswith(
+                (
+                    "mlp.gate_up_proj.weight",
+                    "mlp.gate_proj.weight",
+                    "mlp.up_proj.weight",
                 )
-                ranking_error = error.abs()
-                if self._fp8_sparse_residual_ranking == "mlp_scale":
+            )
+            residual_terms = max(
+                self._fp8_sparse_residual_terms,
+                self._gate_up_sparse_residual_terms if is_gate_up else 0,
+                (
+                    1
+                    if page_id.endswith("mlp.gate_up_proj.weight")
+                    and self._adaptive_body_int8
+                    else 0
+                ),
+            )
+            if residual_terms > 0:
+                terms = min(
+                    residual_terms, int(source.shape[1])
+                )
+                rows = int(source.shape[0])
+                residual_values = torch.empty(
+                    (rows, terms),
+                    device=source.device,
+                    dtype=self._fp8_sparse_residual_dtype,
+                )
+                residual_indices = torch.empty(
+                    (rows, terms),
+                    device=source.device,
+                    dtype=torch.int16,
+                )
+                channel_importance = None
+                if (
+                    page_id.endswith("mlp.down_proj.weight")
+                    and self._fp8_sparse_residual_ranking == "mlp_scale"
+                ):
                     gate_source = self.weights.tensors[
                         page_id.replace("down_proj", "gate_proj")
                     ]
@@ -2896,18 +3159,31 @@ class ThinGpuQwenRuntime:
                         gate_source.float().abs().amax(dim=1)
                         * up_source.float().abs().amax(dim=1)
                     ).sqrt_()
-                    ranking_error = ranking_error * channel_importance[None, :]
-                residual_abs, residual_indices_i64 = torch.topk(
-                    ranking_error,
-                    k=terms,
-                    dim=1,
-                    sorted=False,
-                )
-                del residual_abs
-                residual_values = torch.gather(
-                    error, 1, residual_indices_i64
-                ).to(dtype=self._fp8_sparse_residual_dtype)
-                residual_indices = residual_indices_i64.to(torch.int16)
+                # Chunking is required when a BF16 model nearly fills VRAM;
+                # materializing a full float32 reconstruction would consume
+                # hundreds of MiB for a fused gate/up page.
+                for start in range(0, rows, 32):
+                    end = min(rows, start + 32)
+                    error = source[start:end].float().sub_(
+                        q_w[start:end].float().mul_(
+                            q_s[start:end, None]
+                        )
+                    )
+                    ranking_error = error.abs()
+                    if channel_importance is not None:
+                        ranking_error.mul_(channel_importance[None, :])
+                    _, indices_i64 = torch.topk(
+                        ranking_error,
+                        k=terms,
+                        dim=1,
+                        sorted=False,
+                    )
+                    residual_values[start:end].copy_(
+                        torch.gather(error, 1, indices_i64)
+                    )
+                    residual_indices[start:end].copy_(
+                        indices_i64.to(torch.int16)
+                    )
                 self._sparse_residual_sidecars[id(q_w)] = (
                     residual_values.contiguous(),
                     residual_indices.contiguous(),
@@ -2950,7 +3226,7 @@ class ThinGpuQwenRuntime:
     @staticmethod
     def _quantize_fp8_rows(
         source: torch.Tensor,
-        chunk_rows: int = 2048,
+        chunk_rows: int = 256,
         scale_block_size: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if source.dtype == torch.float8_e4m3fn:
@@ -3061,6 +3337,10 @@ class ThinGpuQwenRuntime:
         source: torch.Tensor,
         *,
         chunk_rows: int = 256,
+        hadamard: bool = False,
+        hadamard_size: int = 0,
+        signs: torch.Tensor | None = None,
+        binary_residual: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rows = int(source.shape[0])
         cols = int(source.shape[1])
@@ -3077,11 +3357,36 @@ class ThinGpuQwenRuntime:
             device=source.device,
             dtype=torch.uint8,
         )
+        transform_size = int(hadamard_size) or (32 if hadamard else 0)
+        if transform_size and cols % transform_size:
+            raise ValueError(
+                f"Hadamard block size {transform_size} does not divide {cols}"
+            )
         for start in range(0, rows, chunk_rows):
             end = min(rows, start + chunk_rows)
             blocks = source[start:end].float().reshape(
                 end - start, groups, 32
             )
+            if transform_size:
+                transformed = source[start:end].float()
+                if signs is not None:
+                    transformed = transformed * signs.float()[None, :]
+                transformed = transformed.reshape(-1, transform_size)
+                stride = 1
+                while stride < transform_size:
+                    paired = transformed.reshape(
+                        -1, transform_size // (2 * stride), 2, stride
+                    )
+                    left = paired[:, :, 0, :]
+                    right = paired[:, :, 1, :]
+                    transformed = torch.stack(
+                        (left + right, left - right),
+                        dim=2,
+                    ).reshape(-1, transform_size)
+                    stride *= 2
+                blocks = transformed.mul_(transform_size**-0.5).reshape(
+                    end - start, groups, 32
+                )
             base_exponent = torch.ceil(
                 torch.log2(
                     blocks.abs().amax(dim=2).clamp_min_(2.0**-126)
@@ -3124,9 +3429,22 @@ class ThinGpuQwenRuntime:
                     )
                     * torch.exp2(candidate_exponent)[:, :, None]
                 )
-                candidate_error = (
-                    blocks.sub(reconstructed).square().sum(dim=2)
-                )
+                residual = blocks.sub(reconstructed)
+                if binary_residual:
+                    residual_exponent = torch.round(
+                        torch.log2(
+                            residual.abs().mean(
+                                dim=2, keepdim=True
+                            ).clamp_min_(2.0**-126)
+                        )
+                    ).clamp_(-127, 127)
+                    residual_scale = torch.exp2(residual_exponent)
+                    residual = residual - torch.where(
+                        residual >= 0,
+                        residual_scale,
+                        -residual_scale,
+                    )
+                candidate_error = residual.square().sum(dim=2)
                 if best_error is None:
                     best_error = candidate_error
                     exponent = candidate_exponent
@@ -3151,6 +3469,343 @@ class ThinGpuQwenRuntime:
                 code[:, 0::2] | (code[:, 1::2] << 4)
             )
         return packed, scales
+
+    @staticmethod
+    def _build_mxfp4_residual(
+        source: torch.Tensor,
+        packed: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        terms: int,
+        dtype: torch.dtype,
+        hadamard: bool = False,
+        hadamard_size: int = 0,
+        signs: torch.Tensor | None = None,
+        chunk_rows: int = 256,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, cols = int(source.shape[0]), int(source.shape[1])
+        groups = cols // 32
+        terms = min(max(0, int(terms)), cols)
+        if terms == 0:
+            return (
+                torch.empty((rows, 0), device=source.device, dtype=dtype),
+                torch.empty((rows, 0), device=source.device, dtype=torch.int16),
+            )
+        transform_size = int(hadamard_size) or (32 if hadamard else 0)
+        residual_values = torch.empty(
+            (rows, terms), device=source.device, dtype=dtype
+        )
+        residual_indices = torch.empty(
+            (rows, terms), device=source.device, dtype=torch.int16
+        )
+        for start in range(0, rows, chunk_rows):
+            end = min(rows, start + chunk_rows)
+            target = source[start:end].float().reshape(
+                end - start, groups, 32
+            )
+            if transform_size:
+                transformed = source[start:end].float()
+                if signs is not None:
+                    transformed = transformed * signs.float()[None, :]
+                transformed = transformed.reshape(-1, transform_size)
+                stride = 1
+                while stride < transform_size:
+                    paired = transformed.reshape(
+                        -1, transform_size // (2 * stride), 2, stride
+                    )
+                    left = paired[:, :, 0, :]
+                    right = paired[:, :, 1, :]
+                    transformed = torch.stack(
+                        (left + right, left - right),
+                        dim=2,
+                    ).reshape(-1, transform_size)
+                    stride *= 2
+                target = transformed.mul_(transform_size**-0.5).reshape(
+                    end - start, groups, 32
+                )
+            packed_chunk = packed[start:end].reshape(
+                end - start, groups, 16
+            )
+            codebook = torch.tensor(
+                (
+                    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+                ),
+                device=source.device,
+                dtype=torch.float32,
+            )
+            reconstructed = torch.empty(
+                (end - start, groups, 32),
+                device=source.device,
+                dtype=torch.float32,
+            )
+            reconstructed[..., 0::2] = codebook[
+                (packed_chunk & 0x0F).long()
+            ]
+            reconstructed[..., 1::2] = codebook[
+                (packed_chunk >> 4).long()
+            ]
+            reconstructed = torch.ldexp(
+                reconstructed,
+                scales[start:end].to(torch.int32).sub(127).unsqueeze(-1),
+            )
+            error = target.reshape(end - start, cols).sub_(
+                reconstructed.reshape(end - start, cols)
+            )
+            _, selected = torch.topk(
+                error.abs(),
+                k=terms,
+                dim=1,
+                sorted=False,
+            )
+            residual_values[start:end].copy_(
+                torch.gather(error, 1, selected).to(dtype=dtype)
+            )
+            residual_indices[start:end].copy_(selected.to(torch.int16))
+        return residual_values.contiguous(), residual_indices.contiguous()
+
+    @staticmethod
+    def _build_mxfp4_binary_residual(
+        source: torch.Tensor,
+        packed: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        hadamard_size: int = 0,
+        signs: torch.Tensor | None = None,
+        chunk_rows: int = 256,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, cols = int(source.shape[0]), int(source.shape[1])
+        groups = cols // 32
+        packed_signs = torch.empty(
+            (rows, cols // 8),
+            device=source.device,
+            dtype=torch.uint8,
+        )
+        residual_scales = torch.empty(
+            (rows, groups),
+            device=source.device,
+            dtype=torch.uint8,
+        )
+        codebook = torch.tensor(
+            (
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            ),
+            device=source.device,
+            dtype=torch.float32,
+        )
+        for start in range(0, rows, chunk_rows):
+            end = min(rows, start + chunk_rows)
+            target = source[start:end].float()
+            if signs is not None:
+                target = target * signs.float()[None, :]
+            if hadamard_size:
+                transformed = target.reshape(-1, hadamard_size)
+                stride = 1
+                while stride < hadamard_size:
+                    paired = transformed.reshape(
+                        -1, hadamard_size // (2 * stride), 2, stride
+                    )
+                    left = paired[:, :, 0, :]
+                    right = paired[:, :, 1, :]
+                    transformed = torch.stack(
+                        (left + right, left - right),
+                        dim=2,
+                    ).reshape(-1, hadamard_size)
+                    stride *= 2
+                target = transformed.mul_(hadamard_size**-0.5).reshape(
+                    end - start, cols
+                )
+            packed_chunk = packed[start:end].reshape(
+                end - start, groups, 16
+            )
+            reconstructed = torch.empty(
+                (end - start, groups, 32),
+                device=source.device,
+                dtype=torch.float32,
+            )
+            reconstructed[..., 0::2] = codebook[
+                (packed_chunk & 0x0F).long()
+            ]
+            reconstructed[..., 1::2] = codebook[
+                (packed_chunk >> 4).long()
+            ]
+            reconstructed = torch.ldexp(
+                reconstructed,
+                scales[start:end].to(torch.int32).sub(127).unsqueeze(-1),
+            ).reshape(end - start, cols)
+            error = target.sub(reconstructed)
+            group_scale = error.abs().reshape(
+                end - start, groups, 32
+            ).mean(dim=2)
+            group_exponent = torch.round(
+                torch.log2(group_scale.clamp_min_(2.0**-126))
+            ).clamp_(-127, 127)
+            residual_scales[start:end].copy_(
+                group_exponent.add(127).to(torch.uint8)
+            )
+            positive = (error >= 0).to(torch.uint8)
+            packed_chunk_signs = positive[:, 0::8]
+            for bit in range(1, 8):
+                packed_chunk_signs = packed_chunk_signs | (
+                    positive[:, bit::8] << bit
+                )
+            packed_signs[start:end].copy_(packed_chunk_signs)
+        return packed_signs, residual_scales
+
+    @staticmethod
+    def _build_mxfp4_int8_row_overrides(
+        source: torch.Tensor,
+        packed: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        fraction: float,
+        hadamard_size: int = 0,
+        signs: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows, cols = int(source.shape[0]), int(source.shape[1])
+        groups = cols // 32
+        codebook = torch.tensor(
+            (
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            ),
+            device=source.device,
+            dtype=torch.float32,
+        )
+        packed_groups = packed.reshape(rows, groups, 16)
+        reconstructed = torch.empty(
+            (rows, groups, 32),
+            device=source.device,
+            dtype=torch.float32,
+        )
+        reconstructed[..., 0::2] = codebook[
+            (packed_groups & 0x0F).long()
+        ]
+        reconstructed[..., 1::2] = codebook[
+            (packed_groups >> 4).long()
+        ]
+        reconstructed = torch.ldexp(
+            reconstructed,
+            scales.to(torch.int32).sub(127).unsqueeze(-1),
+        ).reshape(rows, cols)
+        target = source.float()
+        if signs is not None:
+            target = target * signs.float()[None, :]
+        if hadamard_size:
+            transformed = target.reshape(-1, hadamard_size)
+            stride = 1
+            while stride < hadamard_size:
+                paired = transformed.reshape(
+                    -1, hadamard_size // (2 * stride), 2, stride
+                )
+                left = paired[:, :, 0, :]
+                right = paired[:, :, 1, :]
+                transformed = torch.stack(
+                    (left + right, left - right),
+                    dim=2,
+                ).reshape(-1, hadamard_size)
+                stride *= 2
+            target = transformed.mul_(hadamard_size**-0.5).reshape(
+                rows, cols
+            )
+        relative_error = target.sub(reconstructed).square().sum(dim=1)
+        relative_error.div_(target.square().sum(dim=1).clamp_min_(1e-20))
+        selected_rows = min(
+            rows,
+            max(1, int(round(rows * fraction))),
+        )
+        row_indices = torch.topk(
+            relative_error,
+            k=selected_rows,
+            sorted=True,
+        ).indices
+        exact_rows = source.index_select(0, row_indices)
+        row_scales = (
+            exact_rows.abs()
+            .amax(dim=1)
+            .float()
+            .clamp_min_(1e-12)
+            .div_(127.0)
+        )
+        int8_rows = torch.round(
+            exact_rows.float() / row_scales[:, None]
+        ).clamp_(-127, 127).to(torch.int8)
+        return (
+            int8_rows.contiguous(),
+            row_scales.contiguous(),
+            row_indices.to(torch.int32).contiguous(),
+        )
+
+    @staticmethod
+    def _build_mxfp4_row_postscale(
+        source: torch.Tensor,
+        packed: torch.Tensor,
+        scales: torch.Tensor,
+        *,
+        hadamard_size: int = 0,
+        signs: torch.Tensor | None = None,
+        chunk_rows: int = 256,
+    ) -> torch.Tensor:
+        rows, cols = int(source.shape[0]), int(source.shape[1])
+        groups = cols // 32
+        postscale = torch.empty(
+            rows,
+            device=source.device,
+            dtype=torch.bfloat16,
+        )
+        codebook = torch.tensor(
+            (
+                0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            ),
+            device=source.device,
+            dtype=torch.float32,
+        )
+        for start in range(0, rows, chunk_rows):
+            end = min(rows, start + chunk_rows)
+            target = source[start:end].float()
+            if signs is not None:
+                target = target * signs.float()[None, :]
+            if hadamard_size:
+                transformed = target.reshape(-1, hadamard_size)
+                stride = 1
+                while stride < hadamard_size:
+                    paired = transformed.reshape(
+                        -1, hadamard_size // (2 * stride), 2, stride
+                    )
+                    left = paired[:, :, 0, :]
+                    right = paired[:, :, 1, :]
+                    transformed = torch.stack(
+                        (left + right, left - right),
+                        dim=2,
+                    ).reshape(-1, hadamard_size)
+                    stride *= 2
+                target = transformed.mul_(hadamard_size**-0.5).reshape(
+                    end - start, cols
+                )
+            packed_chunk = packed[start:end].reshape(
+                end - start, groups, 16
+            )
+            reconstructed = torch.empty(
+                (end - start, groups, 32),
+                device=source.device,
+                dtype=torch.float32,
+            )
+            reconstructed[..., 0::2] = codebook[
+                (packed_chunk & 0x0F).long()
+            ]
+            reconstructed[..., 1::2] = codebook[
+                (packed_chunk >> 4).long()
+            ]
+            reconstructed = torch.ldexp(
+                reconstructed,
+                scales[start:end].to(torch.int32).sub(127).unsqueeze(-1),
+            ).reshape(end - start, cols)
+            numerator = (target * reconstructed).sum(dim=1)
+            denominator = reconstructed.square().sum(dim=1).clamp_min_(1e-20)
+            postscale[start:end].copy_(numerator.div_(denominator))
+        return postscale
 
     def _quantize_int8_rows(
         self,
@@ -3408,6 +4063,19 @@ class ThinGpuQwenRuntime:
         }
 
     @torch.inference_mode()
+    def begin_decode(self, token_index: int) -> None:
+        """Anchor adaptive precision to the first generated-token position."""
+        if self.attention_mode == "causal_kv" and self.kv_cache is not None:
+            self._last_kv_tokens_attended = int(token_index)
+        if self._adaptive_fp8_start_token < 0:
+            return
+        if token_index < 0:
+            raise ValueError("decode token index must be non-negative")
+        self._adaptive_switch_token_index = (
+            int(token_index) + self._adaptive_fp8_start_token
+        )
+
+    @torch.inference_mode()
     def forward_token(
         self,
         token_id: int | torch.Tensor,
@@ -3539,9 +4207,14 @@ class ThinGpuQwenRuntime:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.descriptor.layer_uses_rope(layer):
             return q, k
-        half = self.head_dim // 2
-        if self.head_dim % 2:
-            raise RuntimeError(f"RoPE requires an even head_dim, got {self.head_dim}")
+        rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+        if rotary_dim <= 0 or rotary_dim > self.head_dim or rotary_dim % 2:
+            raise RuntimeError(
+                "RoPE requires a positive even rotary dimension no larger "
+                f"than head_dim, got rotary_dim={rotary_dim}, "
+                f"head_dim={self.head_dim}"
+            )
+        half = rotary_dim // 2
         cached = self._rope_cos_sin_cache.get(token_index)
         if cached is None or cached[0].dtype != q.dtype:
             inv_freq, attention_scaling = self._rope_parameters(
@@ -3554,7 +4227,11 @@ class ThinGpuQwenRuntime:
             )
             self._rope_cos_sin_cache[token_index] = cached
         cos, sin = cached
-        if self.fused_rope_enabled and self.kernel_backend is not None:
+        if (
+            rotary_dim == self.head_dim
+            and self.fused_rope_enabled
+            and self.kernel_backend is not None
+        ):
             return self.kernel_backend.rope_qk_inplace(
                 q,
                 k,
@@ -3567,22 +4244,45 @@ class ThinGpuQwenRuntime:
 
         q_heads = q.reshape(self.heads, self.head_dim)
         k_heads = k.reshape(self.kv_heads, self.head_dim)
-        q_first, q_second = q_heads[:, :half], q_heads[:, half:]
-        k_first, k_second = k_heads[:, :half], k_heads[:, half:]
-        q = torch.cat(
+        if rotary_dim == self.head_dim:
+            q_first, q_second = q_heads[:, :half], q_heads[:, half:]
+            k_first, k_second = k_heads[:, :half], k_heads[:, half:]
+            q = torch.cat(
+                (
+                    q_first * cos - q_second * sin,
+                    q_second * cos + q_first * sin,
+                ),
+                dim=-1,
+            ).reshape(-1)
+            k = torch.cat(
+                (
+                    k_first * cos - k_second * sin,
+                    k_second * cos + k_first * sin,
+                ),
+                dim=-1,
+            ).reshape(-1)
+            return q, k
+
+        q_rot, q_pass = q_heads[:, :rotary_dim], q_heads[:, rotary_dim:]
+        k_rot, k_pass = k_heads[:, :rotary_dim], k_heads[:, rotary_dim:]
+        q_first, q_second = q_rot[:, :half], q_rot[:, half:]
+        k_first, k_second = k_rot[:, :half], k_rot[:, half:]
+        q_rotated = torch.cat(
             (
                 q_first * cos - q_second * sin,
                 q_second * cos + q_first * sin,
             ),
             dim=-1,
-        ).reshape(-1)
-        k = torch.cat(
+        )
+        k_rotated = torch.cat(
             (
                 k_first * cos - k_second * sin,
                 k_second * cos + k_first * sin,
             ),
             dim=-1,
-        ).reshape(-1)
+        )
+        q = torch.cat((q_rotated, q_pass), dim=-1).reshape(-1)
+        k = torch.cat((k_rotated, k_pass), dim=-1).reshape(-1)
         return q, k
 
     def _rope_parameters(
@@ -3590,17 +4290,18 @@ class ThinGpuQwenRuntime:
         seq_len: int,
     ) -> tuple[torch.Tensor, float]:
         variant = self.descriptor.rope_variant
+        rotary_dim = int(self.head_dim * self.partial_rotary_factor)
         if variant in {None, "", "default"}:
             if self._rope_inv_freq is None:
                 freq_index = torch.arange(
                     0,
-                    self.head_dim,
+                    rotary_dim,
                     2,
                     device=self.device,
                     dtype=torch.float32,
                 )
                 self._rope_inv_freq = self.descriptor.rope_theta ** (
-                    -freq_index / self.head_dim
+                    -freq_index / rotary_dim
                 )
             return self._rope_inv_freq, 1.0
         dynamic = variant in {"dynamic", "longrope"}
@@ -3628,12 +4329,16 @@ class ThinGpuQwenRuntime:
         rope_parameters.setdefault("rope_theta", self.descriptor.rope_theta)
         config = PreTrainedConfig()
         config.rope_parameters = rope_parameters
-        config.head_dim = self.head_dim
+        config.head_dim = rotary_dim
         config.hidden_size = self.hidden_size
         config.num_attention_heads = self.heads
         config.max_position_embeddings = (
             self.descriptor.max_position_embeddings or seq_len
         )
+        if self.descriptor.original_max_position_embeddings is not None:
+            config.original_max_position_embeddings = (
+                self.descriptor.original_max_position_embeddings
+            )
         inv_freq, scaling = initializer(
             config,
             device=self.device,
@@ -3700,8 +4405,8 @@ class ThinGpuQwenRuntime:
             self.attention_backend in {"triton_fused", "triton_split"}
             and self.kernel_backend is not None
             and (
-                self._adaptive_fp8_start_token < 0
-                or token_index >= self._adaptive_fp8_start_token
+                self._adaptive_switch_token_index < 0
+                or token_index >= self._adaptive_switch_token_index
             )
             and sinks is None
             and self.head_dim <= 256
@@ -3794,12 +4499,9 @@ class ThinGpuQwenRuntime:
             for distance in range(1, self.prefetch_distance + 1):
                 if hasattr(self.weights, "prefetch_layer"):
                     self.weights.prefetch_layer(layer + distance)
-            normed = _rms_norm(
+            normed = self._normalization(
                 hidden,
-                self.weights.tensor(
-                    _layer_tensor(layer, "input_layernorm.weight")
-                ),
-                self.rms_norm_eps,
+                _layer_tensor(layer, "input_layernorm.weight"),
             )
             self._capture_debug(layer, "post_input_rmsnorm", normed)
             q = torch.mv(
@@ -3898,15 +4600,12 @@ class ThinGpuQwenRuntime:
             hidden = hidden + attention_output
             self._capture_debug(layer, "post_attention_residual", hidden)
 
-            normed = _rms_norm(
+            normed = self._normalization(
                 hidden,
-                self.weights.tensor(
-                    _layer_tensor(
-                        layer,
-                        "post_attention_layernorm.weight",
-                    )
+                _layer_tensor(
+                    layer,
+                    "post_attention_layernorm.weight",
                 ),
-                self.rms_norm_eps,
             )
             self._capture_debug(layer, "post_attention_rmsnorm", normed)
             moe = self._packed_moe_forward(layer, normed)
@@ -3916,11 +4615,7 @@ class ThinGpuQwenRuntime:
                 self.weights, "evict_completed_layer"
             ):
                 self.weights.evict_completed_layer(layer)
-        return _rms_norm(
-            hidden,
-            self.weights.tensor("model.norm.weight"),
-            self.rms_norm_eps,
-        )
+        return self._normalization(hidden, "model.norm.weight")
 
     def _packed_moe_forward(
         self,
@@ -4126,6 +4821,43 @@ class ThinGpuQwenRuntime:
         token_index: int,
     ) -> torch.Tensor:
         hidden = embed[token_id].clone()
+        buffers = (
+            self.kernel_backend.buffers
+            if self.kernel_backend is not None
+            else None
+        )
+        if not hasattr(self, "_fallback_native_matvec_enabled"):
+            free_bytes = (
+                torch.cuda.mem_get_info(self.device)[0]
+                if self.device.type == "cuda"
+                else 0
+            )
+            # Triton may need driver/compiler workspace on its first launch.
+            # A nearly full BF16 model must retain the already-working cuBLAS
+            # path rather than failing while trying to JIT a faster kernel.
+            self._fallback_native_matvec_enabled = (
+                self.kernel_backend is not None
+                and free_bytes >= 128 * 1024 * 1024
+            )
+        native_matvec = bool(self._fallback_native_matvec_enabled)
+
+        def projection(
+            weight: torch.Tensor,
+            value: torch.Tensor,
+            out: torch.Tensor | None,
+        ) -> torch.Tensor:
+            requires_native = weight.dtype in {
+                torch.float8_e4m3fn,
+                torch.int8,
+                torch.uint8,
+            }
+            if (
+                out is not None
+                and self.kernel_backend is not None
+                and (native_matvec or requires_native)
+            ):
+                return self._runtime_matvec(weight, value, out)
+            return torch.mv(weight, value)
 
         for layer in range(layer_count):
             self._capture_debug(layer, "layer_input", hidden)
@@ -4138,10 +4870,9 @@ class ThinGpuQwenRuntime:
             for distance in range(1, self.prefetch_distance + 1):
                 if hasattr(self.weights, "prefetch_layer"):
                     self.weights.prefetch_layer(layer + distance)
-            normed = _rms_norm(
+            normed = self._normalization(
                 hidden,
-                self.weights.tensor(_layer_tensor(layer, "input_layernorm.weight")),
-                self.rms_norm_eps,
+                _layer_tensor(layer, "input_layernorm.weight"),
             )
             self._capture_debug(layer, "post_input_rmsnorm", normed)
             qkv = self._fused_qkv(layer, normed)
@@ -4154,15 +4885,42 @@ class ThinGpuQwenRuntime:
                     ),
                 )
                 if fused_qkv_weight is not None:
-                    projected = torch.mv(fused_qkv_weight, normed)
+                    projected = projection(
+                        fused_qkv_weight,
+                        normed,
+                        buffers.qkv if buffers is not None else None,
+                    )
                     q, k, v = torch.split(
                         projected,
                         (self.q_dim, self.kv_dim, self.kv_dim),
                     )
                 else:
-                    q = torch.mv(self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight")), normed)
-                    k = torch.mv(self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight")), normed)
-                    v = torch.mv(self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight")), normed)
+                    q = projection(
+                        self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight")),
+                        normed,
+                        buffers.qkv[: self.q_dim] if buffers is not None else None,
+                    )
+                    k = projection(
+                        self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight")),
+                        normed,
+                        (
+                            buffers.qkv[self.q_dim : self.q_dim + self.kv_dim]
+                            if buffers is not None
+                            else None
+                        ),
+                    )
+                    v = projection(
+                        self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight")),
+                        normed,
+                        (
+                            buffers.qkv[
+                                self.q_dim + self.kv_dim :
+                                self.q_dim + 2 * self.kv_dim
+                            ]
+                            if buffers is not None
+                            else None
+                        ),
+                    )
             else:
                 q, k, v = qkv
             for projected, suffix in (
@@ -4207,9 +4965,10 @@ class ThinGpuQwenRuntime:
             )
             if getattr(self, "_profiler_enabled", False):
                 lev.o_proj_start.record()
-            attn_out = torch.mv(
+            attn_out = projection(
                 self.weights.tensor(_layer_tensor(layer, "self_attn.o_proj.weight")),
                 attn,
+                buffers.attn_out if buffers is not None else None,
             )
             o_bias = _optional_tensor(
                 self.weights,
@@ -4226,10 +4985,9 @@ class ThinGpuQwenRuntime:
                 lev.attn_end.record()
                 lev.mlp_start.record()
 
-            normed = _rms_norm(
+            normed = self._normalization(
                 hidden,
-                self.weights.tensor(_layer_tensor(layer, "post_attention_layernorm.weight")),
-                self.rms_norm_eps,
+                _layer_tensor(layer, "post_attention_layernorm.weight"),
             )
             self._capture_debug(layer, "post_attention_rmsnorm", normed)
             if getattr(self, "_profiler_enabled", False):
@@ -4241,13 +4999,30 @@ class ThinGpuQwenRuntime:
                     _layer_tensor(layer, "mlp.gate_up_proj.weight"),
                 )
                 if fused_gate_up is not None:
-                    gate, up = torch.mv(
+                    gate, up = projection(
                         fused_gate_up,
                         normed,
+                        buffers.gate_up if buffers is not None else None,
                     ).chunk(2)
                 else:
-                    gate = torch.mv(self.weights.tensor(_layer_tensor(layer, "mlp.gate_proj.weight")), normed)
-                    up = torch.mv(self.weights.tensor(_layer_tensor(layer, "mlp.up_proj.weight")), normed)
+                    gate = projection(
+                        self.weights.tensor(_layer_tensor(layer, "mlp.gate_proj.weight")),
+                        normed,
+                        (
+                            buffers.gate_up[: self.intermediate_size]
+                            if buffers is not None
+                            else None
+                        ),
+                    )
+                    up = projection(
+                        self.weights.tensor(_layer_tensor(layer, "mlp.up_proj.weight")),
+                        normed,
+                        (
+                            buffers.gate_up[self.intermediate_size :]
+                            if buffers is not None
+                            else None
+                        ),
+                    )
             else:
                 gate, up = gate_up
             gate_bias = _optional_tensor(
@@ -4273,14 +5048,22 @@ class ThinGpuQwenRuntime:
             if getattr(self, "_profiler_enabled", False):
                 lev.gate_proj_end.record()
                 lev.silu_mul_start.record()
-            silu_val = torch.nn.functional.silu(gate) * up
+            if buffers is not None and self.kernel_backend is not None:
+                silu_val = self._runtime_silu_mul(
+                    gate,
+                    up,
+                    buffers.mlp_act,
+                )
+            else:
+                silu_val = torch.nn.functional.silu(gate) * up
             self._capture_debug(layer, "gated_activation", silu_val)
             if getattr(self, "_profiler_enabled", False):
                 lev.silu_mul_end.record()
                 lev.down_proj_start.record()
-            mlp = torch.mv(
+            mlp = projection(
                 self.weights.tensor(_layer_tensor(layer, "mlp.down_proj.weight")),
                 silu_val,
+                buffers.mlp if buffers is not None else None,
             )
             down_bias = _optional_tensor(
                 self.weights,
@@ -4299,7 +5082,7 @@ class ThinGpuQwenRuntime:
                 lev.mlp_end.record()
                 lev.layer_end.record()
 
-        hidden = _rms_norm(hidden, self.weights.tensor("model.norm.weight"), self.rms_norm_eps)
+        hidden = self._normalization(hidden, "model.norm.weight")
         return hidden
 
     def _lm_head(self) -> torch.Tensor:
@@ -4382,6 +5165,18 @@ class ThinGpuQwenRuntime:
         backend = self.kernel_backend
         if backend is None:
             return
+        from .tuning_cache import (
+            TuningCache,
+            builtin_matvec_choice,
+            matvec_key,
+        )
+
+        capability = torch.cuda.get_device_capability(self.device)
+        gpu_name = torch.cuda.get_device_name(self.device)
+        tuning_cache = TuningCache(
+            f"{gpu_name}-cc{capability[0]}{capability[1]}-"
+            f"torch{torch.__version__}"
+        )
         candidates: list[torch.Tensor] = []
         if isinstance(self.weights, ThinGpuPagePool) and self._layer_plan is not None:
             # Streaming tensors are reloadable and dispatch is keyed by stable
@@ -4434,6 +5229,37 @@ class ThinGpuQwenRuntime:
                         plan.down_proj,
                     ]
                 )
+        elif isinstance(self.weights, ThinGpuWeights):
+            # Architectures such as Phi store QKV and gate/up as fused pages.
+            # They still use the same shape-driven backend selection.
+            for layer in range(self.layers):
+                page_ids = [
+                    _layer_tensor(layer, "self_attn.o_proj.weight"),
+                    _layer_tensor(layer, "mlp.down_proj.weight"),
+                ]
+                page_ids.extend(
+                    [
+                        _layer_tensor(layer, "self_attn.qkv_proj.weight"),
+                    ]
+                    if self.has_fused_qkv_projection
+                    else [
+                        _layer_tensor(layer, f"self_attn.{part}_proj.weight")
+                        for part in ("q", "k", "v")
+                    ]
+                )
+                page_ids.extend(
+                    [
+                        _layer_tensor(layer, "mlp.gate_up_proj.weight"),
+                    ]
+                    if self.has_fused_gate_up_projection
+                    else [
+                        _layer_tensor(layer, f"mlp.{part}_proj.weight")
+                        for part in ("gate", "up")
+                    ]
+                )
+                for page_id in page_ids:
+                    if page_id in self.weights.tensors:
+                        candidates.append(self.weights.tensor(page_id))
         head = self._lm_head()
         if not isinstance(self.weights, ThinGpuPagePool) or self._matvec_shape_key(
             head
@@ -4447,36 +5273,45 @@ class ThinGpuQwenRuntime:
                 continue
             unique.setdefault(self._matvec_shape_key(weight), weight)
 
-        PRETUNED_BACKENDS = {
-            (128256, 2048, "torch.bfloat16"): "triton",
-            (128256, 2048, "torch.float8_e4m3fn"): "triton",
-            (11008, 2048, "torch.bfloat16"): "triton",
-            (11008, 2048, "torch.float8_e4m3fn"): "triton",
-            (2048, 11008, "torch.bfloat16"): "triton_loop_256",
-            (2048, 11008, "torch.float8_e4m3fn"): "triton_loop_128",
-            (2048, 2048, "torch.bfloat16"): "triton",
-            (512, 2048, "torch.bfloat16"): "triton",
-        }
-
         for key, weight in unique.items():
             rows, cols = int(weight.shape[0]), int(weight.shape[1])
             dtype_str = str(weight.dtype)
-            pretuned_key = (rows, cols, dtype_str)
-            if pretuned_key in PRETUNED_BACKENDS:
-                self._matvec_backend_choices[key] = PRETUNED_BACKENDS[pretuned_key]
+            scale = self._weight_scale(weight)
+            persistent_key = matvec_key(
+                capability=capability,
+                rows=rows,
+                cols=cols,
+                dtype=dtype_str,
+                scaled=scale is not None,
+                stride=(int(weight.stride(0)), int(weight.stride(1))),
+            )
+            cached_choice = tuning_cache.get_matvec(persistent_key)
+            seeded_choice = builtin_matvec_choice(
+                capability,
+                rows,
+                cols,
+                dtype_str,
+                scale is not None,
+            )
+            established_choice = cached_choice or seeded_choice
+            if established_choice is not None:
+                self._matvec_backend_choices[key] = established_choice
                 shape_str = f"{rows}x{cols}:{weight.dtype}:stride={weight.stride(0)},{weight.stride(1)}"
                 self.per_shape_backend_benchmarks[shape_str] = {
-                    "chosen_backend": PRETUNED_BACKENDS[pretuned_key],
-                    "winner_microbench": PRETUNED_BACKENDS[pretuned_key],
-                    "winner_real_decode": PRETUNED_BACKENDS[pretuned_key],
+                    "chosen_backend": established_choice,
+                    "winner_microbench": established_choice,
+                    "winner_real_decode": established_choice,
+                    "source": (
+                        "persistent_gpu_cache"
+                        if cached_choice is not None
+                        else "builtin_gpu_scoped_decode_evidence"
+                    ),
                 }
                 continue
 
             if not self.autotune_enabled:
                 self._matvec_backend_choices[key] = "triton"
                 continue
-            rows, cols = int(weight.shape[0]), int(weight.shape[1])
-            scale = self._weight_scale(weight)
             activation_dtype = (
                 self.kernel_backend.dtype if scale is not None else weight.dtype
             )
@@ -4561,17 +5396,23 @@ class ThinGpuQwenRuntime:
                         self._matvec_choice_by_tensor_id[id(w)] = choice
                 
                 try:
-                    # Warm up this configuration
+                    if self.kv_cache is not None:
+                        self.kv_cache.reset(reuse_pages=True)
                     token0 = torch.zeros((), device=self.device, dtype=torch.long)
-                    self.forward_token(token0, token_index=0)
+                    for warmup_index in range(3):
+                        self.forward_token(
+                            token0,
+                            token_index=warmup_index,
+                        )
                     torch.cuda.synchronize()
-                    
-                    # Benchmark real decode steps
+                    if self.kv_cache is not None:
+                        self.kv_cache.reset(reuse_pages=True)
+
                     start = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
                     start.record()
                     for step_idx in range(15):
-                        self.forward_token(token0, token_index=step_idx + 1)
+                        self.forward_token(token0, token_index=step_idx)
                     end.record()
                     end.synchronize()
                     decode_results[choice] = start.elapsed_time(end)
@@ -4582,33 +5423,13 @@ class ThinGpuQwenRuntime:
             if decode_results:
                 winner_real_decode = min(decode_results, key=decode_results.get)
 
-            # Overrides for 3B-class Qwen/SmolLM shapes
-            if rows == 11008 and cols == 2048:
-                winner_real_decode = "triton"
-            elif rows == 128256 and cols == 2048:
-                # Allow autotuned selection instead of hardcoded row_block_m2 override
-                pass
-            elif rows == 2048 and cols == 11008:
-                # Keep the retained quality profile deterministic. Startup
-                # timing noise previously flipped FP8 down-projection between
-                # loop-128 and loop-256, which changes BF16 rounding and can
-                # alter a long greedy trajectory. These choices were already
-                # established by warmed real-decode runs on this shape.
-                winner_real_decode = (
-                    "triton_loop_128"
-                    if weight.element_size() == 1
-                    else "triton_loop_256"
-                )
-            elif rows == 2048 and cols == 2048:
-                winner_real_decode = "triton"
-            elif rows == 512 and cols == 2048:
-                winner_real_decode = "triton"
-            elif self.hidden_size == 1024 and cols in {1024, 2048, 3072}:
-                # Qwen3-0.6B established decode override. Generic row-block
-                # candidates lose the repeat-KV/O fusion on this model.
-                winner_real_decode = "triton"
-
             self._matvec_backend_choices[key] = winner_real_decode
+            tuning_cache.put_matvec(
+                persistent_key,
+                choice=winner_real_decode,
+                microbench_ms=results,
+                decode_ms=decode_results,
+            )
 
             # Task 4: Store telemetry
             shape_str = f"{rows}x{cols}:{weight.dtype}:stride={weight.stride(0)},{weight.stride(1)}"
@@ -4625,7 +5446,8 @@ class ThinGpuQwenRuntime:
                 "row_block_m8_ms": results.get("row_block_m8"),
                 "winner_microbench": winner_microbench,
                 "winner_real_decode": winner_real_decode,
-                "chosen_backend": winner_real_decode
+                "chosen_backend": winner_real_decode,
+                "source": "measured_and_persisted",
             }
 
 
@@ -4759,6 +5581,9 @@ class ThinGpuQwenRuntime:
                     * exact_head.element_size()
                 )
         total += self.fp8_sparse_residual_bytes
+        total += self.mxfp4_binary_residual_bytes
+        total += self.mxfp4_int8_row_override_bytes
+        total += self.mxfp4_row_postscale_bytes
         return total
 
     @property
@@ -4769,6 +5594,9 @@ class ThinGpuQwenRuntime:
             + self.runtime_fusion_extra_bytes
             + self.fused_mlp_extra_bytes
             + self.fp8_sparse_residual_bytes
+            + self.mxfp4_binary_residual_bytes
+            + self.mxfp4_int8_row_override_bytes
+            + self.mxfp4_row_postscale_bytes
             + self.adaptive_exact_resident_bytes
         )
 
@@ -5302,11 +6130,11 @@ class ThinGpuQwenRuntime:
                 normed = precomputed_input_norm
                 precomputed_input_norm = None
             else:
-                normed = backend.rms_norm(
+                normed = self._runtime_norm(
                     hidden,
                     plan.input_layernorm_weight,
+                    _layer_tensor(layer, "input_layernorm.weight"),
                     buffers.normed,
-                    self.rms_norm_eps,
                 )
             self._capture_debug(layer, "post_input_rmsnorm", normed)
             q, k, v = self._triton_qkv(plan, normed, lev if getattr(self, "_profiler_enabled", False) else None)
@@ -5416,11 +6244,14 @@ class ThinGpuQwenRuntime:
                 lev.mlp_start.record()
 
             if not self.fused_residual_norm_enabled:
-                normed = backend.rms_norm(
+                normed = self._runtime_norm(
                     hidden,
                     plan.post_attention_layernorm_weight,
+                    _layer_tensor(
+                        layer,
+                        "post_attention_layernorm.weight",
+                    ),
                     buffers.normed,
-                    self.rms_norm_eps,
                 )
             self._capture_debug(layer, "post_attention_rmsnorm", normed)
 
@@ -5560,11 +6391,11 @@ class ThinGpuQwenRuntime:
 
         if final_norm_ready:
             return buffers.final
-        return backend.rms_norm(
+        return self._runtime_norm(
             hidden,
             self._final_norm_weight,
+            "model.norm.weight",
             buffers.final,
-            self.rms_norm_eps,
         )
 
     def _can_runtime_fuse_weights(self) -> bool:
@@ -5655,8 +6486,8 @@ class ThinGpuQwenRuntime:
         )
         adaptive_qkv = None
         if (
-            self._adaptive_fp8_start_token >= 0
-            and self._active_token_index < self._adaptive_fp8_start_token
+            self._adaptive_switch_token_index >= 0
+            and self._active_token_index < self._adaptive_switch_token_index
         ):
             exact_weights = tuple(
                 self._adaptive_exact_weights.get(id(weight))
@@ -5829,17 +6660,63 @@ class ThinGpuQwenRuntime:
         mxfp4_meta = self._mxfp4_metadata.get(id(weight))
         if mxfp4_meta is not None:
             assert self.kernel_backend is not None
-            rows, cols = mxfp4_meta
+            rows, cols, hadamard_size = mxfp4_meta
             scale = self._weight_scale(weight)
             assert scale is not None
-            return self.kernel_backend.mxfp4_tensorcore_matvec(
+            original_x = x
+            if hadamard_size:
+                transformed_x = self._mxfp4_hadamard_buffers.get(cols)
+                if transformed_x is None:
+                    transformed_x = torch.empty(
+                        cols,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    self._mxfp4_hadamard_buffers[cols] = transformed_x
+                self.kernel_backend.block_hadamard(
+                    x,
+                    transformed_x,
+                    block_size=int(hadamard_size),
+                    signs=self._mxfp4_hadamard_signs.get(id(weight)),
+                )
+                x = transformed_x
+            binary_residual = self._mxfp4_binary_residuals.get(id(weight))
+            result = self.kernel_backend.mxfp4_tensorcore_matvec(
                 weight,
                 scale,
                 x,
                 out,
                 rows=rows,
                 cols=cols,
+                residual_bits=(
+                    binary_residual[0]
+                    if binary_residual is not None
+                    else None
+                ),
+                residual_scales=(
+                    binary_residual[1]
+                    if binary_residual is not None
+                    else None
+                ),
+                post_scales=self._mxfp4_row_postscales.get(id(weight)),
             )
+            residual = self._sparse_residual_sidecars.get(id(weight))
+            if residual is not None:
+                values, indices = residual
+                self.kernel_backend.sparse_residual_matvec(
+                    values, indices, x, result
+                )
+            row_override = self._mxfp4_int8_row_overrides.get(id(weight))
+            if row_override is not None:
+                override_weight, override_scales, row_indices = row_override
+                self.kernel_backend.selected_scaled_matvec(
+                    override_weight,
+                    override_scales,
+                    row_indices,
+                    original_x,
+                    result,
+                )
+            return result
         int4_meta = self._int4_metadata.get(id(weight))
         if int4_meta is not None:
             assert self.kernel_backend is not None
@@ -5858,8 +6735,8 @@ class ThinGpuQwenRuntime:
 
         adaptive_exact = None
         if (
-            self._adaptive_fp8_start_token >= 0
-            and self._active_token_index < self._adaptive_fp8_start_token
+            self._adaptive_switch_token_index >= 0
+            and self._active_token_index < self._adaptive_switch_token_index
         ):
             adaptive_exact = self._adaptive_exact_weights.get(id(weight))
 
@@ -5930,13 +6807,24 @@ class ThinGpuQwenRuntime:
                 num_warps=4,
             )
 
+        if scale is not None and choice in {None, "torch_mv", "torch_matmul"}:
+            # Materializing a full dequantized matrix is both slower and can
+            # exceed VRAM for fused projection pages. Scaled weights always
+            # stay on the streaming Triton path.
+            choice = "triton"
         if scale is not None:
             if choice == "torch_mv" or choice is None:
-                dequant = weight.to(dtype=x.dtype) * scale[:, None]
+                dequant = (
+                    weight.to(dtype=x.dtype)
+                    * scale.to(dtype=x.dtype)[:, None]
+                )
                 torch.mv(dequant, x, out=out)
                 return out
             elif choice == "torch_matmul":
-                dequant = weight.to(dtype=x.dtype) * scale[:, None]
+                dequant = (
+                    weight.to(dtype=x.dtype)
+                    * scale.to(dtype=x.dtype)[:, None]
+                )
                 torch.matmul(dequant, x, out=out)
                 return out
             elif choice == "triton":
@@ -5975,7 +6863,10 @@ class ThinGpuQwenRuntime:
                     )
                 return result
             else:
-                dequant = weight.to(dtype=x.dtype) * scale[:, None]
+                dequant = (
+                    weight.to(dtype=x.dtype)
+                    * scale.to(dtype=x.dtype)[:, None]
+                )
                 torch.mv(dequant, x, out=out)
                 return out
 
@@ -6028,28 +6919,15 @@ class ThinGpuQwenRuntime:
         rows = int(weight.shape[0])
         cols = int(weight.shape[1])
         scaled = self._weight_scale(weight) is not None
-        if (
-            self._adaptive_body_int8
-            and rows == 2048
-            and cols == 11008
-            and scaled
-            and (
-                self._adaptive_fp8_start_token < 0
-                or self._active_token_index >= self._adaptive_fp8_start_token
-            )
-        ):
-            return "triton_loop_256", 32, 4
         if not self.tuned_large_matvec_enabled:
             return choice, None, None
-        if rows == 128256 and cols == 2048 and not scaled:
+        if rows >= 65536 and cols >= 1024 and not scaled:
             return choice, 32, 4
-        if rows == 11008 and cols == 2048 and scaled:
+        if rows >= cols * 4 and scaled:
             return choice, 8, 4
-        if rows == 2048 and cols == 11008 and scaled:
-            return "triton_loop_128", 32, 4
-        if rows == 2048 and cols == 11008 and not scaled:
-            return "triton_loop_256", 32, 8
-        if rows == 2048 and cols == 2048 and not scaled:
+        if cols >= rows * 4:
+            return choice, 32, 4 if scaled else 8
+        if rows == cols and not scaled:
             return choice, 4, 4
         return choice, None, None
 
@@ -6074,6 +6952,56 @@ class ThinGpuQwenRuntime:
         if self.use_triton_elementwise:
             return backend.add(left, right, out)
         torch.add(left, right, out=out)
+        return out
+
+    def _normalization(
+        self,
+        x: torch.Tensor,
+        weight_id: str,
+    ) -> torch.Tensor:
+        weight = self.weights.tensor(weight_id)
+        if self.norm_kind == "rms_norm":
+            return _rms_norm(x, weight, self.norm_eps)
+        bias = _optional_tensor(
+            self.weights,
+            weight_id.removesuffix(".weight") + ".bias",
+        )
+        return torch.nn.functional.layer_norm(
+            x,
+            (int(x.shape[-1]),),
+            weight,
+            bias,
+            self.norm_eps,
+        )
+
+    def _runtime_norm(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_id: str,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        backend = self.kernel_backend
+        assert backend is not None
+        if self.norm_kind == "rms_norm":
+            return backend.rms_norm(
+                x,
+                weight,
+                out,
+                self.norm_eps,
+            )
+        bias = _optional_tensor(
+            self.weights,
+            weight_id.removesuffix(".weight") + ".bias",
+        )
+        value = torch.nn.functional.layer_norm(
+            x,
+            (int(x.shape[-1]),),
+            weight,
+            bias,
+            self.norm_eps,
+        )
+        out.copy_(value)
         return out
 
     def _runtime_silu_mul(
@@ -6143,8 +7071,8 @@ class ThinGpuQwenRuntime:
 
 
 
-# Backward-compatible name retained for existing scripts and archives.
-ThinGpuCausalLMRuntime = ThinGpuQwenRuntime
+# Backward-compatible name retained for existing integrations.
+ThinGpuQwenRuntime = ThinGpuCausalLMRuntime
 
 
 class TempGuard:
@@ -6209,7 +7137,7 @@ def benchmark_gpu_runtime(
     try:
         load_start = time.perf_counter()
         weights = ThinGpuWeights(archive_path, device=device, dtype=dtype)
-        runtime = ThinGpuQwenRuntime(weights)
+        runtime = ThinGpuCausalLMRuntime(weights)
         if device == "cuda":
             torch.cuda.synchronize()
         load_s = time.perf_counter() - load_start

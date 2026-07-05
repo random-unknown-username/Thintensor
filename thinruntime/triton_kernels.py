@@ -266,6 +266,142 @@ def _mxfp4_value(code):
 
 
 @triton.jit
+def _block_hadamard_32_kernel(x, out, cols: tl.constexpr) -> None:
+    """Apply an orthonormal Walsh-Hadamard transform to each 32-value block."""
+    block = tl.program_id(0)
+    row = tl.arange(0, 32)
+    col = tl.arange(0, 32)
+    base = block * 32
+    intersection = row[:, None] & col[None, :]
+    parity = intersection ^ (intersection >> 16)
+    parity = parity ^ (parity >> 8)
+    parity = parity ^ (parity >> 4)
+    parity = parity ^ (parity >> 2)
+    parity = (parity ^ (parity >> 1)) & 1
+    sign = 1.0 - 2.0 * parity.to(tl.float32)
+    values = tl.load(
+        x + base + col,
+        mask=base + col < cols,
+        other=0.0,
+    ).to(tl.float32)
+    transformed = tl.sum(sign * values[None, :], axis=1) * 0.1767766952966369
+    tl.store(
+        out + base + row,
+        transformed,
+        mask=base + row < cols,
+    )
+
+
+@triton.jit
+def _block_hadamard_kernel(
+    x,
+    signs,
+    out,
+    cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SIGNED: tl.constexpr,
+) -> None:
+    """Single-program fast Walsh-Hadamard transform for power-of-two blocks."""
+    block = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(x + block * BLOCK_SIZE + offsets).to(tl.float32)
+    if SIGNED:
+        values *= tl.load(
+            signs + block * BLOCK_SIZE + offsets
+        ).to(tl.float32)
+
+    reshaped = tl.reshape(values, (BLOCK_SIZE // 2, 2, 1))
+    reshaped = tl.permute(reshaped, (0, 2, 1))
+    left, right = tl.split(reshaped)
+    values = tl.reshape(
+        tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+        (BLOCK_SIZE,),
+    )
+    if BLOCK_SIZE >= 4:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 4, 2, 2))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 8:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 8, 2, 4))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 16:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 16, 2, 8))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 32:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 32, 2, 16))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 64:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 64, 2, 32))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 128:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 128, 2, 64))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 256:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 256, 2, 128))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 512:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 512, 2, 256))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 1024:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 1024, 2, 512))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    if BLOCK_SIZE >= 2048:
+        reshaped = tl.reshape(values, (BLOCK_SIZE // 2048, 2, 1024))
+        reshaped = tl.permute(reshaped, (0, 2, 1))
+        left, right = tl.split(reshaped)
+        values = tl.reshape(
+            tl.permute(tl.join(left + right, left - right), (0, 2, 1)),
+            (BLOCK_SIZE,),
+        )
+    values *= BLOCK_SIZE**-0.5
+    tl.store(out + block * BLOCK_SIZE + offsets, values)
+
+
+@triton.jit
 def _mxfp4_selected_matvec_kernel(
     blocks,
     scales,
@@ -530,6 +666,9 @@ def _int8_bf16_tensorcore_matvec_kernel(
 def _mxfp4_bf16_tensorcore_matvec_kernel(
     packed_weight,
     scales,
+    residual_bits,
+    residual_scales,
+    post_scales,
     x,
     y,
     rows: tl.constexpr,
@@ -540,6 +679,8 @@ def _mxfp4_bf16_tensorcore_matvec_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HAS_BINARY_RESIDUAL: tl.constexpr,
+    HAS_POST_SCALE: tl.constexpr,
 ) -> None:
     """Blackwell MXFP4 x BF16 matvec using native scaled tensor cores."""
     offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -580,7 +721,53 @@ def _mxfp4_bf16_tensorcore_matvec_kernel(
             acc=accumulator,
             fast_math=True,
         )
+        if HAS_BINARY_RESIDUAL:
+            pair_index = start_k // 2 + tl.arange(0, BLOCK_K // 2)
+            low_index = pair_index * 2
+            high_index = low_index + 1
+            low_bits = tl.load(
+                residual_bits
+                + offsets_m[:, None] * (cols // 8)
+                + (low_index[None, :] // 8),
+                mask=mask_m[:, None],
+                other=0,
+            )
+            high_bits = tl.load(
+                residual_bits
+                + offsets_m[:, None] * (cols // 8)
+                + (high_index[None, :] // 8),
+                mask=mask_m[:, None],
+                other=0,
+            )
+            low_positive = (
+                (low_bits >> (low_index[None, :] & 7)) & 1
+            ) != 0
+            high_positive = (
+                (high_bits >> (high_index[None, :] & 7)) & 1
+            ) != 0
+            low_code = tl.where(low_positive, 2, 10).to(tl.uint8)
+            high_code = tl.where(high_positive, 2, 10).to(tl.uint8)
+            residual_values = low_code | (high_code << 4)
+            residual_scale_values = tl.load(
+                residual_scales
+                + offsets_m[:, None] * (cols // 32)
+                + offsets_scale_k[None, :],
+                mask=mask_m[:, None],
+                other=127,
+            )
+            accumulator = tl.dot_scaled(
+                residual_values,
+                residual_scale_values,
+                "e2m1",
+                vector_tile,
+                None,
+                "bf16",
+                acc=accumulator,
+                fast_math=True,
+            )
     result = tl.sum(accumulator, axis=1) / BLOCK_N
+    if HAS_POST_SCALE:
+        result *= tl.load(post_scales + offsets_m, mask=mask_m, other=1.0)
     tl.store(y + offsets_m, result, mask=mask_m)
 
 
@@ -1234,6 +1421,84 @@ def _sparse_residual_matvec_kernel(
     correction = tl.sum(values * x_values, axis=1)
     base = tl.load(out + offs_m, mask=mask_m, other=0.0).to(tl.float32)
     tl.store(out + offs_m, base + correction, mask=mask_m)
+
+
+@triton.jit
+def _binary_residual_matvec_kernel(
+    packed_signs,
+    scales,
+    x,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_bm: tl.constexpr,
+    stride_sm: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    correction = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < cols
+        packed = tl.load(
+            packed_signs
+            + offs_m[:, None] * stride_bm
+            + (offs_k[None, :] // 8),
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.int32)
+        positive = ((packed >> (offs_k[None, :] & 7)) & 1) != 0
+        sign = tl.where(positive, 1.0, -1.0)
+        scale = tl.load(
+            scales
+            + offs_m[:, None] * stride_sm
+            + (offs_k[None, :] // 32),
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        values = tl.load(
+            x + offs_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        correction += tl.sum(sign * scale * values[None, :], axis=1)
+    base = tl.load(out + offs_m, mask=mask_m, other=0.0).to(tl.float32)
+    tl.store(out + offs_m, base + correction, mask=mask_m)
+
+
+@triton.jit
+def _selected_scaled_matvec_kernel(
+    weight,
+    scales,
+    row_indices,
+    x,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    accumulator = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < cols
+        values = tl.load(
+            weight
+            + offs_m[:, None] * stride_wm
+            + offs_k[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.float32)
+        vector = tl.load(x + offs_k, mask=mask_k, other=0).to(tl.float32)
+        accumulator += tl.sum(values * vector[None, :], axis=1)
+    scale = tl.load(scales + offs_m, mask=mask_m, other=0).to(tl.float32)
+    destination = tl.load(row_indices + offs_m, mask=mask_m, other=0)
+    tl.store(out + destination, accumulator * scale, mask=mask_m)
 
 
 @triton.jit
@@ -1970,11 +2235,11 @@ def select_matvec_config(rows: int, cols: int) -> tuple[int, int]:
         return 64, 4
     if cols >= 3072:
         return 64, 4
-    if rows >= 3072 and cols == 1024:
+    if cols <= 1024 and rows >= cols * 3:
         return 8, 8
     if rows <= 1024 and cols >= 2048:
         return 8, 4
-    if rows == 2048 and cols == 1024:
+    if rows == cols * 2 and cols <= 1024:
         return 32, 8
     return 16, 8
 
@@ -2454,8 +2719,21 @@ class TritonDecodeBackend:
                 num_warps=num_warps,
             )
             return out
-        if (
+        tensorcore_all = (
             os.environ.get("THINTENSOR_TENSORCORE_MATVEC", "0") == "1"
+        )
+        tensorcore_int8_down = (
+            os.environ.get("THINTENSOR_INT8_DOWN_TENSORCORE", "0") == "1"
+            and weight.dtype == torch.int8
+            and rows == 2048
+            and cols == 11008
+        )
+        tensorcore_int8 = (
+            os.environ.get("THINTENSOR_INT8_TENSORCORE", "0") == "1"
+            and weight.dtype == torch.int8
+        )
+        if (
+            (tensorcore_all or tensorcore_int8 or tensorcore_int8_down)
             and
             x.dtype == torch.bfloat16
             and cols % 256 == 0
@@ -2467,9 +2745,21 @@ class TritonDecodeBackend:
                 else _int8_bf16_tensorcore_matvec_kernel
             )
             tensorcore_block_n = (
-                8 if weight.dtype == torch.float8_e4m3fn else 1
+                8
+                if weight.dtype == torch.float8_e4m3fn
+                else int(os.environ.get("THINTENSOR_INT8_TC_BLOCK_N", "1"))
             )
-            tensorcore_block_m = 32 if rows <= 512 else 64
+            tensorcore_block_m = int(
+                os.environ.get(
+                    "THINTENSOR_INT8_TC_BLOCK_M",
+                    "32" if rows <= 512 else "64",
+                )
+            )
+            tensorcore_block_k = int(
+                os.environ.get("THINTENSOR_INT8_TC_BLOCK_K", "256")
+            )
+            if cols % tensorcore_block_k:
+                tensorcore_block_k = 256
             tensorcore_kernel[
                 (triton.cdiv(rows, tensorcore_block_m),)
             ](
@@ -2481,7 +2771,7 @@ class TritonDecodeBackend:
                 cols,
                 int(weight.stride(0)),
                 BLOCK_M=tensorcore_block_m,
-                BLOCK_K=256,
+                BLOCK_K=tensorcore_block_k,
                 BLOCK_N=tensorcore_block_n,
                 num_warps=4,
                 num_stages=3,
@@ -2617,6 +2907,9 @@ class TritonDecodeBackend:
         *,
         rows: int,
         cols: int,
+        residual_bits: torch.Tensor | None = None,
+        residual_scales: torch.Tensor | None = None,
+        post_scales: torch.Tensor | None = None,
         block_m: int = 64,
         block_k: int = 256,
         block_n: int = 8,
@@ -2637,11 +2930,27 @@ class TritonDecodeBackend:
             )
         if cols % block_k or block_k % 32:
             raise ValueError("MXFP4 tensor-core K dimensions must be 32-aligned")
+        has_binary_residual = residual_bits is not None
+        if has_binary_residual != (residual_scales is not None):
+            raise ValueError("binary residual bits and scales must be provided together")
+        if has_binary_residual:
+            assert residual_bits is not None and residual_scales is not None
+            if tuple(residual_bits.shape) != (rows, cols // 8):
+                raise ValueError("binary residual bits shape mismatch")
+            if tuple(residual_scales.shape) != (rows, cols // 32):
+                raise ValueError("binary residual scales shape mismatch")
+            if residual_scales.dtype != torch.uint8:
+                raise ValueError("binary residual scales must use E8M0 uint8")
+        if post_scales is not None and tuple(post_scales.shape) != (rows,):
+            raise ValueError("MXFP4 post-scale shape mismatch")
         _mxfp4_bf16_tensorcore_matvec_kernel[
             (triton.cdiv(rows, block_m),)
         ](
             packed_weight,
             scales,
+            residual_bits if residual_bits is not None else packed_weight,
+            residual_scales if residual_scales is not None else scales,
+            post_scales if post_scales is not None else scales,
             x,
             out,
             rows,
@@ -2652,8 +2961,58 @@ class TritonDecodeBackend:
             BLOCK_M=block_m,
             BLOCK_K=block_k,
             BLOCK_N=block_n,
+            HAS_BINARY_RESIDUAL=has_binary_residual,
+            HAS_POST_SCALE=post_scales is not None,
             num_warps=4,
             num_stages=3,
+        )
+        return out
+
+    def block_hadamard_32(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.ndim != 1 or out.shape != x.shape:
+            raise ValueError("block Hadamard input/output must be equal 1D tensors")
+        cols = int(x.numel())
+        if cols % 32:
+            raise ValueError("block Hadamard requires a multiple of 32 values")
+        _block_hadamard_32_kernel[(triton.cdiv(cols, 32),)](
+            x,
+            out,
+            cols=cols,
+            num_warps=1,
+        )
+        return out
+
+    def block_hadamard(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        block_size: int,
+        signs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.ndim != 1 or out.shape != x.shape:
+            raise ValueError("block Hadamard input/output must be equal 1D tensors")
+        cols = int(x.numel())
+        if block_size < 2 or block_size > 2048 or block_size & (block_size - 1):
+            raise ValueError("Hadamard block size must be a power of two in [2, 2048]")
+        if cols % block_size:
+            raise ValueError(
+                f"Hadamard block size {block_size} does not divide {cols}"
+            )
+        if signs is not None and signs.shape != x.shape:
+            raise ValueError("Hadamard signs must match the input shape")
+        _block_hadamard_kernel[(cols // block_size,)](
+            x,
+            signs if signs is not None else x,
+            out,
+            cols=cols,
+            BLOCK_SIZE=block_size,
+            SIGNED=signs is not None,
+            num_warps=8 if block_size >= 512 else 4,
         )
         return out
 
@@ -2675,7 +3034,7 @@ class TritonDecodeBackend:
         if plan is None:
             cols = int(weight0.shape[1])
             if triton.next_power_of_2(cols) != cols:
-                # Fallback for non-power-of-two hidden sizes, e.g. Qwen3-4B hidden_size=2560.
+                # Correct fallback for any non-power-of-two hidden size.
                 # Keep correctness by dispatching normal matvecs into slices of the fused output.
                 offset = 0
                 for weight in weights:
@@ -3109,6 +3468,64 @@ class TritonDecodeBackend:
             stride_ik=int(residual_indices.stride(1)),
             BLOCK_M=block_m,
             BLOCK_K=triton.next_power_of_2(terms),
+            num_warps=4,
+        )
+        return out
+
+    def binary_residual_matvec(
+        self,
+        packed_signs: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        rows = int(packed_signs.shape[0])
+        cols = int(x.numel())
+        if tuple(packed_signs.shape) != (rows, cols // 8):
+            raise ValueError("binary residual sign plane shape mismatch")
+        if tuple(scales.shape) != (rows, cols // 32):
+            raise ValueError("binary residual scale shape mismatch")
+        block_m = 8
+        _binary_residual_matvec_kernel[(triton.cdiv(rows, block_m),)](
+            packed_signs,
+            scales,
+            x,
+            out,
+            rows=rows,
+            cols=cols,
+            stride_bm=int(packed_signs.stride(0)),
+            stride_sm=int(scales.stride(0)),
+            BLOCK_M=block_m,
+            BLOCK_K=256,
+            num_warps=4,
+        )
+        return out
+
+    def selected_scaled_matvec(
+        self,
+        weight: torch.Tensor,
+        scales: torch.Tensor,
+        row_indices: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        rows, cols = int(weight.shape[0]), int(weight.shape[1])
+        if tuple(scales.shape) != (rows,):
+            raise ValueError("selected-row scales shape mismatch")
+        if tuple(row_indices.shape) != (rows,):
+            raise ValueError("selected-row index shape mismatch")
+        block_m = 8
+        _selected_scaled_matvec_kernel[(triton.cdiv(rows, block_m),)](
+            weight,
+            scales,
+            row_indices,
+            x,
+            out,
+            rows=rows,
+            cols=cols,
+            stride_wm=int(weight.stride(0)),
+            BLOCK_M=block_m,
+            BLOCK_K=256,
             num_warps=4,
         )
         return out

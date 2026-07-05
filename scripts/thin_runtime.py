@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -143,6 +144,24 @@ def parse_args() -> argparse.Namespace:
             "separate from --fast-60 and remains correctness-gated"
         ),
     )
+    run.add_argument(
+        "--fast-90",
+        "--opt-in-90-tps",
+        dest="fast_90",
+        action="store_true",
+        help=(
+            "Opt in to the measured ~90 tok/s 500-token profile: fast-60 "
+            "quality weights plus INT8-only Blackwell tensor-core matvecs"
+        ),
+    )
+    run.add_argument(
+        "--experimental-int8-tensorcore",
+        action="store_true",
+        help=(
+            "Opt in to the measured Blackwell INT8-only tensor-core "
+            "matvec path (N=2, M=64, K=256); FP8 projections are unchanged"
+        ),
+    )
     run.add_argument("--lm-head-fp8", action="store_true")
     run.add_argument("--keep-bf16-lm-head", action="store_true")
     run.add_argument("--exact-topk", action="store_true")
@@ -234,6 +253,33 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--mxfp4-down-layers")
     run.add_argument("--mxfp4-qkv-layers")
     run.add_argument("--mxfp4-o-layers")
+    run.add_argument(
+        "--mxfp4-hadamard",
+        action="store_true",
+        help=(
+            "Rotate each 32-value MXFP4 input block with an orthonormal "
+            "Hadamard transform before quantization and execution"
+        ),
+    )
+    run.add_argument(
+        "--mxfp4-hadamard-size",
+        type=int,
+        default=0,
+        help="Power-of-two rotation block size; 0 disables the wider transform",
+    )
+    run.add_argument("--mxfp4-hadamard-seed", type=int, default=0)
+    run.add_argument(
+        "--mxfp4-residual-terms",
+        type=int,
+        default=0,
+        help=(
+            "Retain this many largest post-MXFP4 residual coefficients per "
+            "output row"
+        ),
+    )
+    run.add_argument("--mxfp4-binary-residual", action="store_true")
+    run.add_argument("--mxfp4-int8-row-fraction", type=float, default=0.0)
+    run.add_argument("--mxfp4-row-postscale", action="store_true")
     run.add_argument(
         "--fp8-residual-terms",
         type=int,
@@ -485,13 +531,13 @@ def calculate_per_shape_bandwidths(runtime, breakdown):
 def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     selected_fast_profiles = sum(
         bool(value)
-        for value in (args.fast_60, args.fast_80)
+        for value in (args.fast_60, args.fast_80, args.fast_90)
     )
     if selected_fast_profiles > 1:
         raise ValueError(
-            "--fast-60 and --fast-80 are separate opt-in modes"
+            "--fast-60, --fast-80, and --fast-90 are separate opt-in modes"
         )
-    if args.fast_60:
+    if args.fast_60 or args.fast_90:
         args.dtype = "bf16"
         args.residency = "all"
         args.kernel_backend = "triton"
@@ -502,6 +548,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         args.lm_head_fp8 = True
         args.keep_bf16_lm_head = True
         args.lm_head_topk_guard = 64
+        if args.fast_90:
+            args.experimental_int8_tensorcore = True
     elif args.fast_80:
         args.dtype = "bf16"
         args.residency = "all"
@@ -516,6 +564,11 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         args.lm_head_int4_group_size = 0
         args.keep_bf16_lm_head = True
         args.lm_head_topk_guard = 64
+    if args.experimental_int8_tensorcore:
+        os.environ["THINTENSOR_INT8_TENSORCORE"] = "1"
+        os.environ["THINTENSOR_INT8_TC_BLOCK_N"] = "2"
+        os.environ["THINTENSOR_INT8_TC_BLOCK_M"] = "64"
+        os.environ["THINTENSOR_INT8_TC_BLOCK_K"] = "256"
     dtype = parse_dtype(args.dtype)
     reset_gpu(args.device)
     rss0 = _rss_bytes()
@@ -657,6 +710,13 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 mxfp4_down_layers=args.mxfp4_down_layers,
                 mxfp4_qkv_layers=args.mxfp4_qkv_layers,
                 mxfp4_o_layers=args.mxfp4_o_layers,
+                mxfp4_hadamard=args.mxfp4_hadamard,
+                mxfp4_hadamard_size=args.mxfp4_hadamard_size,
+                mxfp4_hadamard_seed=args.mxfp4_hadamard_seed,
+                mxfp4_residual_terms=args.mxfp4_residual_terms,
+                mxfp4_binary_residual=args.mxfp4_binary_residual,
+                mxfp4_int8_row_fraction=args.mxfp4_int8_row_fraction,
+                mxfp4_row_postscale=args.mxfp4_row_postscale,
                 exact_hf_mode=args.exact_hf_mode,
                 fp8_scale_block=args.fp8_scale_block,
                 fp8_residual_terms=args.fp8_residual_terms,
@@ -821,7 +881,14 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "opt_in_profile": (
                 "fast_60"
                 if args.fast_60
-                else ("fast_80" if args.fast_80 else None)
+                else (
+                    "fast_80"
+                    if args.fast_80
+                    else ("fast_90" if args.fast_90 else None)
+                )
+            ),
+            "experimental_int8_tensorcore": (
+                args.experimental_int8_tensorcore
             ),
             "persistent_buffers": not args.no_persistent_buffers,
             "steps": max(1, args.steps),
@@ -918,6 +985,20 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "mxfp4_down_layers": args.mxfp4_down_layers,
             "mxfp4_qkv_layers": args.mxfp4_qkv_layers,
             "mxfp4_o_layers": args.mxfp4_o_layers,
+            "mxfp4_hadamard": args.mxfp4_hadamard,
+            "mxfp4_hadamard_size": args.mxfp4_hadamard_size,
+            "mxfp4_hadamard_seed": args.mxfp4_hadamard_seed,
+            "mxfp4_residual_terms": args.mxfp4_residual_terms,
+            "mxfp4_binary_residual": args.mxfp4_binary_residual,
+            "mxfp4_binary_residual_bytes": (
+                runtime.mxfp4_binary_residual_bytes
+            ),
+            "mxfp4_int8_row_fraction": args.mxfp4_int8_row_fraction,
+            "mxfp4_int8_row_override_bytes": (
+                runtime.mxfp4_int8_row_override_bytes
+            ),
+            "mxfp4_row_postscale": args.mxfp4_row_postscale,
+            "mxfp4_row_postscale_bytes": runtime.mxfp4_row_postscale_bytes,
             "fp8_sparse_residual_terms": runtime._fp8_sparse_residual_terms,
             "fp8_sparse_residual_bytes": runtime.fp8_sparse_residual_bytes,
             "fp8_sparse_residual_layers": sorted(

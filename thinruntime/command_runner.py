@@ -11,30 +11,42 @@ from typing import Optional
 
 
 def find_rust_binary() -> Optional[str]:
-    """Find the thintensor Rust binary.
+    """Find the internal ``thintensor-core`` archive binary.
 
     Search order:
-    1. THINTENSOR_BIN environment variable
-    2. target/release/thintensor (relative to project root)
-    3. target/debug/thintensor (relative to project root)
-    4. System PATH
+    1. THINTENSOR_CORE_BIN (or legacy THINTENSOR_BIN)
+    2. Core bundled in an installed platform wheel
+    3. target/release or target/debug in a source checkout
+    4. ``thintensor-core`` on PATH
+
+    The public ``thintensor`` executable is deliberately never searched: it is
+    the Python product CLI and invoking it here would recurse.
     """
-    # 1. Environment variable
-    env_bin = os.environ.get("THINTENSOR_BIN")
+    env_bin = os.environ.get("THINTENSOR_CORE_BIN") or os.environ.get(
+        "THINTENSOR_BIN"
+    )
     if env_bin and Path(env_bin).exists():
         return env_bin
 
-    # 2. Relative to project root
     module_dir = Path(__file__).resolve().parent
     project_root = module_dir.parent
+    suffix = ".exe" if os.name == "nt" else ""
+    bundled = module_dir / "bin" / f"thintensor-core{suffix}"
+    if bundled.is_file():
+        return str(bundled)
 
     for build_dir in ["release", "debug"]:
-        candidate = project_root / "target" / build_dir / "thintensor"
-        if candidate.exists():
-            return str(candidate)
+        for binary_name in ("thintensor-core", "thintensor"):
+            candidate = (
+                project_root
+                / "target"
+                / build_dir
+                / f"{binary_name}{suffix}"
+            )
+            if candidate.is_file():
+                return str(candidate)
 
-    # 3. System PATH
-    found = shutil.which("thintensor")
+    found = shutil.which("thintensor-core")
     if found:
         return found
 
@@ -45,12 +57,12 @@ def require_rust_binary() -> str:
     """Find the Rust binary or exit with helpful message."""
     binary = find_rust_binary()
     if binary is None:
-        print("\u2717 Could not find the 'thintensor' Rust binary.")
+        print("\u2717 Could not find the bundled 'thintensor-core' binary.")
         print("")
-        print("  Build it with:")
-        print("    cargo build --release")
+        print("  Reinstall a platform wheel or build it with:")
+        print("    cargo build --locked --release --bin thintensor-core")
         print("")
-        print("  Or set THINTENSOR_BIN environment variable.")
+        print("  Or set THINTENSOR_CORE_BIN.")
         raise SystemExit(1)
     return binary
 
