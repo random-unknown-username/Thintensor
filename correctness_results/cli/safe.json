@@ -140,12 +140,12 @@
   "hf_equivalent": false,
   "hf_reference_device": "cuda",
   "hf_reference_mode": "full_recompute_causal",
-  "kernel_backend": "torch",
+  "kernel_backend": "triton-matvec",
   "kv_block_size": 16,
   "kv_residency": "gpu_full",
   "lm_head_fp8": false,
   "lm_head_int4_group_size": 0,
-  "minimum_cosine_similarity": 0.9991410374641418,
+  "minimum_cosine_similarity": 0.9996573328971863,
   "minimum_top5_overlap": 0.8,
   "mlp_fp8": false,
   "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
@@ -171,7 +171,7 @@
   "records": [
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.9998488426208496,
+      "cosine_similarity": 0.9996664524078369,
       "decode_step": 1,
       "generated_hf_tokens": [
         47111
@@ -206,8 +206,8 @@
       "kv_retention_exact": true,
       "kv_tokens_attended": 1,
       "kv_tokens_expected": 1,
-      "max_abs_logit_error": 0.078125,
-      "mean_abs_logit_error": 0.01425519585609436,
+      "max_abs_logit_error": 0.11328125,
+      "mean_abs_logit_error": 0.02030990645289421,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 1,
@@ -242,7 +242,7 @@
     },
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.9999767541885376,
+      "cosine_similarity": 0.9999927282333374,
       "decode_step": 10,
       "generated_hf_tokens": [
         47111,
@@ -263,12 +263,12 @@
         187,
         187,
         42,
-        717,
+        452,
         4028,
         281,
         368
       ],
-      "generated_token_match_rate": 1.0,
+      "generated_token_match_rate": 0.9,
       "hf_top5": [
         {
           "logit": 15.0,
@@ -295,8 +295,8 @@
       "kv_retention_exact": true,
       "kv_tokens_attended": 10,
       "kv_tokens_expected": 10,
-      "max_abs_logit_error": 0.1875,
-      "mean_abs_logit_error": 0.030808432027697563,
+      "max_abs_logit_error": 0.125,
+      "mean_abs_logit_error": 0.020640889182686806,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 1,
@@ -304,7 +304,7 @@
       "reason_not_equivalent": null,
       "thin_top5": [
         {
-          "logit": 15.0,
+          "logit": 15.0625,
           "token_id": 368
         },
         {
@@ -316,7 +316,7 @@
           "token_id": 1642
         },
         {
-          "logit": 13.1875,
+          "logit": 13.125,
           "token_id": 2748
         },
         {
@@ -331,7 +331,7 @@
     },
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.9998517036437988,
+      "cosine_similarity": 0.999855101108551,
       "decode_step": 1,
       "generated_hf_tokens": [
         47111
@@ -367,7 +367,7 @@
       "kv_tokens_attended": 128,
       "kv_tokens_expected": 128,
       "max_abs_logit_error": 0.09375,
-      "mean_abs_logit_error": 0.014036213979125023,
+      "mean_abs_logit_error": 0.013807316310703754,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 128,
@@ -402,7 +402,7 @@
     },
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.9991410374641418,
+      "cosine_similarity": 0.9996573328971863,
       "decode_step": 10,
       "generated_hf_tokens": [
         47111,
@@ -455,8 +455,8 @@
       "kv_retention_exact": true,
       "kv_tokens_attended": 137,
       "kv_tokens_expected": 137,
-      "max_abs_logit_error": 0.51171875,
-      "mean_abs_logit_error": 0.0880032405257225,
+      "max_abs_logit_error": 0.375,
+      "mean_abs_logit_error": 0.063313327729702,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 128,
@@ -464,24 +464,24 @@
       "reason_not_equivalent": null,
       "thin_top5": [
         {
-          "logit": 10.0625,
+          "logit": 10.0,
           "token_id": 5996
         },
         {
-          "logit": 9.5625,
-          "token_id": 783
-        },
-        {
-          "logit": 9.5625,
-          "token_id": 1201
-        },
-        {
-          "logit": 9.5625,
+          "logit": 9.625,
           "token_id": 936
         },
         {
-          "logit": 9.1875,
-          "token_id": 10186
+          "logit": 9.625,
+          "token_id": 783
+        },
+        {
+          "logit": 9.5,
+          "token_id": 1201
+        },
+        {
+          "logit": 9.375,
+          "token_id": 1542
         }
       ],
       "token_trajectory": "hf_greedy_teacher_forced",

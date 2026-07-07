@@ -5834,6 +5834,7 @@ class ThinGpuCausalLMRuntime:
             rotary_dim == self.head_dim
             and self.fused_rope_enabled
             and self.kernel_backend is not None
+            and cos.ndim == 1
         ):
             return self.kernel_backend.rope_qk_inplace(
                 q,
@@ -5850,20 +5851,12 @@ class ThinGpuCausalLMRuntime:
         if rotary_dim == self.head_dim:
             q_first, q_second = q_heads[:, :half], q_heads[:, half:]
             k_first, k_second = k_heads[:, :half], k_heads[:, half:]
-            q = torch.cat(
-                (
-                    q_first * cos - q_second * sin,
-                    q_second * cos + q_first * sin,
-                ),
-                dim=-1,
-            ).reshape(-1)
-            k = torch.cat(
-                (
-                    k_first * cos - k_second * sin,
-                    k_second * cos + k_first * sin,
-                ),
-                dim=-1,
-            ).reshape(-1)
+            q_first_copy = q_first.clone()
+            q_first.mul_(cos).sub_(q_second * sin)
+            q_second.mul_(cos).add_(q_first_copy * sin)
+            k_first_copy = k_first.clone()
+            k_first.mul_(cos).sub_(k_second * sin)
+            k_second.mul_(cos).add_(k_first_copy * sin)
             return q, k
 
         q_rot, q_pass = q_heads[:, :rotary_dim], q_heads[:, rotary_dim:]
@@ -6136,35 +6129,25 @@ class ThinGpuCausalLMRuntime:
                 if hasattr(self.weights, "prefetch_layer"):
                     self.weights.prefetch_layer(layer + distance)
             self._capture_debug(layer, "post_input_rmsnorm", normed)
-            if self.kernel_backend is not None:
-                qkv_out = self._moe_qkv_buffer
-                q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
-                k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
-                v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
-                self.kernel_backend.multi_matvec((q_proj, k_proj, v_proj), normed, qkv_out)
-                q = qkv_out[:self.q_dim]
-                k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
-                v = qkv_out[self.q_dim + self.kv_dim :]
-            else:
-                qkv_weight_id = f"model.layers.{layer}.self_attn.qkv_fused.weight"
-                if getattr(self.weights, "_use_tensor_cache", False):
-                    try:
-                        qkv_weight = self.weights._cached_tensors[qkv_weight_id]
-                    except KeyError:
-                        q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
-                        k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
-                        v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
-                        qkv_weight = torch.cat((q_proj, k_proj, v_proj), dim=0)
-                        self.weights._cached_tensors[qkv_weight_id] = qkv_weight
-                else:
+            qkv_weight_id = f"model.layers.{layer}.self_attn.qkv_fused.weight"
+            if getattr(self.weights, "_use_tensor_cache", False):
+                try:
+                    qkv_weight = self.weights._cached_tensors[qkv_weight_id]
+                except KeyError:
                     q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
                     k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
                     v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
                     qkv_weight = torch.cat((q_proj, k_proj, v_proj), dim=0)
-                qkv_out = torch.mv(qkv_weight, normed)
-                q = qkv_out[:self.q_dim]
-                k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
-                v = qkv_out[self.q_dim + self.kv_dim :]
+                    self.weights._cached_tensors[qkv_weight_id] = qkv_weight
+            else:
+                q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
+                k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
+                v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
+                qkv_weight = torch.cat((q_proj, k_proj, v_proj), dim=0)
+            qkv_out = torch.mv(qkv_weight, normed)
+            q = qkv_out[:self.q_dim]
+            k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
+            v = qkv_out[self.q_dim + self.kv_dim :]
             for projected, suffix in (
                 (q, "self_attn.q_proj.bias"),
                 (k, "self_attn.k_proj.bias"),

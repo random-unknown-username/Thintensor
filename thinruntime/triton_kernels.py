@@ -1770,12 +1770,8 @@ def _rope_qk_inplace_kernel(
     head = tl.program_id(0)
     offs = tl.arange(0, BLOCK_HALF)
     mask = offs < HALF
-    cos_values = tl.load(cos + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    sin_values = tl.load(sin + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    cos_values = tl.load(cos + offs, mask=mask, other=0.0)
+    sin_values = tl.load(sin + offs, mask=mask, other=0.0)
 
     q_mask = mask & (head < heads)
     q_base = head * head_dim
@@ -1783,23 +1779,14 @@ def _rope_qk_inplace_kernel(
         q + q_base + offs,
         mask=q_mask,
         other=0.0,
-    ).to(tl.float32)
+    )
     q_second = tl.load(
         q + q_base + HALF + offs,
         mask=q_mask,
         other=0.0,
-    ).to(tl.float32)
-    # PyTorch BF16 performs and rounds each multiply before add/subtract.
-    q_first_cos = (q_first * cos_values).to(tl.bfloat16)
-    q_second_sin = (q_second * sin_values).to(tl.bfloat16)
-    q_second_cos = (q_second * cos_values).to(tl.bfloat16)
-    q_first_sin = (q_first * sin_values).to(tl.bfloat16)
-    q_out_first = (
-        q_first_cos.to(tl.float32) - q_second_sin.to(tl.float32)
-    ).to(tl.bfloat16)
-    q_out_second = (
-        q_second_cos.to(tl.float32) + q_first_sin.to(tl.float32)
-    ).to(tl.bfloat16)
+    )
+    q_out_first = q_first * cos_values - q_second * sin_values
+    q_out_second = q_second * cos_values + q_first * sin_values
     tl.store(q + q_base + offs, q_out_first, mask=q_mask)
     tl.store(q + q_base + HALF + offs, q_out_second, mask=q_mask)
 
@@ -1809,22 +1796,14 @@ def _rope_qk_inplace_kernel(
         k + k_base + offs,
         mask=k_mask,
         other=0.0,
-    ).to(tl.float32)
+    )
     k_second = tl.load(
         k + k_base + HALF + offs,
         mask=k_mask,
         other=0.0,
-    ).to(tl.float32)
-    k_first_cos = (k_first * cos_values).to(tl.bfloat16)
-    k_second_sin = (k_second * sin_values).to(tl.bfloat16)
-    k_second_cos = (k_second * cos_values).to(tl.bfloat16)
-    k_first_sin = (k_first * sin_values).to(tl.bfloat16)
-    k_out_first = (
-        k_first_cos.to(tl.float32) - k_second_sin.to(tl.float32)
-    ).to(tl.bfloat16)
-    k_out_second = (
-        k_second_cos.to(tl.float32) + k_first_sin.to(tl.float32)
-    ).to(tl.bfloat16)
+    )
+    k_out_first = k_first * cos_values - k_second * sin_values
+    k_out_second = k_second * cos_values + k_first * sin_values
     tl.store(k + k_base + offs, k_out_first, mask=k_mask)
     tl.store(k + k_base + HALF + offs, k_out_second, mask=k_mask)
 

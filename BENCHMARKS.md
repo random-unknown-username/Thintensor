@@ -48,19 +48,19 @@ order of two tied entries differed.
 | Qwen3.5-0.8B | balanced | 114.49 | 1.450 | 0.999811 | yes | no | no |
 | Qwen3.5-0.8B | max-performance | 115.91 | 1.453 | 0.999811 | yes | no | no |
 | Qwen3.5-0.8B | lab | 105.12 | 1.450 | 0.999811 | yes | no | no |
-| Qwen3.5-0.8B | max-max-perf | 110.66 | 1.444 | 0.997078 | yes | yes | no |
+| Qwen3.5-0.8B | max-max-perf | 145.08 | 1.444 | 0.997078 | yes | yes | no |
 | Qwen3.5-0.8B | Transformers | 64.33 | 1.452 | 1.000000 | yes | yes | yes |
 | Gemma-4-E2B | safe | 35.05 | 6.490 | n/a | n/a | n/a | n/a |
 | Gemma-4-E2B | balanced | 34.26 | 6.490 | n/a | n/a | n/a | n/a |
 | Gemma-4-E2B | max-performance | 34.24 | 6.490 | 0.999090 | yes | yes | no |
 | Gemma-4-E2B | lab | 35.02 | 6.490 | n/a | n/a | n/a | n/a |
-| Gemma-4-E2B | max-max-perf | 33.30 | 6.497 | n/a | n/a | n/a | n/a |
+| Gemma-4-E2B | max-max-perf | 37.48 | 6.49 | n/a | n/a | n/a | n/a |
 | Gemma-4-E2B | Transformers | 1.60 | 6.620 | 1.000000 | yes | yes | yes |
 | OLMoE-1B-7B-0924-Instruct | safe | 8.99 | 6.935 | n/a | n/a | n/a | n/a |
 | OLMoE-1B-7B-0924-Instruct | balanced | 30.65 | 6.832 | n/a | n/a | n/a | n/a |
 | OLMoE-1B-7B-0924-Instruct | max-performance | 31.28 | 6.772 | 0.998586 | yes | yes | no |
 | OLMoE-1B-7B-0924-Instruct | lab | 10.23 | 6.935 | n/a | n/a | n/a | n/a |
-| OLMoE-1B-7B-0924-Instruct | max-max-perf | 31.95 | 6.700 | 0.998586 | yes | yes | no |
+| OLMoE-1B-7B-0924-Instruct | max-max-perf | 29.49 | 6.78 | 0.998586 | yes | yes | no |
 | OLMoE-1B-7B-0924-Instruct | Transformers | 1.60 | 6.450 | 1.000000 | yes | yes | yes |
 
 Quality rows are the minimum across the public quick suite at prefill lengths

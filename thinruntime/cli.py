@@ -1027,7 +1027,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
         budget_text="0",
         auto_quant="off",
     )
-    if auto_fit_plan.residency == "stream":
+    if auto_fit_plan.residency == "stream" and not profile.get("exact_prefill", False):
         runtime_flags.extend([
             "--weight-residency", "stream",
             "--gpu-weight-budget", str(auto_fit_plan.weight_budget_bytes)
