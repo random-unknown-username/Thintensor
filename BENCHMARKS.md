@@ -30,6 +30,8 @@ strict top-5 set. At 1,000-token prefill and decode step 50, it retained all
 1,049 KV positions, reached 0.999835 cosine, and matched the top-5 set; the
 order of two tied entries differed.
 
+Gemma2 is really slow rn ik, its a older and a kind of bad arch for our case
+
 ## Every public profile on the newly added architectures
 
 | Model | Profile | Thin tok/s | Peak GiB | Min cosine | Top-1 | Top-5 set | Top-5 order |
