@@ -5013,13 +5013,8 @@ class ThinGpuCausalLMRuntime:
                     layer, "per_layer_input_gate.weight"
                 )
             )
-            if self.kernel_backend is not None and self.gemma4_triton_ple:
-                assert self._gemma4_ple_gate_buffer is not None
-                ple_gate = self._runtime_matvec(
-                    ple_gate_weight,
-                    hidden,
-                    self._gemma4_ple_gate_buffer,
-                )
+            if self._gemma4_ple_gate_buffer is not None:
+                ple_gate = torch.mv(ple_gate_weight, hidden, out=self._gemma4_ple_gate_buffer)
             else:
                 ple_gate = torch.mv(ple_gate_weight, hidden)
             ple_gate = torch.nn.functional.gelu(
@@ -5031,13 +5026,8 @@ class ThinGpuCausalLMRuntime:
                     layer, "per_layer_projection.weight"
                 )
             )
-            if self.kernel_backend is not None and self.gemma4_triton_ple:
-                assert self._gemma4_projection_buffer is not None
-                ple = self._runtime_matvec(
-                    ple_projection,
-                    ple_gate,
-                    self._gemma4_projection_buffer,
-                )
+            if self._gemma4_projection_buffer is not None:
+                ple = torch.mv(ple_projection, ple_gate, out=self._gemma4_projection_buffer)
             else:
                 ple = torch.mv(ple_projection, ple_gate)
             ple = self._normalization(
@@ -5244,18 +5234,18 @@ class ThinGpuCausalLMRuntime:
             source_layer = self._gemma4_shared_source[layer_type]
 
         keys = torch.stack(
-            self._gemma4_key_history[source_layer], dim=1
+            self._gemma4_key_history[source_layer], dim=2
         )
         values = torch.stack(
             self._gemma4_value_history[source_layer], dim=1
         )
-        if not is_full and keys.shape[1] > 512:
-            keys = keys[:, -512:]
+        if not is_full and keys.shape[2] > 512:
+            keys = keys[..., -512:]
             values = values[:, -512:]
-        self._last_kv_tokens_attended = int(keys.shape[1])
+        self._last_kv_tokens_attended = int(keys.shape[2])
         group = self.heads // int(keys.shape[0])
         query = q.reshape(int(keys.shape[0]), group, head_dim)
-        scores = torch.matmul(query, keys.transpose(1, 2))
+        scores = torch.matmul(query, keys)
         probabilities = torch.softmax(
             scores, dim=-1, dtype=torch.float32
         ).to(dtype=hidden.dtype)
@@ -5263,13 +5253,8 @@ class ThinGpuCausalLMRuntime:
         o_weight = self.weights.tensor(
             _layer_tensor(layer, "self_attn.o_proj.weight")
         )
-        if self.kernel_backend is not None and self.gemma4_triton_attention:
-            assert self._gemma4_projection_buffer is not None
-            return self._runtime_matvec(
-                o_weight,
-                mixed,
-                self._gemma4_projection_buffer,
-            )
+        if self._gemma4_projection_buffer is not None:
+            return torch.mv(o_weight, mixed, out=self._gemma4_projection_buffer)
         return torch.mv(o_weight, mixed)
 
     def _gemma4_head_norm(
