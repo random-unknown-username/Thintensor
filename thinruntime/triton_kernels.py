@@ -1687,13 +1687,14 @@ def _rms_norm_kernel(
     n: tl.constexpr,
     eps: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    weight_offset: tl.constexpr = 0.0,
 ) -> None:
     offs = tl.arange(0, BLOCK_N)
     mask = offs < n
     xv = tl.load(x + offs, mask=mask, other=0.0).to(tl.float32)
     wv = tl.load(weight + offs, mask=mask, other=0.0).to(tl.float32)
     mean = tl.sum(xv * xv, axis=0) / n
-    out = xv * tl.rsqrt(mean + eps) * wv
+    out = xv * tl.rsqrt(mean + eps) * (wv + weight_offset)
     tl.store(y + offs, out, mask=mask)
 
 
@@ -3997,7 +3998,7 @@ class TritonDecodeBackend:
             "matvec_argmax() synchronizes CUDA; use matvec_argmax_tensor()"
         )
 
-    def rms_norm(self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float) -> torch.Tensor:
+    def rms_norm(self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float, weight_offset: float = 0.0) -> torch.Tensor:
         n = x.numel()
         _rms_norm_kernel[(1,)](
             x,
@@ -4006,6 +4007,7 @@ class TritonDecodeBackend:
             n,
             eps,
             BLOCK_N=triton.next_power_of_2(n),
+            weight_offset=weight_offset,
             num_warps=8,
         )
         return out

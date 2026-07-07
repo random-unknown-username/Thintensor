@@ -5247,13 +5247,11 @@ class ThinGpuCausalLMRuntime:
         self._last_kv_tokens_attended = int(keys.shape[1])
         group = self.heads // int(keys.shape[0])
         query = q.reshape(int(keys.shape[0]), group, head_dim)
-        scores = torch.einsum("kgd,ktd->kgt", query, keys)
+        scores = torch.matmul(query, keys.transpose(1, 2))
         probabilities = torch.softmax(
             scores, dim=-1, dtype=torch.float32
         ).to(dtype=hidden.dtype)
-        mixed = torch.einsum(
-            "kgt,ktd->kgd", probabilities, values
-        ).reshape(-1)
+        mixed = torch.matmul(probabilities, values).reshape(-1)
         o_weight = self.weights.tensor(
             _layer_tensor(layer, "self_attn.o_proj.weight")
         )
@@ -6059,7 +6057,7 @@ class ThinGpuCausalLMRuntime:
 
         if lev is not None:
             lev.qk_start.record()
-        scores = torch.einsum("kgd,ktd->kgt", query, keys)
+        scores = torch.matmul(query, keys.transpose(1, 2))
         scores.mul_(
             self.attention_scale
             if self.attention_scale is not None
@@ -6097,7 +6095,7 @@ class ThinGpuCausalLMRuntime:
         if lev is not None:
             lev.softmax_end.record()
             lev.value_mix_start.record()
-        mixed = torch.einsum("kgt,ktd->kgd", probabilities, values)
+        mixed = torch.matmul(probabilities, values)
         self._capture_debug(
             layer,
             "attention_output_before_o_proj",
@@ -6115,43 +6113,64 @@ class ThinGpuCausalLMRuntime:
         layer_count: int,
         token_index: int,
     ) -> torch.Tensor:
+        if getattr(self, "_moe_qkv_buffer", None) is None:
+            self._moe_qkv_buffer = torch.empty(
+                (int(self.q_dim + 2 * self.kv_dim),),
+                device=self.device,
+                dtype=embed.dtype,
+            )
         hidden = embed[token_id].clone()
         if self.embedding_scale != 1.0:
             hidden.mul_(
                 torch.tensor(
-                    self.embedding_scale,
-                    device=hidden.device,
-                    dtype=hidden.dtype,
+                     self.embedding_scale,
+                     device=hidden.device,
+                     dtype=hidden.dtype,
                 )
             )
+        if getattr(self, "_moe_next_hidden_buffer", None) is None:
+            self._moe_next_hidden_buffer = torch.empty_like(hidden)
+            self._moe_normed_buffer = torch.empty_like(hidden)
+        hidden_a = hidden
+        hidden_b = self._moe_next_hidden_buffer
+        normed = self._normalization(
+            hidden_a,
+            _layer_tensor(0, "input_layernorm.weight"),
+        )
         for layer in range(layer_count):
-            self._capture_debug(layer, "layer_input", hidden)
+            self._capture_debug(layer, "layer_input", hidden_a)
             for distance in range(1, self.prefetch_distance + 1):
                 if hasattr(self.weights, "prefetch_layer"):
                     self.weights.prefetch_layer(layer + distance)
-            normed = self._normalization(
-                hidden,
-                _layer_tensor(layer, "input_layernorm.weight"),
-            )
             self._capture_debug(layer, "post_input_rmsnorm", normed)
-            q = torch.mv(
-                self.weights.tensor(
-                    _layer_tensor(layer, "self_attn.q_proj.weight")
-                ),
-                normed,
-            )
-            k = torch.mv(
-                self.weights.tensor(
-                    _layer_tensor(layer, "self_attn.k_proj.weight")
-                ),
-                normed,
-            )
-            v = torch.mv(
-                self.weights.tensor(
-                    _layer_tensor(layer, "self_attn.v_proj.weight")
-                ),
-                normed,
-            )
+            if self.kernel_backend is not None:
+                qkv_out = self._moe_qkv_buffer
+                q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
+                k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
+                v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
+                self.kernel_backend.multi_matvec((q_proj, k_proj, v_proj), normed, qkv_out)
+                q = qkv_out[:self.q_dim]
+                k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
+                v = qkv_out[self.q_dim + self.kv_dim :]
+            else:
+                q = torch.mv(
+                    self.weights.tensor(
+                        _layer_tensor(layer, "self_attn.q_proj.weight")
+                    ),
+                    normed,
+                )
+                k = torch.mv(
+                    self.weights.tensor(
+                        _layer_tensor(layer, "self_attn.k_proj.weight")
+                    ),
+                    normed,
+                )
+                v = torch.mv(
+                    self.weights.tensor(
+                        _layer_tensor(layer, "self_attn.v_proj.weight")
+                    ),
+                    normed,
+                )
             for projected, suffix in (
                 (q, "self_attn.q_proj.bias"),
                 (k, "self_attn.k_proj.bias"),
@@ -6235,25 +6254,55 @@ class ThinGpuCausalLMRuntime:
             )
             if o_bias is not None:
                 attention_output.add_(o_bias)
-            hidden = hidden + attention_output
-            self._capture_debug(layer, "post_attention_residual", hidden)
-
-            normed = self._normalization(
-                hidden,
-                _layer_tensor(
-                    layer,
-                    "post_attention_layernorm.weight",
-                ),
-            )
+            
+            if self.kernel_backend is not None:
+                self.kernel_backend.add_rms_norm(
+                    hidden_a,
+                    attention_output,
+                    hidden_b,
+                    self.weights.tensor(_layer_tensor(layer, "post_attention_layernorm.weight")),
+                    self._moe_normed_buffer,
+                    self.rms_norm_eps,
+                )
+                normed = self._moe_normed_buffer
+            else:
+                hidden_b.copy_(hidden_a + attention_output)
+                normed = self._normalization(
+                    hidden_b,
+                    _layer_tensor(
+                        layer,
+                        "post_attention_layernorm.weight",
+                    ),
+                )
+            self._capture_debug(layer, "post_attention_residual", hidden_b)
             self._capture_debug(layer, "post_attention_rmsnorm", normed)
             moe = self._packed_moe_forward(layer, normed)
-            hidden = hidden + moe
-            self._capture_debug(layer, "final_residual_after_mlp", hidden)
+            
+            if layer < layer_count - 1:
+                if self.kernel_backend is not None:
+                    self.kernel_backend.add_rms_norm(
+                        hidden_b,
+                        moe,
+                        hidden_a,
+                        self.weights.tensor(_layer_tensor(layer + 1, "input_layernorm.weight")),
+                        self._moe_normed_buffer,
+                        self.rms_norm_eps,
+                    )
+                    normed = self._moe_normed_buffer
+                else:
+                    hidden_a.copy_(hidden_b + moe)
+                    normed = self._normalization(
+                        hidden_a,
+                        _layer_tensor(layer + 1, "input_layernorm.weight"),
+                    )
+            else:
+                hidden_a.copy_(hidden_b + moe)
+            self._capture_debug(layer, "final_residual_after_mlp", hidden_a)
             if self.evict_completed_layers and hasattr(
                 self.weights, "evict_completed_layer"
             ):
                 self.weights.evict_completed_layer(layer)
-        return self._normalization(hidden, "model.norm.weight")
+        return self._normalization(hidden_a, "model.norm.weight")
 
     def _packed_moe_forward(
         self,
@@ -6307,7 +6356,11 @@ class ThinGpuCausalLMRuntime:
             _layer_tensor(layer, "mlp.experts.gate_up_proj"),
         )
         if gate_up is not None:
-            selected_gate_up = gate_up.index_select(0, router_indices)
+            if top_k == 1:
+                idx = int(router_indices[0])
+                selected_gate_up = gate_up[idx]
+            else:
+                selected_gate_up = gate_up.index_select(0, router_indices)
         else:
             gate_blocks = _optional_tensor(
                 self.weights,
@@ -6343,25 +6396,25 @@ class ThinGpuCausalLMRuntime:
                     self._moe_gate_up_buffer,
                 )
             else:
-                selected_gate_up = _dequantize_mxfp4(
-                    gate_blocks.index_select(0, router_indices),
-                    gate_scales.index_select(0, router_indices),
-                    dtype=hidden.dtype,
-                )
+                if top_k == 1:
+                    idx = int(router_indices[0])
+                    selected_gate_up = _dequantize_mxfp4(
+                        gate_blocks[idx],
+                        gate_scales[idx],
+                        dtype=hidden.dtype,
+                    )
+                else:
+                    selected_gate_up = _dequantize_mxfp4(
+                        gate_blocks.index_select(0, router_indices),
+                        gate_scales.index_select(0, router_indices),
+                        dtype=hidden.dtype,
+                    )
         if selected_gate_up.ndim == 2:
-            gate_up_output = selected_gate_up
+            gate_up_output = torch.mv(selected_gate_up, hidden)
         elif selected_gate_up.shape[1] == hidden.numel():
-            gate_up_output = torch.einsum(
-                "khm,h->km",
-                selected_gate_up,
-                hidden,
-            )
+            gate_up_output = torch.matmul(selected_gate_up.transpose(1, 2), hidden)
         elif selected_gate_up.shape[2] == hidden.numel():
-            gate_up_output = torch.einsum(
-                "kmh,h->km",
-                selected_gate_up,
-                hidden,
-            )
+            gate_up_output = torch.matmul(selected_gate_up, hidden)
         else:
             raise RuntimeError(
                 f"unsupported packed gate/up shape {selected_gate_up.shape}"
@@ -6371,17 +6424,30 @@ class ThinGpuCausalLMRuntime:
             _layer_tensor(layer, "mlp.experts.gate_up_proj_bias"),
         )
         if gate_up_bias is not None:
-            gate_up_output.add_(
-                gate_up_bias.index_select(0, router_indices)
-            )
+            if top_k == 1:
+                idx = int(router_indices[0])
+                gate_up_output.add_(gate_up_bias[idx])
+            else:
+                gate_up_output.add_(
+                    gate_up_bias.index_select(0, router_indices)
+                )
         if self.descriptor.swiglu_limit is not None:
-            gate = gate_up_output[:, 0::2].clamp(
-                max=self.descriptor.swiglu_limit
-            )
-            up = gate_up_output[:, 1::2].clamp(
-                min=-self.descriptor.swiglu_limit,
-                max=self.descriptor.swiglu_limit,
-            )
+            if top_k == 1:
+                gate = gate_up_output[0::2].clamp(
+                    max=self.descriptor.swiglu_limit
+                )
+                up = gate_up_output[1::2].clamp(
+                    min=-self.descriptor.swiglu_limit,
+                    max=self.descriptor.swiglu_limit,
+                )
+            else:
+                gate = gate_up_output[:, 0::2].clamp(
+                    max=self.descriptor.swiglu_limit
+                )
+                up = gate_up_output[:, 1::2].clamp(
+                    min=-self.descriptor.swiglu_limit,
+                    max=self.descriptor.swiglu_limit,
+                )
             activation = (
                 (up + 1)
                 * gate
@@ -6396,7 +6462,11 @@ class ThinGpuCausalLMRuntime:
             _layer_tensor(layer, "mlp.experts.down_proj"),
         )
         if down is not None:
-            selected_down = down.index_select(0, router_indices)
+            if top_k == 1:
+                idx = int(router_indices[0])
+                selected_down = down[idx]
+            else:
+                selected_down = down.index_select(0, router_indices)
         else:
             down_blocks = _optional_tensor(
                 self.weights,
@@ -6424,24 +6494,26 @@ class ThinGpuCausalLMRuntime:
                 )
                 selected_down = None
             else:
-                selected_down = _dequantize_mxfp4(
-                    down_blocks.index_select(0, router_indices),
-                    down_scales.index_select(0, router_indices),
-                    dtype=hidden.dtype,
-                )
+                if top_k == 1:
+                    idx = int(router_indices[0])
+                    selected_down = _dequantize_mxfp4(
+                        down_blocks[idx],
+                        down_scales[idx],
+                        dtype=hidden.dtype,
+                    )
+                else:
+                    selected_down = _dequantize_mxfp4(
+                        down_blocks.index_select(0, router_indices),
+                        down_scales.index_select(0, router_indices),
+                        dtype=hidden.dtype,
+                    )
         if selected_down is not None:
-            if selected_down.shape[1] == activation.shape[1]:
-                expert_output = torch.einsum(
-                    "kih,ki->kh",
-                    selected_down,
-                    activation,
-                )
+            if selected_down.ndim == 2:
+                expert_output = torch.mv(selected_down, activation)
+            elif selected_down.shape[1] == activation.shape[1]:
+                expert_output = torch.matmul(selected_down.transpose(1, 2), activation.unsqueeze(-1)).squeeze(-1)
             elif selected_down.shape[2] == activation.shape[1]:
-                expert_output = torch.einsum(
-                    "khi,ki->kh",
-                    selected_down,
-                    activation,
-                )
+                expert_output = torch.matmul(selected_down, activation.unsqueeze(-1)).squeeze(-1)
             else:
                 raise RuntimeError(
                     f"unsupported packed down shape {selected_down.shape}"
@@ -6451,13 +6523,20 @@ class ThinGpuCausalLMRuntime:
             _layer_tensor(layer, "mlp.experts.down_proj_bias"),
         )
         if down_bias is not None:
-            expert_output.add_(
-                down_bias.index_select(0, router_indices)
-            )
-        return torch.sum(
-            expert_output * router_scores[:, None],
-            dim=0,
-        ).to(dtype=hidden.dtype)
+            if top_k == 1:
+                idx = int(router_indices[0])
+                expert_output.add_(down_bias[idx])
+            else:
+                expert_output.add_(
+                    down_bias.index_select(0, router_indices)
+                )
+        if top_k == 1:
+            return (expert_output * router_scores[0]).to(dtype=hidden.dtype)
+        else:
+            return torch.sum(
+                expert_output * router_scores[:, None],
+                dim=0,
+            ).to(dtype=hidden.dtype)
 
     def _separate_expert_moe_forward(
         self,
@@ -8827,6 +8906,16 @@ class ThinGpuCausalLMRuntime:
         weight_id: str,
     ) -> torch.Tensor:
         if self.norm_kind == "rms_norm":
+            weight = self.weights.tensor(weight_id)
+            if self.kernel_backend is not None:
+                out = torch.empty_like(x)
+                return self.kernel_backend.rms_norm(
+                    x,
+                    weight,
+                    out,
+                    self.norm_eps,
+                    weight_offset=self.norm_weight_offset,
+                )
             if self.norm_weight_offset:
                 cache_key = f"{weight_id}_offsetted"
                 if getattr(self, "_use_tensor_cache", False):
@@ -8843,7 +8932,6 @@ class ThinGpuCausalLMRuntime:
                 normed = work * torch.rsqrt(work.pow(2).mean() + self.norm_eps)
                 return normed.to(dtype=x.dtype) * weight
             else:
-                weight = self.weights.tensor(weight_id)
                 return _rms_norm(
                     x,
                     weight,
@@ -8873,20 +8961,12 @@ class ThinGpuCausalLMRuntime:
         backend = self.kernel_backend
         assert backend is not None
         if self.norm_kind == "rms_norm":
-            if self.norm_weight_offset:
-                value = _rms_norm(
-                    x,
-                    weight,
-                    self.norm_eps,
-                    weight_offset=self.norm_weight_offset,
-                )
-                out.copy_(value)
-                return out
             return backend.rms_norm(
                 x,
                 weight,
                 out,
                 self.norm_eps,
+                weight_offset=self.norm_weight_offset,
             )
         bias = _optional_tensor(
             self.weights,
