@@ -1020,6 +1020,18 @@ def cmd_validate(args: argparse.Namespace) -> None:
     runtime_flags = [
         flag for flag in runtime_flags if flag != "--keep-bf16-lm-head"
     ]
+    auto_fit_plan = _automatic_fit_plan(
+        str(archive),
+        device=args.device,
+        context=128 if args.suite == "quick" else 512,
+        budget_text="0",
+        auto_quant="off",
+    )
+    if auto_fit_plan.residency == "stream":
+        runtime_flags.extend([
+            "--weight-residency", "stream",
+            "--gpu-weight-budget", str(auto_fit_plan.weight_budget_bytes)
+        ])
     report_path = Path(args.out)
     if not args.dry_run:
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1813,7 +1825,7 @@ def _profile_auto_quant_mode(profile: dict[str, Any], requested: str) -> str:
     name = str(profile.get("name") or "balanced")
     if name in {"safe", "lab"}:
         return "off"
-    if name == "max-performance":
+    if name in {"max-performance", "max-max-perf"}:
         return "aggressive"
     return "on"
 
@@ -2027,13 +2039,22 @@ def _load_transformers_model(
             dtype=_parse_dtype(dtype),
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_source,
-            dtype=_parse_dtype(dtype),
-            low_cpu_mem_usage=True,
-            trust_remote_code=trust_remote_code,
-        )
-        model.to(torch.device(device))
+        if "cuda" in str(device):
+            model = AutoModelForCausalLM.from_pretrained(
+                model_source,
+                torch_dtype=_parse_dtype(dtype),
+                low_cpu_mem_usage=True,
+                trust_remote_code=trust_remote_code,
+                device_map="auto",
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_source,
+                dtype=_parse_dtype(dtype),
+                low_cpu_mem_usage=True,
+                trust_remote_code=trust_remote_code,
+            )
+            model.to(torch.device(device))
     model.eval()
     return model, tokenizer
 

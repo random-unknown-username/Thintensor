@@ -57,12 +57,20 @@ def run_single_trial(mode: str, hf_dir: Path, thin_file: Path, prompt: str, toke
         # Standard HF path
         tokenizer = AutoTokenizer.from_pretrained(hf_dir)
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(
-            hf_dir,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        model.to(device)
+        if "cuda" in str(device):
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_dir,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_dir,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+            model.to(device)
         model.eval()
         if device == "cuda":
             torch.cuda.synchronize()

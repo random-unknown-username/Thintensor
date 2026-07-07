@@ -97,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--down-proj-fp8", action="store_true")
     parser.add_argument("--gate-up-fp8", action="store_true")
     parser.add_argument("--fused-scaled-mlp", action="store_true")
+    parser.add_argument("--fused-residual-norm", action="store_true")
     parser.add_argument("--fused-rope", action="store_true")
     parser.add_argument(
         "--exact-prefill",
@@ -153,6 +154,76 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def should_load_on_cpu(model_path: str, device: torch.device) -> bool:
+    if "cuda" not in str(device):
+        return True
+    path = Path(model_path)
+    weight_size = 0
+    if path.is_dir():
+        for ext in ("*.safetensors", "*.bin", "*.pt"):
+            for f in path.glob(ext):
+                weight_size += f.stat().st_size
+    if weight_size == 0:
+        return False
+
+    total_vram = torch.cuda.get_device_properties(device).total_memory
+
+    # Check if Mixture of Experts (MoE) model
+    is_moe = False
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_path)
+        is_moe = (
+            getattr(config, "num_local_experts", 0) > 0
+            or getattr(config, "num_experts", 0) > 0
+            or "moe" in getattr(config, "model_type", "").lower()
+        )
+    except Exception:
+        pass
+
+    limit_fraction = 0.5 if is_moe else 0.8
+    if weight_size > total_vram * limit_fraction:
+        return True
+    return False
+
+
+def try_load_hf(args: argparse.Namespace, dtype: torch.dtype, device: torch.device):
+    if should_load_on_cpu(args.hf_model, device):
+        print("Model size or Mixture of Experts architecture indicates high OOM risk on GPU. Proactively offloading reference model to CPU.", file=sys.stderr)
+        return None, False
+
+    hf_model = None
+    try:
+        if "cuda" in str(device):
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                args.hf_model,
+                torch_dtype=dtype,
+                trust_remote_code=args.trust_remote_code,
+                device_map="auto",
+            )
+        else:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                args.hf_model,
+                torch_dtype=dtype,
+                trust_remote_code=args.trust_remote_code,
+            ).to(device)
+        hf_model.eval()
+
+        # Sanity test to ensure we don't OOM during actual trajectory run
+        if "cuda" in str(device):
+            with torch.inference_mode():
+                test_in = torch.zeros((1, 1), dtype=torch.long, device=device)
+                hf_model(test_in)
+        return hf_model, True
+    except (torch.OutOfMemoryError, RuntimeError) as e:
+        if "cuda" not in str(device):
+            raise
+        print(f"Warning: Loading/running HF model on GPU failed ({e}). Falling back to CPU/RAM for reference model.", file=sys.stderr)
+        if hf_model is not None:
+            del hf_model
+        return None, False
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -178,12 +249,29 @@ def main() -> None:
     hf_config_summary = summarize_hf_config(Path(args.hf_model))
 
     print(f"loading HF model {args.hf_model}", file=sys.stderr)
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        args.hf_model,
-        torch_dtype=dtype,
-        trust_remote_code=args.trust_remote_code,
-    ).to(device)
-    hf_model.eval()
+    hf_model, success = try_load_hf(args, dtype, device)
+    if not success:
+        # Force-release any leaked CUDA tensors from the failed load attempt
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                    if obj.device.type == 'cuda':
+                        obj.data = torch.empty(0)
+            except Exception:
+                pass
+        gc.collect()
+        torch.cuda.empty_cache()
+        hf_device = torch.device("cpu")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model,
+            torch_dtype=dtype,
+            trust_remote_code=args.trust_remote_code,
+            device_map={"": "cpu"},
+        )
+        hf_model.eval()
+    else:
+        hf_device = device
+
     hf_attention_implementation = getattr(
         hf_model.config, "_attn_implementation", "unknown"
     )
@@ -195,7 +283,7 @@ def main() -> None:
         for prefill_len, input_ids in input_ids_by_length.items():
             hf_runs[prefill_len] = run_hf_trajectory(
                 hf_model,
-                input_ids.to(device),
+                input_ids.to(hf_device),
                 requested_steps,
                 max_steps,
             )
@@ -233,14 +321,14 @@ def main() -> None:
         if args.find_first_divergence:
             hf_layer_trace = capture_hf_layer_trace(
                 hf_model,
-                debug_sequence.to(device),
+                debug_sequence.to(hf_device),
                 token_position=debug_token,
                 descriptor=hf_descriptor,
             )
         if detailed_debug_requested:
             hf_debug = capture_hf_components(
                 hf_model,
-                debug_sequence.to(device),
+                debug_sequence.to(hf_device),
                 layer_index=debug_layer,
                 token_position=debug_token,
                 descriptor=hf_descriptor,
@@ -345,6 +433,7 @@ def main() -> None:
                 kv_prefetch_pages=args.kv_prefetch_pages,
                 lm_head_backend=args.lm_head_backend,
                 fused_scaled_mlp=args.fused_scaled_mlp,
+                fused_residual_norm=args.fused_residual_norm,
                 fused_rope=args.fused_rope,
                 exact_prefill=args.exact_prefill,
                 split_k_down_proj=args.split_k_down_proj,
@@ -502,7 +591,8 @@ def run_hf_trajectory(
     # differ measurably from HF full recomputation in BF16 because prefill and
     # decode use different reduction shapes; that kernel-ordering drift must
     # not be misdiagnosed as a ThinTensor attention error.
-    current_ids = input_ids
+    device = next(model.parameters()).device
+    current_ids = input_ids.to(device)
     outputs = model(input_ids=current_ids, use_cache=False)
     logits = outputs.logits[0, -1].float()
     captured: dict[int, torch.Tensor] = {}
@@ -557,6 +647,7 @@ def run_thin_trajectory(
     kv_prefetch_pages: int,
     lm_head_backend: str | None,
     fused_scaled_mlp: bool,
+    fused_residual_norm: bool,
     fused_rope: bool,
     exact_prefill: bool,
     split_k_down_proj: bool,
@@ -625,6 +716,7 @@ def run_thin_trajectory(
             down_proj_fp8=down_proj_fp8,
             gate_up_fp8=gate_up_fp8,
             fused_scaled_mlp=fused_scaled_mlp,
+            fused_residual_norm=fused_residual_norm,
             fused_rope=fused_rope,
             split_k_down_proj=split_k_down_proj,
             attn_proj_fp8=attn_proj_fp8,
@@ -681,6 +773,7 @@ def run_thin_trajectory(
             down_proj_fp8=down_proj_fp8,
             gate_up_fp8=gate_up_fp8,
             fused_scaled_mlp=fused_scaled_mlp,
+            fused_residual_norm=fused_residual_norm,
             fused_rope=fused_rope,
             split_k_down_proj=split_k_down_proj,
             attn_proj_fp8=attn_proj_fp8,

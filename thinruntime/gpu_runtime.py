@@ -445,6 +445,10 @@ class ThinGpuWeights:
         self.archive = ThinArchive(self.archive_path, run_verify=verify)
         self.archive_open_s = time.perf_counter() - open_start
         self.tensors: Dict[str, torch.Tensor] = {}
+        self._cached_tensors: Dict[str, torch.Tensor] = {}
+        self._cached_optional_tensors: Dict[str, Optional[torch.Tensor]] = {}
+        self._cached_rowwise_scales: Dict[str, Optional[torch.Tensor]] = {}
+        self._use_tensor_cache = False
         self._rowwise_int8_scales: Dict[str, torch.Tensor] = {}
         self.rowwise_int8_original_bytes = 0
         self.page_specs: Dict[str, dict[str, Any]] = {
@@ -593,11 +597,27 @@ class ThinGpuWeights:
         return quantized
 
     def rowwise_int8_scale(self, page_id: str) -> Optional[torch.Tensor]:
-        return self._rowwise_int8_scales.get(page_id)
+        if getattr(self, "_use_tensor_cache", False):
+            try:
+                return self._cached_rowwise_scales[page_id]
+            except KeyError:
+                pass
+        val = self._rowwise_int8_scales.get(page_id)
+        if getattr(self, "_use_tensor_cache", False):
+            self._cached_rowwise_scales[page_id] = val
+        return val
 
     def tensor(self, page_id: str) -> torch.Tensor:
+        if getattr(self, "_use_tensor_cache", False):
+            try:
+                return self._cached_tensors[page_id]
+            except KeyError:
+                pass
         try:
-            return self.tensors[page_id]
+            val = self.tensors[page_id]
+            if getattr(self, "_use_tensor_cache", False):
+                self._cached_tensors[page_id] = val
+            return val
         except KeyError as exc:
             raise KeyError(f"ThinTensor GPU page {page_id} is not loaded") from exc
 
@@ -2528,6 +2548,10 @@ class ThinGpuCausalLMRuntime:
         mxfp4_row_postscale: bool = False,
     ) -> None:
         self.weights = weights
+        self._use_tensor_cache = (
+            not evict_completed_layers
+            and isinstance(weights, ThinGpuWeights)
+        )
         self.exact_hf_mode = exact_hf_mode
         self._adaptive_fp8_start_token = int(
             adaptive_body_int8_start_token
@@ -2764,8 +2788,11 @@ class ThinGpuCausalLMRuntime:
         )
         self.gemma4_triton_mlp = (
             self.is_gemma4
-            and os.environ.get("THINTENSOR_GEMMA4_TRITON_MLP", "0")
-            == "1"
+            and (
+                os.environ.get("THINTENSOR_GEMMA4_TRITON_MLP", "0") == "1"
+                or self.gate_up_fp8
+                or self.down_proj_fp8
+            )
         )
         self.gemma4_triton_ple = (
             self.is_gemma4
@@ -3448,6 +3475,8 @@ class ThinGpuCausalLMRuntime:
             _tensor_nbytes(weight)
             for weight in self._adaptive_exact_weights.values()
         )
+        if getattr(self, "_use_tensor_cache", False):
+            self.weights._use_tensor_cache = True
         self.body_fp8_memory_saved_bytes = max(
             0,
             self.body_fp8_original_bytes
@@ -8797,17 +8826,34 @@ class ThinGpuCausalLMRuntime:
         x: torch.Tensor,
         weight_id: str,
     ) -> torch.Tensor:
-        weight = self.weights.tensor(weight_id)
         if self.norm_kind == "rms_norm":
-            return _rms_norm(
-                x,
-                weight,
-                self.norm_eps,
-                weight_offset=self.norm_weight_offset,
-            )
+            if self.norm_weight_offset:
+                cache_key = f"{weight_id}_offsetted"
+                if getattr(self, "_use_tensor_cache", False):
+                    try:
+                        weight = self.weights._cached_tensors[cache_key]
+                    except KeyError:
+                        orig = self.weights.tensor(weight_id)
+                        weight = (orig.float() + self.norm_weight_offset).to(dtype=x.dtype)
+                        self.weights._cached_tensors[cache_key] = weight
+                else:
+                    orig = self.weights.tensor(weight_id)
+                    weight = (orig.float() + self.norm_weight_offset).to(dtype=x.dtype)
+                work = x.float()
+                normed = work * torch.rsqrt(work.pow(2).mean() + self.norm_eps)
+                return normed.to(dtype=x.dtype) * weight
+            else:
+                weight = self.weights.tensor(weight_id)
+                return _rms_norm(
+                    x,
+                    weight,
+                    self.norm_eps,
+                    weight_offset=0.0,
+                )
+        weight = self.weights.tensor(weight_id)
         bias = _optional_tensor(
             self.weights,
-            weight_id.removesuffix(".weight") + ".bias",
+            _get_bias_id(weight_id),
         )
         return torch.nn.functional.layer_norm(
             x,
@@ -9055,9 +9101,18 @@ def _optional_tensor(
     weights: ThinGpuWeights | ThinGpuPagePool,
     page_id: str,
 ) -> Optional[torch.Tensor]:
+    if getattr(weights, "_use_tensor_cache", False):
+        try:
+            return weights._cached_optional_tensors[page_id]
+        except KeyError:
+            pass
     if hasattr(weights, "has_page") and weights.has_page(page_id):
-        return weights.tensor(page_id)
-    return weights.tensors.get(page_id)
+        val = weights.tensor(page_id)
+    else:
+        val = weights.tensors.get(page_id)
+    if getattr(weights, "_use_tensor_cache", False):
+        weights._cached_optional_tensors[page_id] = val
+    return val
 
 
 def _has_page(
@@ -9270,8 +9325,27 @@ def _single_token_attention(
     return v.reshape(kv_heads, head_dim).repeat_interleave(group, dim=0).reshape(heads * head_dim)
 
 
+_LAYER_TENSOR_CACHE = {}
+
 def _layer_tensor(layer: int, suffix: str) -> str:
-    return f"model.layers.{layer}.{suffix}"
+    key = (layer, suffix)
+    try:
+        return _LAYER_TENSOR_CACHE[key]
+    except KeyError:
+        val = f"model.layers.{layer}.{suffix}"
+        _LAYER_TENSOR_CACHE[key] = val
+        return val
+
+
+_BIAS_SUFFIX_CACHE = {}
+
+def _get_bias_id(weight_id: str) -> str:
+    try:
+        return _BIAS_SUFFIX_CACHE[weight_id]
+    except KeyError:
+        val = weight_id.removesuffix(".weight") + ".bias"
+        _BIAS_SUFFIX_CACHE[weight_id] = val
+        return val
 
 
 def _codec_bytes(codec: str) -> float:

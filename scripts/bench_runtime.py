@@ -89,12 +89,20 @@ def bench_hf(
     monitor.start()
     t0 = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(path)
-    model = AutoModelForCausalLM.from_pretrained(
-        path,
-        dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
-    model.to(device)
+    if "cuda" in str(device):
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+        )
+        model.to(device)
     model.eval()
     sync(device)
     load_s = time.perf_counter() - t0

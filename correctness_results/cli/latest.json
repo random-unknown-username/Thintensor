@@ -5,7 +5,7 @@
     "minimum_generated_token_match_rate": 0.8,
     "minimum_top5_overlap": 0.8,
     "short_generation_mostly_matches": true,
-    "strict_cosine_all_records": true,
+    "strict_cosine_all_records": false,
     "top1_same_all_records": true,
     "top5_exact_order_all_records": false,
     "top5_overlap_high_all_records": true
@@ -27,7 +27,7 @@
   "fp8_layers": "all",
   "fp8_scale_block": 0,
   "gate_up_fp8": false,
-  "gpu_weight_budget_bytes": 0,
+  "gpu_weight_budget_bytes": 7456253543,
   "hf_attention_implementation": "sdpa",
   "hf_config_summary": {
     "attention_bias": false,
@@ -138,14 +138,14 @@
     "vocab_size_per_layer_input": 0
   },
   "hf_equivalent": false,
-  "hf_reference_device": "cpu",
+  "hf_reference_device": "cuda",
   "hf_reference_mode": "full_recompute_causal",
-  "kernel_backend": "torch",
+  "kernel_backend": "triton",
   "kv_block_size": 512,
   "kv_residency": "gpu_full",
   "lm_head_fp8": false,
   "lm_head_int4_group_size": 0,
-  "minimum_cosine_similarity": 0.9991387128829956,
+  "minimum_cosine_similarity": 0.9985862374305725,
   "minimum_top5_overlap": 0.8,
   "mlp_fp8": false,
   "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
@@ -171,7 +171,7 @@
   "records": [
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.999854326248169,
+      "cosine_similarity": 0.9998488426208496,
       "decode_step": 1,
       "generated_hf_tokens": [
         47111
@@ -206,8 +206,8 @@
       "kv_retention_exact": true,
       "kv_tokens_attended": 1,
       "kv_tokens_expected": 1,
-      "max_abs_logit_error": 0.09375,
-      "mean_abs_logit_error": 0.013985472731292248,
+      "max_abs_logit_error": 0.078125,
+      "mean_abs_logit_error": 0.014255174435675144,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 1,
@@ -242,7 +242,7 @@
     },
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.9999067783355713,
+      "cosine_similarity": 0.9999945163726807,
       "decode_step": 10,
       "generated_hf_tokens": [
         47111,
@@ -295,8 +295,8 @@
       "kv_retention_exact": true,
       "kv_tokens_attended": 10,
       "kv_tokens_expected": 10,
-      "max_abs_logit_error": 0.2890625,
-      "mean_abs_logit_error": 0.0546996146440506,
+      "max_abs_logit_error": 0.125,
+      "mean_abs_logit_error": 0.019150840118527412,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 1,
@@ -304,7 +304,7 @@
       "reason_not_equivalent": null,
       "thin_top5": [
         {
-          "logit": 14.9375,
+          "logit": 15.0,
           "token_id": 368
         },
         {
@@ -312,11 +312,11 @@
           "token_id": 3890
         },
         {
-          "logit": 13.25,
+          "logit": 13.3125,
           "token_id": 1642
         },
         {
-          "logit": 13.25,
+          "logit": 13.1875,
           "token_id": 2748
         },
         {
@@ -331,7 +331,7 @@
     },
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.999846339225769,
+      "cosine_similarity": 0.9998480081558228,
       "decode_step": 1,
       "generated_hf_tokens": [
         47111
@@ -367,7 +367,7 @@
       "kv_tokens_attended": 128,
       "kv_tokens_expected": 128,
       "max_abs_logit_error": 0.09375,
-      "mean_abs_logit_error": 0.01444558147341013,
+      "mean_abs_logit_error": 0.014263568446040154,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 128,
@@ -402,7 +402,7 @@
     },
     {
       "attention_mode": "causal_kv",
-      "cosine_similarity": 0.9991387128829956,
+      "cosine_similarity": 0.9985862374305725,
       "decode_step": 10,
       "generated_hf_tokens": [
         47111,
@@ -421,14 +421,14 @@
         15995,
         13,
         281,
-        457,
+        14,
         936,
         14,
         783,
         14,
         5996
       ],
-      "generated_token_match_rate": 0.9,
+      "generated_token_match_rate": 1.0,
       "hf_top5": [
         {
           "logit": 9.75,
@@ -455,8 +455,8 @@
       "kv_retention_exact": true,
       "kv_tokens_attended": 137,
       "kv_tokens_expected": 137,
-      "max_abs_logit_error": 0.533203125,
-      "mean_abs_logit_error": 0.08754105120897293,
+      "max_abs_logit_error": 0.6090087890625,
+      "mean_abs_logit_error": 0.12184597551822662,
       "model_name": "/home/satvik/.cache/thintensor/models/allenai--OLMoE-1B-7B-0924-Instruct",
       "not_hf_equivalent": false,
       "prefill_length": 128,
@@ -464,23 +464,23 @@
       "reason_not_equivalent": null,
       "thin_top5": [
         {
-          "logit": 10.0625,
+          "logit": 9.9375,
           "token_id": 5996
         },
         {
           "logit": 9.625,
-          "token_id": 1201
-        },
-        {
-          "logit": 9.5625,
-          "token_id": 936
-        },
-        {
-          "logit": 9.5,
           "token_id": 783
         },
         {
-          "logit": 9.25,
+          "logit": 9.5625,
+          "token_id": 1201
+        },
+        {
+          "logit": 9.5,
+          "token_id": 936
+        },
+        {
+          "logit": 9.1875,
           "token_id": 10186
         }
       ],
@@ -605,5 +605,5 @@
   "top1_exact_all_records": true,
   "top5_ordered_exact_all_records": false,
   "top5_set_exact_all_records": false,
-  "weight_residency": "all"
+  "weight_residency": "stream"
 }

@@ -41,6 +41,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "fused_residual_norm": False,
         "experimental": False,
         "required_capabilities": None,
+        "weight_residency": "all",
         "intent": "Highest fidelity and broadest native-runtime compatibility.",
         "quality_contract": (
             "BF16 weights and BF16 KV values. Different kernel reduction order "
@@ -142,6 +143,44 @@ PROFILES: dict[str, dict[str, Any]] = {
             "Quality is model-dependent.",
             "Tensor-core gains are shape and GPU dependent.",
             "Throughput declines as full causal attention grows.",
+        ),
+    },
+    "max-max-perf": {
+        "label": "Maximum aggressive performance",
+        "description": (
+            "Aggressive speed profile with FP8 body weights (MLP/attention projections), "
+            "fused rope, exact prefill, adaptive body INT8, lm head FP8, and fused scaled MLP/residual norm."
+        ),
+        "kernel_backend": "triton",
+        "gate_up_fp8": True,
+        "down_proj_fp8": True,
+        "o_proj_fp8": True,
+        "qkv_fp8": True,
+        "lm_head_fp8": True,
+        "keep_bf16_lm_head": True,
+        "lm_head_backend": "triton",
+        "lm_head_topk_guard": 64,
+        "attention_backend": "triton_fused",
+        "kv_block_size": 512,
+        "fused_rope": True,
+        "exact_prefill": True,
+        "adaptive_body_int8_start_token": 18,
+        "experimental_int8_tensorcore": True,
+        "fused_scaled_mlp": True,
+        "fused_residual_norm": True,
+        "experimental": True,
+        "required_capabilities": DENSE_GATED_CAPABILITY,
+        "intent": "Minimize weight loading bandwidth through aggressive FP8 body quantization.",
+        "quality_contract": (
+            "MLP and attention projections quantized to FP8. Prefill and early generated "
+            "tokens are exact; later tokens use adaptive INT8. Cosine similarity targets 0.995+."
+        ),
+        "retention_contract": "Full uncompressed BF16 KV history.",
+        "speed_contract": "Max speed; benchmark against max-performance locally.",
+        "recommended_for": "Local execution on Blackwell or RTX GPUs for maximum speedup.",
+        "tradeoffs": (
+            "Higher quantization noise than max-performance.",
+            "Requires CUDA compatibility and sufficient VRAM headroom.",
         ),
     },
     "lab": {
@@ -322,7 +361,7 @@ def get_profile(
         )
     result = dict(PROFILES[canonical])
     if (
-        canonical == "max-performance"
+        canonical in {"max-performance", "max-max-perf"}
         and model is not None
         and _model_value(model, "architecture_family") == "decoder_moe"
     ):
@@ -394,6 +433,30 @@ def get_profile(
                     "quantized dense modes are disabled because they lost "
                     "end-to-end throughput on the retained checkpoint."
                 ),
+            }
+        )
+    if (
+        model is not None
+        and str(model.get("model_type") or "") == "qwen3_5"
+        and canonical == "max-max-perf"
+    ):
+        result.update(
+            {
+                "kernel_backend": "triton-matvec",
+                "attention_backend": "torch",
+                "gate_up_fp8": False,
+                "down_proj_fp8": False,
+                "o_proj_fp8": True,
+                "qkv_fp8": True,
+                "lm_head_fp8": False,
+                "keep_bf16_lm_head": True,
+                "lm_head_topk_guard": 0,
+                "exact_prefill": False,
+                "adaptive_body_int8_start_token": -1,
+                "experimental_int8_tensorcore": False,
+                "fused_rope": True,
+                "fused_residual_norm": True,
+                "preferred_auto_quant": "off",
             }
         )
     if (

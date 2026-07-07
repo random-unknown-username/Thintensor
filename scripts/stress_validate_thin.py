@@ -110,11 +110,19 @@ def main() -> None:
             raise ValueError(f"--cases matched no stress cases: {sorted(selected)}")
 
     print("loading HF stress reference", file=sys.stderr)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.hf_model,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    ).to(device)
+    if "cuda" in str(device):
+        model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            device_map="auto",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        ).to(device)
     model.eval()
     model.config._attn_implementation = "eager"
     references = {}

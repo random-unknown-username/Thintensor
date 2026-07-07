@@ -33,14 +33,24 @@ def main():
         args.model,
         trust_remote_code=args.trust_remote_code,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=dtype,
-        low_cpu_mem_usage=True,
-        trust_remote_code=args.trust_remote_code,
-        attn_implementation="sdpa",
-    )
-    model.to(args.device)
+    if "cuda" in args.device:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            trust_remote_code=args.trust_remote_code,
+            attn_implementation="sdpa",
+            device_map="auto",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            trust_remote_code=args.trust_remote_code,
+            attn_implementation="sdpa",
+        )
+        model.to(args.device)
     model.eval()
 
     torch.cuda.synchronize()
