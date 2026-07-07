@@ -79,6 +79,56 @@ def quantize_to_fp8_via_gpu(
     return quantized_cpu, scales_cpu
 
 
+def quantize_to_int4_cpu(
+    source: torch.Tensor,
+    *,
+    group_size: int = 128,
+    chunk_rows: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a matrix into signed symmetric INT4 without retaining BF16 RAM."""
+    rows, cols = int(source.shape[0]), int(source.shape[1])
+    if cols % 2:
+        raise ValueError("expert INT4 requires an even input width")
+    if group_size <= 0 or group_size & (group_size - 1):
+        raise ValueError("expert INT4 group size must be a positive power of two")
+    groups = (cols + group_size - 1) // group_size
+    packed = torch.empty((rows, cols // 2), dtype=torch.uint8)
+    scales = torch.empty((rows, groups), dtype=torch.float32)
+    for start in range(0, rows, chunk_rows):
+        end = min(rows, start + chunk_rows)
+        values_f32 = source[start:end].float()
+        if cols % group_size == 0:
+            grouped = values_f32.reshape(end - start, groups, group_size)
+            scale = (
+                grouped.abs().amax(dim=2).clamp_min_(1e-12).div_(7.0)
+            )
+            scales[start:end].copy_(scale)
+            quantized = (
+                torch.round(grouped / scale[:, :, None])
+                .clamp_(-7, 7)
+                .add_(8)
+                .to(torch.uint8)
+                .reshape(end - start, cols)
+            )
+        else:
+            quantized = torch.empty((end - start, cols), dtype=torch.uint8)
+            for group in range(groups):
+                col_start = group * group_size
+                col_end = min(cols, col_start + group_size)
+                values = values_f32[:, col_start:col_end]
+                scale = values.abs().amax(dim=1).clamp_min_(1e-12).div_(7.0)
+                scales[start:end, group].copy_(scale)
+                quantized[:, col_start:col_end].copy_(
+                    torch.round(values / scale[:, None])
+                    .clamp_(-7, 7)
+                    .add_(8)
+                )
+        packed[start:end].copy_(
+            quantized[:, 0::2] | (quantized[:, 1::2] << 4)
+        )
+    return packed, scales
+
+
 @dataclass(frozen=True)
 class GpuLoadStats:
     archive_open_s: float
@@ -233,7 +283,7 @@ class DirectGpuPageLoader:
     def load_tensor(self, page: dict[str, Any], stream: Optional[torch.cuda.Stream] = None) -> torch.Tensor:
         page_id = page["id"]
         if self.parent_pool is not None:
-            quantized = self.parent_pool._fp8_cached_tensor(page_id)
+            quantized = self.parent_pool._cached_tensor(page_id)
             if quantized is not None:
                 tensor, metrics = self._copy_cpu_tensor(
                     page_id,
@@ -395,6 +445,8 @@ class ThinGpuWeights:
         self.archive = ThinArchive(self.archive_path, run_verify=verify)
         self.archive_open_s = time.perf_counter() - open_start
         self.tensors: Dict[str, torch.Tensor] = {}
+        self._rowwise_int8_scales: Dict[str, torch.Tensor] = {}
+        self.rowwise_int8_original_bytes = 0
         self.page_specs: Dict[str, dict[str, Any]] = {
             page["id"]: page for page in self.archive.manifest.get("pages", [])
         }
@@ -410,7 +462,12 @@ class ThinGpuWeights:
 
     @property
     def resident_weight_bytes(self) -> int:
-        return _unique_tensor_storage_bytes(self.tensors.values())
+        return _unique_tensor_storage_bytes(
+            (
+                *self.tensors.values(),
+                *self._rowwise_int8_scales.values(),
+            )
+        )
 
     def close(self) -> None:
         self.archive.close()
@@ -453,6 +510,16 @@ class ThinGpuWeights:
             if page.get("fused_to") is not None and page["fused_to"] in fused_raw:
                 gpu_tensor = self._logical_view_from_fused(page, fused_raw[page["fused_to"]])
                 fused_logical_pages += 1
+            elif (
+                str(
+                    self.manifest.get("model", {}).get("model_type")
+                    or ""
+                ).startswith("gemma4")
+                and page_id == "model.embed_tokens_per_layer.weight"
+            ):
+                gpu_tensor = self._load_rowwise_int8_page(page)
+                pages_loaded += 1
+                unique_gpu_weight_bytes += _tensor_nbytes(gpu_tensor)
             else:
                 gpu_tensor = self.loader.load_tensor(page)
                 pages_loaded += 1
@@ -481,6 +548,52 @@ class ThinGpuWeights:
             minor_page_faults=sum(metric.minor_page_faults for metric in loader_metrics),
             major_page_faults=sum(metric.major_page_faults for metric in loader_metrics),
         )
+
+    def _load_rowwise_int8_page(
+        self,
+        page: dict[str, Any],
+        *,
+        chunk_rows: int = 2048,
+    ) -> torch.Tensor:
+        page_id = str(page["id"])
+        source, _ = load_tensor_view(self.archive, page_id)
+        if source.ndim != 2:
+            raise RuntimeError(
+                f"rowwise INT8 page {page_id} must be a matrix"
+            )
+        rows, cols = (int(source.shape[0]), int(source.shape[1]))
+        quantized = torch.empty(
+            (rows, cols), device=self.device, dtype=torch.int8
+        )
+        scales = torch.empty(
+            rows, device=self.device, dtype=torch.float32
+        )
+        self.rowwise_int8_original_bytes += _tensor_nbytes(source)
+        for start in range(0, rows, chunk_rows):
+            end = min(rows, start + chunk_rows)
+            chunk = source[start:end].to(
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            scale = (
+                chunk.abs()
+                .amax(dim=1)
+                .float()
+                .clamp_min_(1e-12)
+                .div_(127.0)
+            )
+            scales[start:end].copy_(scale)
+            quantized[start:end].copy_(
+                torch.round(chunk.float() / scale[:, None])
+                .clamp_(-127, 127)
+                .to(torch.int8)
+            )
+            del chunk, scale
+        self._rowwise_int8_scales[page_id] = scales
+        return quantized
+
+    def rowwise_int8_scale(self, page_id: str) -> Optional[torch.Tensor]:
+        return self._rowwise_int8_scales.get(page_id)
 
     def tensor(self, page_id: str) -> torch.Tensor:
         try:
@@ -535,6 +648,12 @@ class ThinGpuPagePool:
         o_fp8_layer_spec: Optional[str] = None,
         fp8_scale_block: int = 0,
         lm_head_fp8_scale_block: int = 0,
+        expert_int4: bool = False,
+        expert_int4_layer_spec: Optional[str] = None,
+        expert_int4_group_size: int = 32,
+        dense_int4: bool = False,
+        dense_int4_layer_spec: Optional[str] = None,
+        dense_int4_group_size: int = 32,
     ) -> None:
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
@@ -553,6 +672,10 @@ class ThinGpuPagePool:
         self.fp8_layer_spec = fp8_layer_spec
         self.fp8_scale_block = fp8_scale_block
         self.lm_head_fp8_scale_block = lm_head_fp8_scale_block
+        self.expert_int4 = bool(expert_int4)
+        self.expert_int4_group_size = int(expert_int4_group_size)
+        self.dense_int4 = bool(dense_int4)
+        self.dense_int4_group_size = int(dense_int4_group_size)
         self.decode_steps_run = 0
 
         open_start = time.perf_counter()
@@ -563,29 +686,56 @@ class ThinGpuPagePool:
             fp8_layer_spec,
             int(self.manifest["model"]["layers"]),
         )
+        self.selected_fp8_layers = selected_fp8_layers
         selected_down_fp8_layers = _parse_layer_selection(
             down_fp8_layer_spec
             if down_fp8_layer_spec is not None
             else fp8_layer_spec,
             int(self.manifest["model"]["layers"]),
         )
+        self.selected_down_fp8_layers = selected_down_fp8_layers
         selected_qkv_fp8_layers = _parse_layer_selection(
             qkv_fp8_layer_spec
             if qkv_fp8_layer_spec is not None
             else fp8_layer_spec,
             int(self.manifest["model"]["layers"]),
         )
+        self.selected_qkv_fp8_layers = selected_qkv_fp8_layers
         selected_o_fp8_layers = _parse_layer_selection(
             o_fp8_layer_spec
             if o_fp8_layer_spec is not None
             else fp8_layer_spec,
             int(self.manifest["model"]["layers"]),
         )
+        self.selected_o_fp8_layers = selected_o_fp8_layers
+        selected_expert_int4_layers = _parse_layer_selection(
+            expert_int4_layer_spec,
+            int(self.manifest["model"]["layers"]),
+        )
+        self.selected_expert_int4_layers = selected_expert_int4_layers
+        selected_dense_int4_layers = _parse_layer_selection(
+            dense_int4_layer_spec,
+            int(self.manifest["model"]["layers"]),
+        )
+        self.selected_dense_int4_layers = selected_dense_int4_layers
         self.page_specs: Dict[str, dict[str, Any]] = {
-            page["id"]: page for page in self.manifest.get("pages", [])
+            page["id"]: {
+                **page,
+                "shape": list(page.get("shape", ())),
+            }
+            for page in self.manifest.get("pages", [])
         }
 
         self._fp8_cpu_cache: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._int4_cpu_cache: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._int4_source_pages: set[str] = set()
+        self._expert_int4_pack_cpu: Dict[str, torch.Tensor] = {}
+        self._expert_int4_pack_page_ids: Dict[
+            int, tuple[str, str, str, str]
+        ] = {}
+        self._int4_metadata_by_page: Dict[str, tuple[int, int, int]] = {}
+        self._weight_scales: Dict[str, torch.Tensor] = {}
+        self._quantization_lock = threading.Lock()
         self._tensor_id_to_page_id: Dict[int, str] = {}
 
         if (
@@ -631,7 +781,6 @@ class ThinGpuPagePool:
                 if is_down or is_qkv or is_o or (
                     layer_selected and is_gate_up
                 ):
-                    from .torch_loader import load_tensor_view
                     source, _ = load_tensor_view(self.archive, page_id)
                     q_w, q_s = quantize_to_fp8_via_gpu(
                         source,
@@ -655,12 +804,146 @@ class ThinGpuPagePool:
                         "checksum": f"runtime-scale:{page_id}",
                     }
 
+        if self.expert_int4:
+            import sys
+            print(
+                "Configuring router-driven lazy INT4 for middle-layer experts...",
+                file=sys.stderr,
+            )
+            for page_id, page in list(self.page_specs.items()):
+                page_layer = page.get("layer")
+                if (
+                    page_layer is None
+                    or int(page_layer) not in selected_expert_int4_layers
+                    or not _is_separate_expert_weight(page_id)
+                ):
+                    continue
+                rows, cols = int(page["shape"][0]), int(page["shape"][1])
+                groups = (
+                    cols + self.expert_int4_group_size - 1
+                ) // self.expert_int4_group_size
+                self._int4_source_pages.add(page_id)
+                self._int4_metadata_by_page[page_id] = (
+                    rows,
+                    cols,
+                    self.expert_int4_group_size,
+                )
+                page["shape"] = [rows, cols // 2]
+                page["dtype"] = "torch.uint8"
+                page["size"] = rows * (cols // 2)
+                page["quant_scheme"] = "runtime_grouped_int4"
+                page["bits_per_weight"] = 4
+                page["quant_group_size"] = self.expert_int4_group_size
+                scale_id = page_id + ".scale"
+                page["scale_page"] = scale_id
+                self.page_specs[scale_id] = {
+                    "id": scale_id,
+                    "shape": [rows, groups],
+                    "dtype": "torch.float32",
+                    "size": rows * groups * 4,
+                    "kind": "scale",
+                    "layer": page_layer,
+                    "checksum": f"runtime-int4-scale:{page_id}",
+                }
+            num_experts = int(
+                self.manifest["model"].get("num_local_experts") or 0
+            )
+            for layer in sorted(selected_expert_int4_layers):
+                if num_experts <= 0:
+                    break
+                gate_id, up_id, down_id = _separate_expert_tensor_ids(
+                    self, layer, 0
+                )
+                gate_rows, gate_cols, _ = self._int4_metadata_by_page[gate_id]
+                up_rows, up_cols, _ = self._int4_metadata_by_page[up_id]
+                down_rows, down_cols, _ = self._int4_metadata_by_page[down_id]
+                if gate_rows != up_rows or gate_cols != up_cols:
+                    raise RuntimeError(
+                        f"layer {layer} expert gate/up geometry differs"
+                    )
+                prefix = f"__runtime__.layer.{layer}.experts"
+                ids = (
+                    prefix + ".gate_up.int4",
+                    prefix + ".gate_up.int4.scale",
+                    prefix + ".down.int4",
+                    prefix + ".down.int4.scale",
+                )
+                self._expert_int4_pack_page_ids[layer] = ids
+                groups_gate = (
+                    gate_cols + self.expert_int4_group_size - 1
+                ) // self.expert_int4_group_size
+                groups_down = (
+                    down_cols + self.expert_int4_group_size - 1
+                ) // self.expert_int4_group_size
+                specs = (
+                    (ids[0], [num_experts, gate_rows + up_rows, gate_cols // 2], "torch.uint8"),
+                    (ids[1], [num_experts, gate_rows + up_rows, groups_gate], "torch.float32"),
+                    (ids[2], [num_experts, down_rows, down_cols // 2], "torch.uint8"),
+                    (ids[3], [num_experts, down_rows, groups_down], "torch.float32"),
+                )
+                for pack_id, shape, dtype_name in specs:
+                    element_size = 4 if dtype_name == "torch.float32" else 1
+                    self.page_specs[pack_id] = {
+                        "id": pack_id,
+                        "shape": shape,
+                        "dtype": dtype_name,
+                        "size": math.prod(shape) * element_size,
+                        "kind": "expert_pack",
+                        "layer": layer,
+                        "checksum": f"runtime-expert-pack:{pack_id}",
+                    }
+
+        if self.dense_int4:
+            import sys
+            print(
+                "Configuring router-driven lazy INT4 for middle-layer dense projections...",
+                file=sys.stderr,
+            )
+            for page_id, page in list(self.page_specs.items()):
+                page_layer = page.get("layer")
+                if (
+                    page_layer is None
+                    or int(page_layer) not in self.selected_dense_int4_layers
+                    or not _is_dense_projection(page_id)
+                ):
+                    continue
+                rows, cols = int(page["shape"][0]), int(page["shape"][1])
+                groups = (
+                    cols + self.dense_int4_group_size - 1
+                ) // self.dense_int4_group_size
+                self._int4_source_pages.add(page_id)
+                self._int4_metadata_by_page[page_id] = (
+                    rows,
+                    cols,
+                    self.dense_int4_group_size,
+                )
+                page["shape"] = [rows, cols // 2]
+                page["dtype"] = "torch.uint8"
+                page["size"] = rows * (cols // 2)
+                page["quant_scheme"] = "runtime_grouped_int4"
+                page["bits_per_weight"] = 4
+                page["quant_group_size"] = self.dense_int4_group_size
+                scale_id = page_id + ".scale"
+                page["scale_page"] = scale_id
+                self.page_specs[scale_id] = {
+                    "id": scale_id,
+                    "shape": [rows, groups],
+                    "dtype": "torch.float32",
+                    "size": rows * groups * 4,
+                    "kind": "scale",
+                    "layer": page_layer,
+                    "checksum": f"runtime-int4-scale:{page_id}",
+                }
+
         self.cpu_store = None
         if self.cpu_offload:
             self.cpu_store = CpuPageStore(
                 self.archive, pin_cpu_pages=self.pin_cpu_pages, dtype=self.dtype
             )
             for page_id, (q_w, q_s) in self._fp8_cpu_cache.items():
+                self.cpu_store.tensors[page_id] = q_w
+                self.cpu_store.tensors[page_id + ".scale"] = q_s
+            for page_id, (q_w, q_s) in self._int4_cpu_cache.items():
                 self.cpu_store.tensors[page_id] = q_w
                 self.cpu_store.tensors[page_id + ".scale"] = q_s
             self.cpu_store.cpu_resident_bytes = sum(t.numel() * t.element_size() for t in self.cpu_store.tensors.values())
@@ -675,6 +958,8 @@ class ThinGpuPagePool:
         )
         self.tensors: "OrderedDict[str, torch.Tensor]" = OrderedDict()
         self.owned_bytes: dict[str, int] = {}
+        self._active_pages: set[str] = set()
+        self._page_use_events: dict[str, torch.cuda.Event] = {}
         self.alias_keys: dict[tuple[str, tuple[int, ...], str], str] = {}
         self.resident_bytes = 0
         self.external_resident_bytes = 0
@@ -725,14 +1010,49 @@ class ThinGpuPagePool:
         model every token. Keep a deterministic prefix resident and reserve
         enough space for the current layer plus prefetched layers.
         """
+        # Identify active pages
+        active_pages = set()
+        for page_id, page in self.page_specs.items():
+            if page.get("kind") == "fused_physical":
+                continue
+            page_layer = page.get("layer")
+            if page_layer is not None:
+                layer_idx = int(page_layer)
+                # If this is an individual expert page for an INT4 layer, skip it (packed expert pages are used instead)
+                if (
+                    self.expert_int4
+                    and layer_idx in self.selected_expert_int4_layers
+                    and _is_separate_expert_page(page_id)
+                ):
+                    if not page_id.startswith("__runtime__"):
+                        continue
+            active_pages.add(page_id)
+
+        total_active_bytes = sum(
+            self._page_resident_size(self.page_specs[pid])
+            for pid in active_pages
+            if pid in self.page_specs
+        )
         budget = self.vram_budget_bytes
-        if budget is None or budget <= 0:
+        if budget is None or total_active_bytes <= budget:
+            self.persistent_pages = active_pages
+            self.budget_resident_layers = list(range(int(self.manifest["model"]["layers"])))
+            import sys
+            budget_str = f"{budget / 1024**3:.2f} GiB" if budget is not None else "Unlimited"
+            print(
+                f"All weights fit within VRAM budget ({total_active_bytes / 1024**3:.2f} GiB <= {budget_str}); pinning all weights to VRAM.",
+                file=sys.stderr,
+            )
             return
 
         pages_by_layer: dict[int, list[dict[str, Any]]] = {}
         for page in self.page_specs.values():
             layer = page.get("layer")
-            if layer is None or page.get("kind") == "fused_physical":
+            if (
+                layer is None
+                or page.get("kind") == "fused_physical"
+                or _is_separate_expert_page(str(page["id"]))
+            ):
                 continue
             pages_by_layer.setdefault(int(layer), []).append(page)
         if not pages_by_layer:
@@ -748,7 +1068,24 @@ class ThinGpuPagePool:
             layer: sum(self._page_resident_size(page) for page in pages)
             for layer, pages in pages_by_layer.items()
         }
-        working_set_bytes = max(layer_bytes.values()) * (1 + self.prefetch_distance)
+        expert_sizes = sorted(
+            (
+                self._page_resident_size(page)
+                for page in self.page_specs.values()
+                if _is_separate_expert_weight(str(page["id"]))
+            ),
+            reverse=True,
+        )
+        top_k = int(
+            self.manifest.get("model", {}).get("num_experts_per_token") or 0
+        )
+        # Keep two routed expert sets outside the pinned-layer calculation:
+        # one set may still have queued kernels while the next layer routes.
+        expert_working_set = sum(expert_sizes[: 3 * top_k]) * 2
+        working_set_bytes = (
+            max(layer_bytes.values()) * (1 + self.prefetch_distance)
+            + expert_working_set
+        )
         pin_budget = max(0, budget - global_bytes - working_set_bytes)
 
         pinned_bytes = 0
@@ -760,12 +1097,132 @@ class ThinGpuPagePool:
             pinned_bytes += size
             self.persistent_pages.update(page["id"] for page in pages_by_layer[layer])
 
-    def _fp8_cached_tensor(self, page_id: str) -> Optional[torch.Tensor]:
+    def _cached_tensor(self, page_id: str) -> Optional[torch.Tensor]:
+        for layer, pack_ids in self._expert_int4_pack_page_ids.items():
+            if page_id in pack_ids:
+                self._build_expert_int4_pack(layer)
+                return self._expert_int4_pack_cpu[page_id]
+        int4_base = (
+            page_id[: -len(".scale")]
+            if page_id.endswith(".scale")
+            else page_id
+        )
+        if int4_base in self._int4_source_pages:
+            if int4_base not in self._int4_cpu_cache:
+                with self._quantization_lock:
+                    if int4_base not in self._int4_cpu_cache:
+                        source = None
+                        if (
+                            self.cpu_store is not None
+                            and int4_base in self.cpu_store.tensors
+                        ):
+                            source = self.cpu_store.tensors[int4_base]
+                        if source is None:
+                            source, _ = load_tensor_view(
+                                self.archive, int4_base
+                            )
+                        meta = self._int4_metadata_by_page.get(int4_base)
+                        gsize = meta[2] if meta is not None else 32
+                        q_w, q_s = quantize_to_int4_cpu(
+                            source,
+                            group_size=gsize,
+                        )
+                        self._int4_cpu_cache[int4_base] = (q_w, q_s)
+                        self._weight_scales[int4_base] = q_s
+                        if self.cpu_store is not None:
+                            self.cpu_store.tensors[int4_base] = q_w
+                            self.cpu_store.tensors[int4_base + ".scale"] = q_s
+            cached_int4 = self._int4_cpu_cache[int4_base]
+            return cached_int4[1] if page_id.endswith(".scale") else cached_int4[0]
+        if page_id.endswith(".scale"):
+            cached_int4 = self._int4_cpu_cache.get(page_id[: -len(".scale")])
+            if cached_int4 is not None:
+                return cached_int4[1]
+        cached_int4 = self._int4_cpu_cache.get(page_id)
+        if cached_int4 is not None:
+            return cached_int4[0]
         if page_id.endswith(".scale"):
             cached = self._fp8_cpu_cache.get(page_id[: -len(".scale")])
             return cached[1] if cached is not None else None
         cached = self._fp8_cpu_cache.get(page_id)
         return cached[0] if cached is not None else None
+
+    def _build_expert_int4_pack(self, layer: int) -> None:
+        ids = self._expert_int4_pack_page_ids[layer]
+        if ids[0] in self._expert_int4_pack_cpu:
+            return
+        with self._quantization_lock:
+            if ids[0] in self._expert_int4_pack_cpu:
+                return
+            shapes = [self.page_specs[page_id]["shape"] for page_id in ids]
+            gate_up_q = torch.empty(tuple(shapes[0]), dtype=torch.uint8)
+            gate_up_s = torch.empty(tuple(shapes[1]), dtype=torch.float32)
+            down_q = torch.empty(tuple(shapes[2]), dtype=torch.uint8)
+            down_s = torch.empty(tuple(shapes[3]), dtype=torch.float32)
+            num_experts = int(shapes[0][0])
+            gate_rows = int(shapes[0][1]) // 2
+            for expert in range(num_experts):
+                gate_id, up_id, down_id = _separate_expert_tensor_ids(
+                    self, layer, expert
+                )
+                gate_source, _ = load_tensor_view(self.archive, gate_id)
+                up_source, _ = load_tensor_view(self.archive, up_id)
+                down_source, _ = load_tensor_view(self.archive, down_id)
+                gate_q, gate_s = quantize_to_int4_cpu(
+                    gate_source, group_size=self.expert_int4_group_size
+                )
+                up_q, up_s = quantize_to_int4_cpu(
+                    up_source, group_size=self.expert_int4_group_size
+                )
+                down_q_one, down_s_one = quantize_to_int4_cpu(
+                    down_source, group_size=self.expert_int4_group_size
+                )
+                gate_up_q[expert, :gate_rows].copy_(gate_q)
+                gate_up_q[expert, gate_rows:].copy_(up_q)
+                gate_up_s[expert, :gate_rows].copy_(gate_s)
+                gate_up_s[expert, gate_rows:].copy_(up_s)
+                down_q[expert].copy_(down_q_one)
+                down_s[expert].copy_(down_s_one)
+            self._expert_int4_pack_cpu.update(
+                {
+                    ids[0]: gate_up_q,
+                    ids[1]: gate_up_s,
+                    ids[2]: down_q,
+                    ids[3]: down_s,
+                }
+            )
+
+    def has_expert_int4_pack(self, layer: int) -> bool:
+        return layer in self._expert_int4_pack_page_ids
+
+    @property
+    def is_fully_pinned(self) -> bool:
+        active_pages = set()
+        for page_id, page in self.page_specs.items():
+            if page.get("kind") == "fused_physical":
+                continue
+            page_layer = page.get("layer")
+            if page_layer is not None:
+                layer_idx = int(page_layer)
+                if (
+                    self.expert_int4
+                    and layer_idx in self.selected_expert_int4_layers
+                    and _is_separate_expert_page(page_id)
+                ):
+                    if not page_id.startswith("__runtime__"):
+                        continue
+            active_pages.add(page_id)
+        return active_pages.issubset(self.persistent_pages)
+
+    def expert_int4_pack(
+        self, layer: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ids = self._expert_int4_pack_page_ids[layer]
+        return tuple(self.tensor(page_id) for page_id in ids)  # type: ignore[return-value]
+
+    # Retained for downstream integrations that used the old private helper.
+    def _fp8_cached_tensor(self, page_id: str) -> Optional[torch.Tensor]:
+        return self._cached_tensor(page_id)
 
     def warm_start(self) -> None:
         for page_id in sorted(self.persistent_pages):
@@ -874,6 +1331,10 @@ class ThinGpuPagePool:
         for page_id, page in list(self.page_specs.items()):
             if page.get("layer") is None or int(page.get("layer", -1)) > cutoff:
                 continue
+            # Expert reuse is input dependent, not layer sequential. Let the
+            # bounded LRU retain hot experts across tokens.
+            if _is_separate_expert_page(page_id):
+                continue
             if page_id not in self.persistent_pages:
                 self.evict(page_id)
 
@@ -888,6 +1349,13 @@ class ThinGpuPagePool:
             return
             
         t = self.tensors.get(page_id)
+        if t is not None and t.is_cuda:
+            # A page can be selected for eviction between returning it to a
+            # caller and that caller enqueueing every dependent kernel. CUDA's
+            # allocator stream tracking cannot represent that host-side
+            # lifetime gap. Synchronize only on actual eviction; normal cache
+            # hits and resident execution remain fully asynchronous.
+            torch.cuda.current_stream(t.device).synchronize()
 
         if page.get("kind") == "fused_physical":
             for logical_id, logical in list(self.page_specs.items()):
@@ -1082,8 +1550,10 @@ class ThinGpuPagePool:
     def _layer_page_ids(self, layer: int) -> list[str]:
         return [
             page["id"]
-            for page in self.manifest.get("pages", [])
-            if page.get("kind") != "fused_physical" and page.get("layer") == layer
+            for page in self.page_specs.values()
+            if page.get("kind") != "fused_physical"
+            and page.get("layer") == layer
+            and not _is_separate_expert_page(str(page["id"]))
         ]
 
     def _insert_tensor(self, page_id: str, tensor: torch.Tensor, owned_bytes: int) -> None:
@@ -1102,6 +1572,7 @@ class ThinGpuPagePool:
         del self.tensors[page_id]
         if self._tensor_id_to_page_id.get(id(tensor)) == page_id:
             self._tensor_id_to_page_id.pop(id(tensor), None)
+        self._page_use_events.pop(page_id, None)
         self.resident_bytes = max(0, self.resident_bytes - self.owned_bytes.pop(page_id, 0))
         self.stats["evicted_pages"] = int(self.stats["evicted_pages"]) + 1
 
@@ -1110,18 +1581,32 @@ class ThinGpuPagePool:
             while self.resident_bytes > self.vram_budget_bytes:
                 victim = None
                 for candidate in self.tensors.keys():
-                    if candidate not in self.persistent_pages and candidate != page_id:
+                    use_event = self._page_use_events.get(candidate)
+                    if (
+                        candidate not in self.persistent_pages
+                        and candidate != page_id
+                        and candidate not in self._active_pages
+                        and (use_event is None or use_event.query())
+                    ):
                         victim = candidate
                         break
                 if victim is None:
                     for candidate in self.tensors.keys():
-                        if candidate != page_id and candidate in self.persistent_pages:
-                            is_tiny_norm = "norm" in candidate.lower() or self.owned_bytes.get(candidate, 0) < 1 * 1024 * 1024
-                            if not is_tiny_norm:
-                                victim = candidate
-                                break
+                        if (
+                            candidate not in self.persistent_pages
+                            and candidate != page_id
+                            and candidate not in self._active_pages
+                        ):
+                            victim = candidate
+                            use_event = self._page_use_events.get(candidate)
+                            if use_event is not None:
+                                use_event.synchronize()
+                            break
                 if victim is None:
-                    break
+                    raise RuntimeError(
+                        "GPU weight budget is below the protected execution "
+                        "working set; increase --gpu-memory-budget"
+                    )
                 self.evict(victim)
 
 
@@ -2268,6 +2753,30 @@ class ThinGpuCausalLMRuntime:
         self.model = weights.manifest["model"]
         self.descriptor = descriptor_from_manifest(weights.manifest)
         self.is_moe = self.descriptor.is_moe
+        self.is_qwen3_5 = self.descriptor.model_type == "qwen3_5"
+        self.is_gemma4 = self.descriptor.model_type == "gemma4"
+        self.gemma4_triton_attention = (
+            self.is_gemma4
+            and os.environ.get(
+                "THINTENSOR_GEMMA4_TRITON_ATTENTION", "1"
+            )
+            == "1"
+        )
+        self.gemma4_triton_mlp = (
+            self.is_gemma4
+            and os.environ.get("THINTENSOR_GEMMA4_TRITON_MLP", "0")
+            == "1"
+        )
+        self.gemma4_triton_ple = (
+            self.is_gemma4
+            and os.environ.get("THINTENSOR_GEMMA4_TRITON_PLE", "0")
+            == "1"
+        )
+        self.gemma4_mlp_int8 = (
+            self.is_gemma4
+            and os.environ.get("THINTENSOR_GEMMA4_MLP_INT8", "0")
+            == "1"
+        )
         if attention_mode not in {"causal_kv", "current_only_smoke"}:
             raise ValueError(
                 "attention_mode must be causal_kv or current_only_smoke"
@@ -2424,7 +2933,41 @@ class ThinGpuCausalLMRuntime:
             self.weights,
             _layer_tensor(0, "mlp.gate_up_proj.weight"),
         )
-        if self.has_fused_qkv_projection:
+        if self.is_gemma4:
+            q_shape = self.weights.tensor(
+                _layer_tensor(0, "self_attn.q_proj.weight")
+            ).shape
+            k_shape = self.weights.tensor(
+                _layer_tensor(0, "self_attn.k_proj.weight")
+            ).shape
+            self.q_dim = int(q_shape[0])
+            self.kv_dim = int(k_shape[0])
+        elif self.is_qwen3_5:
+            full_layers = [
+                layer
+                for layer, layer_type in enumerate(
+                    self.descriptor.layer_types
+                )
+                if layer_type == "full_attention"
+            ]
+            if not full_layers:
+                raise RuntimeError(
+                    "Qwen3.5 archive has no full_attention layer"
+                )
+            full_layer = full_layers[0]
+            q_shape = self.weights.tensor(
+                _layer_tensor(full_layer, "self_attn.q_proj.weight")
+            ).shape
+            k_shape = self.weights.tensor(
+                _layer_tensor(full_layer, "self_attn.k_proj.weight")
+            ).shape
+            if int(q_shape[0]) % 2:
+                raise RuntimeError(
+                    "Qwen3.5 gated q_proj must have an even row count"
+                )
+            self.q_dim = int(q_shape[0]) // 2
+            self.kv_dim = int(k_shape[0])
+        elif self.has_fused_qkv_projection:
             self.q_dim = self.manifest_heads * int(
                 self.manifest_head_dim
                 or self.descriptor.head_dim
@@ -2505,6 +3048,119 @@ class ThinGpuCausalLMRuntime:
 
         self._embed_weight = self.weights.tensor("model.embed_tokens.weight")
         self._final_norm_weight = self.weights.tensor("model.norm.weight")
+        self._qwen35_conv_states: dict[int, torch.Tensor] = {}
+        self._qwen35_recurrent_states: dict[int, torch.Tensor] = {}
+        self._qwen35_projection_buffer: Optional[torch.Tensor] = None
+        self._qwen35_core_buffer: Optional[torch.Tensor] = None
+        self._gemma4_key_history: dict[int, list[torch.Tensor]] = {}
+        self._gemma4_value_history: dict[int, list[torch.Tensor]] = {}
+        self._gemma4_shared_source: dict[str, int] = {}
+        self._gemma4_qkv_buffer: Optional[torch.Tensor] = None
+        self._gemma4_gate_up_buffer: Optional[torch.Tensor] = None
+        self._gemma4_mlp_buffer: Optional[torch.Tensor] = None
+        self._gemma4_context_buffer: Optional[torch.Tensor] = None
+        self._gemma4_ple_gate_buffer: Optional[torch.Tensor] = None
+        self._gemma4_projection_buffer: Optional[torch.Tensor] = None
+        if self.is_qwen3_5:
+            conv_dim = (
+                2
+                * self.descriptor.linear_num_key_heads
+                * self.descriptor.linear_key_head_dim
+                + self.descriptor.linear_num_value_heads
+                * self.descriptor.linear_value_head_dim
+            )
+            for layer, layer_type in enumerate(
+                self.descriptor.layer_types
+            ):
+                if layer_type != "linear_attention":
+                    continue
+                self._qwen35_conv_states[layer] = torch.zeros(
+                    (
+                        conv_dim,
+                        self.descriptor.linear_conv_kernel_dim,
+                    ),
+                    device=self.device,
+                    dtype=self._final_norm_weight.dtype,
+                )
+                self._qwen35_recurrent_states[layer] = torch.zeros(
+                    (
+                        self.descriptor.linear_num_value_heads,
+                        self.descriptor.linear_key_head_dim,
+                        self.descriptor.linear_value_head_dim,
+                    ),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            self._qwen35_projection_buffer = torch.empty(
+                max(
+                    conv_dim
+                    + self.descriptor.linear_num_value_heads
+                    * self.descriptor.linear_value_head_dim
+                    + 2 * self.descriptor.linear_num_value_heads,
+                    self.q_dim * 2 + 2 * self.kv_dim,
+                ),
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._qwen35_core_buffer = torch.empty(
+                self.descriptor.linear_num_value_heads
+                * self.descriptor.linear_value_head_dim,
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+        if self.is_gemma4:
+            first_shared = self.layers - self.descriptor.num_kv_shared_layers
+            for layer in range(max(0, first_shared)):
+                self._gemma4_key_history[layer] = []
+                self._gemma4_value_history[layer] = []
+                self._gemma4_shared_source[
+                    self.descriptor.layer_types[layer]
+                ] = layer
+            max_intermediate = max(
+                int(
+                    self.weights.tensor(
+                        _layer_tensor(
+                            layer, "mlp.gate_proj.weight"
+                        )
+                    ).shape[0]
+                )
+                for layer in range(self.layers)
+            )
+            self._gemma4_qkv_buffer = torch.empty(
+                self.heads * self.descriptor.global_head_dim
+                + 2 * max(
+                    self.descriptor.head_dim,
+                    self.descriptor.global_head_dim,
+                ),
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._gemma4_gate_up_buffer = torch.empty(
+                2 * max_intermediate,
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._gemma4_mlp_buffer = torch.empty(
+                max_intermediate,
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._gemma4_context_buffer = torch.empty(
+                self.layers
+                * self.descriptor.hidden_size_per_layer_input,
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._gemma4_ple_gate_buffer = torch.empty(
+                self.descriptor.hidden_size_per_layer_input,
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._gemma4_projection_buffer = torch.empty(
+                self.hidden_size,
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
         self._moe_gate_up_buffer: Optional[torch.Tensor] = None
         self._moe_down_buffer: Optional[torch.Tensor] = None
         if self.is_moe:
@@ -2700,22 +3356,44 @@ class ThinGpuCausalLMRuntime:
                         )
                         self._weight_scales[id(q_w)] = q_s
                 if self.qkv_fp8 and layer in self.qkv_fp8_layers:
-                    qkv_suffixes = (
-                        ("self_attn.qkv_proj.weight",)
-                        if self.has_fused_qkv_projection
-                        else (
-                            "self_attn.q_proj.weight",
-                            "self_attn.k_proj.weight",
-                            "self_attn.v_proj.weight",
+                    if self.is_qwen3_5:
+                        qkv_suffixes = (
+                            (
+                                "linear_attn.in_proj_qkv.weight",
+                                "linear_attn.in_proj_z.weight",
+                            )
+                            if self.descriptor.layer_types[layer]
+                            == "linear_attention"
+                            else (
+                                "self_attn.q_proj.weight",
+                                "self_attn.k_proj.weight",
+                                "self_attn.v_proj.weight",
+                            )
                         )
-                    )
+                    else:
+                        qkv_suffixes = (
+                            ("self_attn.qkv_proj.weight",)
+                            if self.has_fused_qkv_projection
+                            else (
+                                "self_attn.q_proj.weight",
+                                "self_attn.k_proj.weight",
+                                "self_attn.v_proj.weight",
+                            )
+                        )
                     for suffix in qkv_suffixes:
                         page_id = _layer_tensor(layer, suffix)
                         q_w, q_s = self._quantize_weight_page(page_id)
                         self._weight_scales[id(q_w)] = q_s
                 if self.o_proj_fp8 and layer in self.o_fp8_layers:
                     page_id = _layer_tensor(
-                        layer, "self_attn.o_proj.weight"
+                        layer,
+                        (
+                            "linear_attn.out_proj.weight"
+                            if self.is_qwen3_5
+                            and self.descriptor.layer_types[layer]
+                            == "linear_attention"
+                            else "self_attn.o_proj.weight"
+                        ),
                     )
                     q_w, q_s = self._quantize_weight_page(page_id)
                     self._weight_scales[id(q_w)] = q_s
@@ -2799,12 +3477,23 @@ class ThinGpuCausalLMRuntime:
         if (
             isinstance(self.weights, ThinGpuWeights)
             and not self.is_moe
+            and not self.is_qwen3_5
+            and not self.is_gemma4
             and not self.has_fused_qkv_projection
             and not self.has_fused_gate_up_projection
         ):
             self._layer_plan = [self._make_layer_plan(layer) for layer in range(self.layers)]
             self._initialize_runtime_fusion()
-        elif isinstance(self.weights, ThinGpuPagePool):
+        elif self.gemma4_mlp_int8 and ".mlp." in page_id:
+            q_w, q_s = self._quantize_int8_rows(
+                source,
+                scale_block_size=scale_block_size,
+            )
+        elif (
+            isinstance(self.weights, ThinGpuPagePool)
+            and not self.is_qwen3_5
+            and not self.is_gemma4
+        ):
             self._layer_plan = [LayerPlan(layer, pool=self.weights) for layer in range(self.layers)]
         if (
             self.device.type == "cuda"
@@ -2818,6 +3507,8 @@ class ThinGpuCausalLMRuntime:
             self.kernel_backend is not None
             and self.use_triton_matvec
             and not self.is_moe
+            and not self.is_qwen3_5
+            and not self.is_gemma4
         ):
             self._autotuning = True
             try:
@@ -2941,6 +3632,18 @@ class ThinGpuCausalLMRuntime:
         adaptive_extra = (
             self._adaptive_body_int8
             and (
+                (
+                    self.is_qwen3_5
+                    and (
+                        ".linear_attn.in_proj_" in page_id
+                        or page_id.endswith(
+                            ".linear_attn.out_proj.weight"
+                        )
+                        or ".self_attn." in page_id
+                        or ".mlp." in page_id
+                    )
+                )
+                or
                 "self_attn.q_proj.weight" in page_id
                 or "self_attn.k_proj.weight" in page_id
                 or "self_attn.v_proj.weight" in page_id
@@ -4117,7 +4820,21 @@ class ThinGpuCausalLMRuntime:
             raise ValueError(f"token_id {token_id} outside vocab {embed.shape[0]}")
         layer_count = min(self.layers, layers if layers is not None else self.layers)
         
-        if self.is_moe:
+        if self.is_gemma4:
+            res = self._forward_token_gemma4(
+                embed,
+                token_id,
+                layer_count,
+                token_index,
+            )
+        elif self.is_qwen3_5:
+            res = self._forward_token_qwen3_5(
+                embed,
+                token_id,
+                layer_count,
+                token_index,
+            )
+        elif self.is_moe:
             res = self._forward_token_moe(
                 embed,
                 token_id,
@@ -4150,6 +4867,848 @@ class ThinGpuCausalLMRuntime:
             self._current_step_profile["forward_end"].record()
 
         return res
+
+    @torch.inference_mode()
+    def _forward_token_gemma4(
+        self,
+        embed: torch.Tensor,
+        token_id: int | torch.Tensor,
+        layer_count: int,
+        token_index: int,
+    ) -> torch.Tensor:
+        if token_index == 0:
+            for values in self._gemma4_key_history.values():
+                values.clear()
+            for values in self._gemma4_value_history.values():
+                values.clear()
+        if isinstance(token_id, torch.Tensor):
+            token = token_id.reshape(1).to(
+                device=embed.device, dtype=torch.long
+            )
+            hidden = embed.index_select(0, token).reshape(-1).clone()
+        else:
+            token = torch.tensor(
+                [token_id], device=embed.device, dtype=torch.long
+            )
+            hidden = embed[token_id].clone()
+        hidden.mul_(
+            torch.tensor(
+                self.embedding_scale,
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+        )
+        per_layer_inputs = self._gemma4_per_layer_inputs(
+            token, hidden
+        )
+
+        for layer in range(layer_count):
+            residual = hidden
+            normed = self._normalization(
+                hidden,
+                _layer_tensor(layer, "input_layernorm.weight"),
+            )
+            attention = self._gemma4_attention(
+                layer, normed, token_index
+            )
+            attention = self._normalization(
+                attention,
+                _layer_tensor(
+                    layer, "post_attention_layernorm.weight"
+                ),
+            )
+            hidden = residual + attention
+
+            residual = hidden
+            normed = self._normalization(
+                hidden,
+                _layer_tensor(
+                    layer, "pre_feedforward_layernorm.weight"
+                ),
+            )
+            gate_weight = self.weights.tensor(
+                _layer_tensor(layer, "mlp.gate_proj.weight")
+            )
+            up_weight = self.weights.tensor(
+                _layer_tensor(layer, "mlp.up_proj.weight")
+            )
+            intermediate = int(gate_weight.shape[0])
+            if self.kernel_backend is not None and self.gemma4_triton_mlp:
+                assert self._gemma4_gate_up_buffer is not None
+                gate_up = self._gemma4_gate_up_buffer[
+                    : 2 * intermediate
+                ]
+                self.kernel_backend.multi_matvec(
+                    (gate_weight, up_weight), normed, gate_up
+                )
+                gate = gate_up[:intermediate]
+                up = gate_up[intermediate:]
+            else:
+                gate = torch.mv(gate_weight, normed)
+                up = torch.mv(up_weight, normed)
+            activation = torch.nn.functional.gelu(
+                gate, approximate="tanh"
+            ) * up
+            down_weight = self.weights.tensor(
+                _layer_tensor(layer, "mlp.down_proj.weight")
+            )
+            if self.kernel_backend is not None and self.gemma4_triton_mlp:
+                assert self._gemma4_projection_buffer is not None
+                mlp = self.kernel_backend.matvec(
+                    down_weight,
+                    activation,
+                    self._gemma4_projection_buffer,
+                    config_name="triton_loop_256",
+                    block_m=16,
+                    num_warps=4,
+                )
+            else:
+                mlp = torch.mv(down_weight, activation)
+            mlp = self._normalization(
+                mlp,
+                _layer_tensor(
+                    layer, "post_feedforward_layernorm.weight"
+                ),
+            )
+            hidden = residual + mlp
+
+            ple_gate_weight = self.weights.tensor(
+                _layer_tensor(
+                    layer, "per_layer_input_gate.weight"
+                )
+            )
+            if self.kernel_backend is not None and self.gemma4_triton_ple:
+                assert self._gemma4_ple_gate_buffer is not None
+                ple_gate = self._runtime_matvec(
+                    ple_gate_weight,
+                    hidden,
+                    self._gemma4_ple_gate_buffer,
+                )
+            else:
+                ple_gate = torch.mv(ple_gate_weight, hidden)
+            ple_gate = torch.nn.functional.gelu(
+                ple_gate, approximate="tanh"
+            )
+            ple_gate.mul_(per_layer_inputs[layer])
+            ple_projection = self.weights.tensor(
+                _layer_tensor(
+                    layer, "per_layer_projection.weight"
+                )
+            )
+            if self.kernel_backend is not None and self.gemma4_triton_ple:
+                assert self._gemma4_projection_buffer is not None
+                ple = self._runtime_matvec(
+                    ple_projection,
+                    ple_gate,
+                    self._gemma4_projection_buffer,
+                )
+            else:
+                ple = torch.mv(ple_projection, ple_gate)
+            ple = self._normalization(
+                ple,
+                _layer_tensor(
+                    layer, "post_per_layer_input_norm.weight"
+                ),
+            )
+            hidden = hidden + ple
+            layer_scalar = self.weights.tensor(
+                _layer_tensor(layer, "layer_scalar")
+            )
+            hidden.mul_(layer_scalar.reshape(()))
+
+        return self._normalization(hidden, "model.norm.weight")
+
+    def _gemma4_per_layer_inputs(
+        self,
+        token: torch.Tensor,
+        inputs_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        page_id = "model.embed_tokens_per_layer.weight"
+        table = self.weights.tensor(page_id)
+        scales = (
+            self.weights.rowwise_int8_scale(page_id)
+            if hasattr(self.weights, "rowwise_int8_scale")
+            else None
+        )
+        if scales is None:
+            token_component = table.index_select(0, token).reshape(
+                self.layers,
+                self.descriptor.hidden_size_per_layer_input,
+            )
+        else:
+            token_component = (
+                table.index_select(0, token).reshape(-1).to(
+                    dtype=inputs_embed.dtype
+                )
+                * scales.index_select(0, token).reshape(()).to(
+                    dtype=inputs_embed.dtype
+                )
+            ).reshape(
+                self.layers,
+                self.descriptor.hidden_size_per_layer_input,
+            )
+        token_component.mul_(
+            torch.tensor(
+                self.descriptor.hidden_size_per_layer_input**0.5,
+                device=self.device,
+                dtype=inputs_embed.dtype,
+            )
+        )
+        context_weight = self.weights.tensor(
+            "model.per_layer_model_projection.weight"
+        )
+        if self.kernel_backend is not None and self.gemma4_triton_ple:
+            assert self._gemma4_context_buffer is not None
+            context = self._runtime_matvec(
+                context_weight,
+                inputs_embed,
+                self._gemma4_context_buffer,
+            )
+        else:
+            context = torch.mv(context_weight, inputs_embed)
+        context.mul_(self.hidden_size**-0.5)
+        context = context.reshape(
+            self.layers,
+            self.descriptor.hidden_size_per_layer_input,
+        )
+        norm_weight = self.weights.tensor(
+            "model.per_layer_projection_norm.weight"
+        )
+        work = context.float()
+        context = (
+            work
+            * torch.rsqrt(
+                work.pow(2).mean(dim=-1, keepdim=True)
+                + self.norm_eps
+            )
+            * norm_weight.float()
+        ).to(dtype=inputs_embed.dtype)
+        return (context + token_component) * (2.0**-0.5)
+
+    def _gemma4_attention(
+        self,
+        layer: int,
+        hidden: torch.Tensor,
+        token_index: int,
+    ) -> torch.Tensor:
+        layer_type = self.descriptor.layer_types[layer]
+        is_full = layer_type == "full_attention"
+        head_dim = (
+            self.descriptor.global_head_dim
+            if is_full
+            else self.descriptor.head_dim
+        )
+        q_weight = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.q_proj.weight")
+        )
+        first_shared = (
+            self.layers - self.descriptor.num_kv_shared_layers
+        )
+        if self.kernel_backend is not None and self.gemma4_triton_attention:
+            assert self._gemma4_qkv_buffer is not None
+            if layer < first_shared:
+                k_weight = self.weights.tensor(
+                    _layer_tensor(
+                        layer, "self_attn.k_proj.weight"
+                    )
+                )
+                v_weight = self.weights.tensor(
+                    _layer_tensor(
+                        layer, "self_attn.v_proj.weight"
+                    )
+                )
+                rows = (
+                    int(q_weight.shape[0]),
+                    int(k_weight.shape[0]),
+                    int(v_weight.shape[0]),
+                )
+                qkv = self._gemma4_qkv_buffer[: sum(rows)]
+                self.kernel_backend.multi_matvec(
+                    (q_weight, k_weight, v_weight),
+                    hidden,
+                    qkv,
+                )
+                q_raw = qkv[: rows[0]]
+                k_raw = qkv[
+                    rows[0] : rows[0] + rows[1]
+                ]
+                v_raw = qkv[rows[0] + rows[1] : sum(rows)]
+            else:
+                q_raw = self._runtime_matvec(
+                    q_weight,
+                    hidden,
+                    self._gemma4_qkv_buffer[
+                        : int(q_weight.shape[0])
+                    ],
+                )
+                k_raw = None
+                v_raw = None
+        else:
+            q_raw = torch.mv(q_weight, hidden)
+            k_raw = None
+            v_raw = None
+        q = q_raw.reshape(self.heads, head_dim)
+        q = self._gemma4_head_norm(
+            q,
+            self.weights.tensor(
+                _layer_tensor(layer, "self_attn.q_norm.weight")
+            ),
+        )
+        q = self._gemma4_rope(
+            q, token_index, is_full=is_full
+        )
+
+        if layer < first_shared:
+            if k_raw is None or v_raw is None:
+                k = torch.mv(
+                    self.weights.tensor(
+                        _layer_tensor(
+                            layer, "self_attn.k_proj.weight"
+                        )
+                    ),
+                    hidden,
+                ).reshape(-1, head_dim)
+                v = torch.mv(
+                    self.weights.tensor(
+                        _layer_tensor(
+                            layer, "self_attn.v_proj.weight"
+                        )
+                    ),
+                    hidden,
+                ).reshape(-1, head_dim)
+            else:
+                k = k_raw.reshape(-1, head_dim)
+                v = v_raw.reshape(-1, head_dim)
+            k = self._gemma4_head_norm(
+                k,
+                self.weights.tensor(
+                    _layer_tensor(
+                        layer, "self_attn.k_norm.weight"
+                    )
+                ),
+            )
+            v_work = v.float()
+            v = (
+                v_work
+                * torch.rsqrt(
+                    v_work.pow(2).mean(
+                        dim=-1, keepdim=True
+                    )
+                    + self.norm_eps
+                )
+            ).to(dtype=hidden.dtype)
+            k = self._gemma4_rope(
+                k, token_index, is_full=is_full
+            )
+            self._gemma4_key_history[layer].append(k)
+            self._gemma4_value_history[layer].append(v)
+            source_layer = layer
+        else:
+            source_layer = self._gemma4_shared_source[layer_type]
+
+        keys = torch.stack(
+            self._gemma4_key_history[source_layer], dim=1
+        )
+        values = torch.stack(
+            self._gemma4_value_history[source_layer], dim=1
+        )
+        if not is_full and keys.shape[1] > 512:
+            keys = keys[:, -512:]
+            values = values[:, -512:]
+        self._last_kv_tokens_attended = int(keys.shape[1])
+        group = self.heads // int(keys.shape[0])
+        query = q.reshape(int(keys.shape[0]), group, head_dim)
+        scores = torch.einsum("kgd,ktd->kgt", query, keys)
+        probabilities = torch.softmax(
+            scores, dim=-1, dtype=torch.float32
+        ).to(dtype=hidden.dtype)
+        mixed = torch.einsum(
+            "kgt,ktd->kgd", probabilities, values
+        ).reshape(-1)
+        o_weight = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.o_proj.weight")
+        )
+        if self.kernel_backend is not None and self.gemma4_triton_attention:
+            assert self._gemma4_projection_buffer is not None
+            return self._runtime_matvec(
+                o_weight,
+                mixed,
+                self._gemma4_projection_buffer,
+            )
+        return torch.mv(o_weight, mixed)
+
+    def _gemma4_head_norm(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        work = value.float()
+        return (
+            work
+            * torch.pow(
+                work.pow(2).mean(dim=-1, keepdim=True)
+                + self.norm_eps,
+                -0.5,
+            )
+            * weight.float()
+        ).to(dtype=value.dtype)
+
+    def _gemma4_rope(
+        self,
+        value: torch.Tensor,
+        token_index: int,
+        *,
+        is_full: bool,
+    ) -> torch.Tensor:
+        head_dim = int(value.shape[-1])
+        if is_full:
+            active_angles = int(0.25 * head_dim // 2)
+            active = 2 * active_angles
+            freq_index = torch.arange(
+                0, active, 2, device=self.device, dtype=torch.float32
+            )
+            inv = 1_000_000.0 ** (-freq_index / head_dim)
+            inv = torch.cat(
+                (
+                    inv,
+                    torch.zeros(
+                        head_dim // 2 - active_angles,
+                        device=self.device,
+                        dtype=torch.float32,
+                    ),
+                )
+            )
+        else:
+            freq_index = torch.arange(
+                0,
+                head_dim,
+                2,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            inv = 10_000.0 ** (-freq_index / head_dim)
+        frequencies = inv * float(token_index)
+        cos = torch.cat((frequencies, frequencies)).cos().to(
+            dtype=value.dtype
+        )
+        sin = torch.cat((frequencies, frequencies)).sin().to(
+            dtype=value.dtype
+        )
+        first, second = value.chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        return value * cos + rotated * sin
+
+    @torch.inference_mode()
+    def _forward_token_qwen3_5(
+        self,
+        embed: torch.Tensor,
+        token_id: int | torch.Tensor,
+        layer_count: int,
+        token_index: int,
+    ) -> torch.Tensor:
+        self._active_token_index = token_index
+        if token_index == 0:
+            for state in self._qwen35_conv_states.values():
+                state.zero_()
+            for state in self._qwen35_recurrent_states.values():
+                state.zero_()
+
+        if isinstance(token_id, torch.Tensor):
+            token = token_id.reshape(1).to(
+                device=embed.device, dtype=torch.long
+            )
+            hidden = embed.index_select(0, token).reshape(-1).clone()
+        else:
+            hidden = embed[token_id].clone()
+
+        for layer in range(layer_count):
+            self._capture_debug(layer, "layer_input", hidden)
+            for distance in range(1, self.prefetch_distance + 1):
+                if hasattr(self.weights, "prefetch_layer"):
+                    self.weights.prefetch_layer(layer + distance)
+
+            normed = self._normalization(
+                hidden,
+                _layer_tensor(layer, "input_layernorm.weight"),
+            )
+            self._capture_debug(layer, "post_input_rmsnorm", normed)
+            layer_type = self.descriptor.layer_types[layer]
+            if layer_type == "linear_attention":
+                mixed = self._qwen35_linear_attention(layer, normed)
+            elif layer_type == "full_attention":
+                mixed = self._qwen35_full_attention(
+                    layer, normed, token_index
+                )
+            else:
+                raise RuntimeError(
+                    f"unsupported Qwen3.5 layer type {layer_type!r}"
+                )
+            hidden = hidden + mixed
+            self._capture_debug(
+                layer, "post_attention_residual", hidden
+            )
+
+            mlp_input = self._normalization(
+                hidden,
+                _layer_tensor(
+                    layer, "post_attention_layernorm.weight"
+                ),
+            )
+            gate_weight = self.weights.tensor(
+                _layer_tensor(layer, "mlp.gate_proj.weight")
+            )
+            up_weight = self.weights.tensor(
+                _layer_tensor(layer, "mlp.up_proj.weight")
+            )
+            down_weight = self.weights.tensor(
+                _layer_tensor(layer, "mlp.down_proj.weight")
+            )
+            if self.kernel_backend is not None:
+                buffers = self.kernel_backend.buffers
+                self._qwen35_multi_matvec(
+                    (gate_weight, up_weight),
+                    mlp_input,
+                    buffers.gate_up,
+                )
+                gate = buffers.gate_up[: self.intermediate_size]
+                up = buffers.gate_up[self.intermediate_size :]
+                activation = self._runtime_silu_mul(
+                    gate, up, buffers.mlp_act
+                )
+                mlp = self._runtime_matvec(
+                    down_weight, activation, buffers.mlp
+                )
+            else:
+                gate = torch.mv(gate_weight, mlp_input)
+                up = torch.mv(up_weight, mlp_input)
+                activation = torch.nn.functional.silu(gate) * up
+                mlp = torch.mv(down_weight, activation)
+            hidden = hidden + mlp
+            self._capture_debug(
+                layer, "final_residual_after_mlp", hidden
+            )
+            if self.evict_completed_layers and hasattr(
+                self.weights, "evict_completed_layer"
+            ):
+                self.weights.evict_completed_layer(layer)
+
+        return self._normalization(hidden, "model.norm.weight")
+
+    def _qwen35_multi_matvec(
+        self,
+        weights: tuple[torch.Tensor, ...],
+        hidden: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        backend = self.kernel_backend
+        assert backend is not None
+        if (
+            self._adaptive_switch_token_index >= 0
+            and self._active_token_index
+            < self._adaptive_switch_token_index
+        ):
+            exact = tuple(
+                self._adaptive_exact_weights.get(id(weight))
+                for weight in weights
+            )
+            if all(weight is not None for weight in exact):
+                large_rows = max(int(weight.shape[0]) for weight in exact)
+                return backend.multi_matvec(
+                    exact,
+                    hidden,
+                    out,
+                    block_m=64 if large_rows >= 512 else 8,
+                    num_warps=4,
+                )
+        scales = tuple(self._weight_scale(weight) for weight in weights)
+        if all(
+            scale is not None and scale.ndim == 1
+            for scale in scales
+        ) and len({weight.dtype for weight in weights}) == 1 and weights[
+            0
+        ].dtype in {torch.float8_e4m3fn, torch.int8}:
+            return backend.multi_scaled_tensorcore_matvec(
+                weights,
+                scales,
+                tuple(int(weight.shape[0]) for weight in weights),
+                int(weights[0].shape[1]),
+                hidden,
+                out,
+            )
+        large_rows = max(int(weight.shape[0]) for weight in weights)
+        return backend.multi_matvec(
+            weights,
+            hidden,
+            out,
+            block_m=64 if large_rows >= 512 else 8,
+            num_warps=4,
+        )
+
+    def _qwen35_linear_attention(
+        self,
+        layer: int,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        prefix = "linear_attn"
+        qkv_weight = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.in_proj_qkv.weight")
+        )
+        z_weight = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.in_proj_z.weight")
+        )
+        a_weight = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.in_proj_a.weight")
+        )
+        b_weight = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.in_proj_b.weight")
+        )
+        if self.kernel_backend is not None:
+            assert self._qwen35_projection_buffer is not None
+            projection = self._qwen35_projection_buffer
+            qkv_rows = int(qkv_weight.shape[0])
+            z_rows = int(z_weight.shape[0])
+            self._qwen35_multi_matvec(
+                (qkv_weight, z_weight),
+                hidden,
+                projection[: qkv_rows + z_rows],
+            )
+            self._qwen35_multi_matvec(
+                (a_weight, b_weight),
+                hidden,
+                projection[
+                    qkv_rows + z_rows : qkv_rows + z_rows
+                    + int(a_weight.shape[0])
+                    + int(b_weight.shape[0])
+                ],
+            )
+            mixed_qkv = projection[:qkv_rows]
+            z = projection[qkv_rows : qkv_rows + z_rows]
+            a_start = qkv_rows + z_rows
+            a = projection[a_start : a_start + int(a_weight.shape[0])]
+            b = projection[
+                a_start + int(a_weight.shape[0]) :
+                a_start + int(a_weight.shape[0]) + int(b_weight.shape[0])
+            ]
+        else:
+            mixed_qkv = torch.mv(qkv_weight, hidden)
+            z = torch.mv(z_weight, hidden)
+            a = torch.mv(a_weight, hidden)
+            b = torch.mv(b_weight, hidden)
+
+        conv_state = self._qwen35_conv_states[layer]
+        conv_weight = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.conv1d.weight")
+        )
+        a_log = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.A_log")
+        )
+        dt_bias = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.dt_bias")
+        )
+        norm_weight = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.norm.weight")
+        )
+        if self.kernel_backend is not None:
+            assert self._qwen35_core_buffer is not None
+            gated = self.kernel_backend.qwen35_gated_deltanet(
+                mixed_qkv,
+                z,
+                a,
+                b,
+                conv_weight,
+                dt_bias,
+                a_log,
+                norm_weight,
+                conv_state,
+                self._qwen35_recurrent_states[layer],
+                self._qwen35_core_buffer,
+                key_heads=self.descriptor.linear_num_key_heads,
+                value_heads=self.descriptor.linear_num_value_heads,
+                key_dim=self.descriptor.linear_key_head_dim,
+                value_dim=self.descriptor.linear_value_head_dim,
+                eps=self.norm_eps,
+            )
+            out_weight = self.weights.tensor(
+                _layer_tensor(layer, f"{prefix}.out_proj.weight")
+            )
+            return self._runtime_matvec(
+                out_weight,
+                gated,
+                self.kernel_backend.buffers.attn_out,
+            )
+
+        conv_state.copy_(
+            torch.cat((conv_state[:, 1:], mixed_qkv[:, None]), dim=1)
+        )
+        convolved = torch.nn.functional.conv1d(
+            conv_state.unsqueeze(0),
+            conv_weight,
+            groups=int(conv_state.shape[0]),
+        ).reshape(-1)
+        convolved = torch.nn.functional.silu(convolved)
+
+        key_dim = (
+            self.descriptor.linear_num_key_heads
+            * self.descriptor.linear_key_head_dim
+        )
+        value_dim = (
+            self.descriptor.linear_num_value_heads
+            * self.descriptor.linear_value_head_dim
+        )
+        query, key, value = torch.split(
+            convolved, (key_dim, key_dim, value_dim)
+        )
+        query = query.reshape(
+            self.descriptor.linear_num_key_heads,
+            self.descriptor.linear_key_head_dim,
+        )
+        key = key.reshape(
+            self.descriptor.linear_num_key_heads,
+            self.descriptor.linear_key_head_dim,
+        )
+        value = value.reshape(
+            self.descriptor.linear_num_value_heads,
+            self.descriptor.linear_value_head_dim,
+        )
+
+        query = query * torch.rsqrt(
+            (query * query).sum(dim=-1, keepdim=True) + 1e-6
+        )
+        key = key * torch.rsqrt(
+            (key * key).sum(dim=-1, keepdim=True) + 1e-6
+        )
+        repeats = (
+            self.descriptor.linear_num_value_heads
+            // self.descriptor.linear_num_key_heads
+        )
+        if repeats > 1:
+            query = query.repeat_interleave(repeats, dim=0)
+            key = key.repeat_interleave(repeats, dim=0)
+
+        beta = torch.sigmoid(b).float()
+        g = -a_log.float().exp() * torch.nn.functional.softplus(
+            a.float() + dt_bias.float()
+        )
+
+        recurrent = self._qwen35_recurrent_states[layer]
+        recurrent.mul_(torch.exp(g)[:, None, None])
+        query_f = query.float() * (
+            self.descriptor.linear_key_head_dim ** -0.5
+        )
+        key_f = key.float()
+        value_f = value.float()
+        kv_mem = (recurrent * key_f.unsqueeze(-1)).sum(dim=-2)
+        delta = (value_f - kv_mem) * beta[:, None]
+        recurrent.add_(key_f.unsqueeze(-1) * delta.unsqueeze(-2))
+        output = (
+            recurrent * query_f.unsqueeze(-1)
+        ).sum(dim=-2).to(dtype=hidden.dtype)
+
+        output_2d = output.reshape(
+            self.descriptor.linear_num_value_heads,
+            self.descriptor.linear_value_head_dim,
+        )
+        z_2d = z.reshape_as(output_2d)
+        work = output_2d.float()
+        work = work * torch.rsqrt(
+            work.pow(2).mean(dim=-1, keepdim=True) + self.norm_eps
+        )
+        gated = norm_weight * work.to(dtype=hidden.dtype)
+        gated = (
+            gated * torch.nn.functional.silu(z_2d.float())
+        ).to(dtype=hidden.dtype)
+        out_weight = self.weights.tensor(
+            _layer_tensor(layer, f"{prefix}.out_proj.weight")
+        )
+        if self.kernel_backend is not None:
+            return self._runtime_matvec(
+                out_weight,
+                gated.reshape(-1),
+                self.kernel_backend.buffers.attn_out,
+            )
+        return torch.mv(out_weight, gated.reshape(-1))
+
+    def _qwen35_full_attention(
+        self,
+        layer: int,
+        hidden: torch.Tensor,
+        token_index: int,
+    ) -> torch.Tensor:
+        q_weight = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.q_proj.weight")
+        )
+        k_weight = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.k_proj.weight")
+        )
+        v_weight = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.v_proj.weight")
+        )
+        if self.kernel_backend is not None:
+            assert self._qwen35_projection_buffer is not None
+            projection = self._qwen35_projection_buffer
+            rows = (
+                int(q_weight.shape[0]),
+                int(k_weight.shape[0]),
+                int(v_weight.shape[0]),
+            )
+            self._qwen35_multi_matvec(
+                (q_weight, k_weight, v_weight),
+                hidden,
+                projection[: sum(rows)],
+            )
+            q_raw = projection[: rows[0]]
+            k_raw = projection[rows[0] : rows[0] + rows[1]]
+            v = projection[rows[0] + rows[1] : sum(rows)]
+        else:
+            q_raw = torch.mv(q_weight, hidden)
+            k_raw = torch.mv(k_weight, hidden)
+            v = torch.mv(v_weight, hidden)
+        q_projected = q_raw.reshape(self.heads, self.head_dim * 2)
+        q, gate = q_projected.chunk(2, dim=-1)
+        k = k_raw.reshape(self.kv_heads, self.head_dim)
+        q_norm = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.q_norm.weight")
+        )
+        k_norm = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.k_norm.weight")
+        )
+        q_work = q.float()
+        q = (
+            q_work
+            * torch.rsqrt(
+                q_work.pow(2).mean(dim=-1, keepdim=True)
+                + self.norm_eps
+            )
+            * (1.0 + q_norm.float())
+        ).to(dtype=hidden.dtype)
+        k_work = k.float()
+        k = (
+            k_work
+            * torch.rsqrt(
+                k_work.pow(2).mean(dim=-1, keepdim=True)
+                + self.norm_eps
+            )
+            * (1.0 + k_norm.float())
+        ).to(dtype=hidden.dtype)
+        q, k = self._apply_rope(
+            q.reshape(-1), k.reshape(-1), layer, token_index
+        )
+        if self.kv_cache is not None and not getattr(
+            self, "_autotuning", False
+        ):
+            self.kv_cache.append(layer, k, v, token_index)
+        attended = self._attention(q, k, v, layer, token_index)
+        attended.mul_(torch.sigmoid(gate.reshape(-1)))
+        o_weight = self.weights.tensor(
+            _layer_tensor(layer, "self_attn.o_proj.weight")
+        )
+        if self.kernel_backend is not None:
+            return self._runtime_matvec(
+                o_weight,
+                attended,
+                self.kernel_backend.buffers.attn_out,
+            )
+        return torch.mv(o_weight, attended)
 
     @torch.inference_mode()
     def forward_token_debug(
@@ -4599,20 +6158,28 @@ class ThinGpuCausalLMRuntime:
                 _layer_tensor(layer, "self_attn.k_norm.weight"),
             )
             if q_norm is not None:
-                q = _head_rms_norm(
-                    q,
-                    q_norm,
-                    self.heads,
-                    self.head_dim,
-                    self.rms_norm_eps,
+                q = (
+                    _rms_norm(q, q_norm, self.rms_norm_eps)
+                    if q_norm.numel() == q.numel()
+                    else _head_rms_norm(
+                        q,
+                        q_norm,
+                        self.heads,
+                        self.head_dim,
+                        self.rms_norm_eps,
+                    )
                 )
             if k_norm is not None:
-                k = _head_rms_norm(
-                    k,
-                    k_norm,
-                    self.kv_heads,
-                    self.head_dim,
-                    self.rms_norm_eps,
+                k = (
+                    _rms_norm(k, k_norm, self.rms_norm_eps)
+                    if k_norm.numel() == k.numel()
+                    else _head_rms_norm(
+                        k,
+                        k_norm,
+                        self.kv_heads,
+                        self.head_dim,
+                        self.rms_norm_eps,
+                    )
                 )
             if self.attention_mode == "causal_kv":
                 q, k = self._apply_rope(q, k, layer, token_index)
@@ -4693,11 +6260,18 @@ class ThinGpuCausalLMRuntime:
             router_logits,
             descending=True,
         )[:top_k]
-        router_scores = torch.softmax(
-            router_logits.index_select(0, router_indices),
+        all_router_scores = torch.softmax(
+            router_logits,
             dim=0,
-            dtype=router_logits.dtype,
+            dtype=torch.float32,
         )
+        router_scores = all_router_scores.index_select(
+            0, router_indices
+        ).to(dtype=hidden.dtype)
+        if self.descriptor.norm_topk_prob:
+            router_scores = router_scores / router_scores.sum().clamp_min(
+                torch.finfo(router_scores.dtype).tiny
+            )
 
         gate_up = _optional_tensor(
             self.weights,
@@ -4721,9 +6295,11 @@ class ThinGpuCausalLMRuntime:
                 ),
             )
             if gate_blocks is None or gate_scales is None:
-                raise RuntimeError(
-                    "separate-expert MoE tensors must be archive-repacked "
-                    "before GPU-only routing"
+                return self._separate_expert_moe_forward(
+                    layer,
+                    hidden,
+                    router_indices,
+                    router_scores,
                 )
             if (
                 self.kernel_backend is not None
@@ -4853,6 +6429,143 @@ class ThinGpuCausalLMRuntime:
             expert_output * router_scores[:, None],
             dim=0,
         ).to(dtype=hidden.dtype)
+
+    def _separate_expert_moe_forward(
+        self,
+        layer: int,
+        hidden: torch.Tensor,
+        router_indices: torch.Tensor,
+        router_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute only the experts selected by the exact GPU router."""
+        if self._moe_gate_up_buffer is None or self._moe_down_buffer is None:
+            raise RuntimeError("MoE expert buffers were not initialized")
+        if (
+            isinstance(self.weights, ThinGpuPagePool)
+            and self.weights.has_expert_int4_pack(layer)
+        ):
+            if self.kernel_backend is None:
+                raise RuntimeError(
+                    "packed expert INT4 requires a Triton backend"
+                )
+            pack_ids = self.weights._expert_int4_pack_page_ids[layer]
+            self.weights._active_pages.update(pack_ids)
+            try:
+                gate_up_q, gate_up_s, down_q, down_s = (
+                    self.weights.expert_int4_pack(layer)
+                )
+                gate_up = self._moe_gate_up_buffer[
+                    : int(router_indices.numel())
+                ]
+                self.kernel_backend.int4_selected_matvec(
+                    gate_up_q,
+                    gate_up_s,
+                    hidden,
+                    router_indices,
+                    gate_up,
+                    group_size=self.weights.expert_int4_group_size,
+                )
+                gate, up = gate_up.chunk(2, dim=-1)
+                activation = torch.nn.functional.silu(gate) * up
+                expert_output = self._moe_down_buffer[
+                    : int(router_indices.numel())
+                ]
+                self.kernel_backend.int4_selected_matvec(
+                    down_q,
+                    down_s,
+                    activation,
+                    router_indices,
+                    expert_output,
+                    group_size=self.weights.expert_int4_group_size,
+                )
+                return torch.sum(
+                    expert_output * router_scores[:, None],
+                    dim=0,
+                ).to(dtype=hidden.dtype)
+            finally:
+                self.weights._active_pages.difference_update(pack_ids)
+        # Selected expert IDs are the only dynamic page addresses. This one
+        # small synchronization prevents loading all experts in the layer.
+        selected = [int(value) for value in router_indices.tolist()]
+        gate_up = self._moe_gate_up_buffer[: len(selected)]
+        expert_output = self._moe_down_buffer[: len(selected)]
+        intermediate = self.intermediate_size
+        for slot, expert in enumerate(selected):
+            gate_id, up_id, down_id = _separate_expert_tensor_ids(
+                self.weights,
+                layer,
+                expert,
+            )
+            self._expert_page_matvec(
+                gate_id,
+                hidden,
+                gate_up[slot, :intermediate],
+            )
+            self._expert_page_matvec(
+                up_id,
+                hidden,
+                gate_up[slot, intermediate:],
+            )
+            activation = (
+                torch.nn.functional.silu(gate_up[slot, :intermediate])
+                * gate_up[slot, intermediate:]
+            )
+            self._expert_page_matvec(
+                down_id,
+                activation,
+                expert_output[slot],
+            )
+        combined = torch.zeros_like(hidden)
+        for slot in sorted(range(len(selected)), key=selected.__getitem__):
+            combined.add_(expert_output[slot] * router_scores[slot])
+        return combined
+
+    def _expert_page_matvec(
+        self,
+        page_id: str,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = self.weights.tensor(page_id)
+        if isinstance(self.weights, ThinGpuPagePool):
+            metadata = self.weights._int4_metadata_by_page.get(page_id)
+            if metadata is not None:
+                if self.kernel_backend is None:
+                    raise RuntimeError(
+                        "streamed expert INT4 requires a Triton backend"
+                    )
+                rows, cols, group_size = metadata
+                # Retain both CUDA tensors locally through dispatch. Loading
+                # the scale may evict the weight from the page-pool index under
+                # an extremely small budget, but record_stream keeps storage
+                # alive until this kernel finishes.
+                self.weights._active_pages.add(page_id)
+                try:
+                    scale_id = page_id + ".scale"
+                    scale = self.weights.tensor(scale_id)
+                    result = self.kernel_backend.int4_scaled_matvec(
+                        weight,
+                        scale,
+                        x,
+                        out,
+                        rows=rows,
+                        cols=cols,
+                        group_size=group_size,
+                    )
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(weight.device))
+                    self.weights._page_use_events[page_id] = event
+                    self.weights._page_use_events[scale_id] = event
+                    return result
+                finally:
+                    self.weights._active_pages.discard(page_id)
+            # Exact expert pages are short-lived and may be reloaded at a new
+            # address after LRU eviction. cuBLAS matvec has stable lifetime
+            # semantics for this path; the hand-tuned Triton dispatch is kept
+            # for persistent dense pages and packed INT4 experts.
+            torch.mv(weight, x, out=out)
+            return out
+        return self._runtime_matvec(weight, x, out)
 
     @torch.inference_mode()
     def _forward_token_pytorch_fallback(
@@ -6775,6 +8488,13 @@ class ThinGpuCausalLMRuntime:
         x: torch.Tensor,
         out: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(self.weights, ThinGpuPagePool):
+            page_id = self.weights._tensor_id_to_page_id.get(id(weight))
+            int4_cache = getattr(
+                self.weights, "_int4_metadata_by_page", {}
+            )
+            if page_id in int4_cache:
+                self._int4_metadata[id(weight)] = int4_cache[page_id]
         mxfp4_meta = self._mxfp4_metadata.get(id(weight))
         if mxfp4_meta is not None:
             assert self.kernel_backend is not None
@@ -7440,6 +9160,70 @@ def _fused_matrix_for_layer(
     if target_dtype != source_dtype:
         matrix = matrix.to(dtype=target_dtype)
     return matrix
+
+
+def _is_dense_projection(page_id: str) -> bool:
+    return page_id.endswith(
+        (
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+            "mlp.gate_up_proj.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.qkv_proj.weight",
+            "self_attn.o_proj.weight",
+        )
+    ) and ".experts." not in page_id
+
+
+def _is_separate_expert_page(page_id: str) -> bool:
+    return (
+        ".mlp.experts." in page_id
+        or ".block_sparse_moe.experts." in page_id
+        or (
+            page_id.startswith("__runtime__.layer.")
+            and ".experts." in page_id
+        )
+    )
+
+
+def _is_separate_expert_weight(page_id: str) -> bool:
+    return _is_separate_expert_page(page_id) and page_id.endswith(".weight")
+
+
+def _separate_expert_tensor_ids(
+    weights: ThinGpuWeights | ThinGpuPagePool,
+    layer: int,
+    expert: int,
+) -> tuple[str, str, str]:
+    candidates = (
+        (
+            f"model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+            f"model.layers.{layer}.mlp.experts.{expert}.up_proj.weight",
+            f"model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+        ),
+        (
+            f"model.layers.{layer}.block_sparse_moe.experts.{expert}.w1.weight",
+            f"model.layers.{layer}.block_sparse_moe.experts.{expert}.w3.weight",
+            f"model.layers.{layer}.block_sparse_moe.experts.{expert}.w2.weight",
+        ),
+    )
+    for names in candidates:
+        if all(
+            (
+                weights.has_page(name)
+                if hasattr(weights, "has_page")
+                else name in weights.tensors
+            )
+            for name in names
+        ):
+            return names
+    raise RuntimeError(
+        f"layer {layer} selected expert {expert}, but no supported separate "
+        "gate/up/down tensor triplet exists"
+    )
 
 
 def _rms_norm(

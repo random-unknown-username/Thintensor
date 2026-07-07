@@ -20,6 +20,9 @@ structures for bandwidth and preserve a BF16 source or exact shortlist guard.
 | Qwen2.5-3B-Instruct | verified | 500 | 93.08 | 48.18 | 1.932x | 6.189 / 5.871 | +5.4% | 0.998892 | yes | yes | yes | full BF16 |
 | Gemma-2-2B-IT | verified | 200 | 57.29 | 53.58 | 1.069x | 5.463 / 4.901 | +11.5% | 0.999555 | yes | yes | yes | full BF16 |
 | TinyLlama-1.1B-Chat | candidate | 200 | 180.28 | 132.36 | 1.362x | 2.137 / 2.064 | +3.5% | 0.997788 | yes | no | no | full BF16 |
+| Qwen3.5-0.8B | candidate | 200 | 115.91 | 64.33 | 1.802x | 1.453 / 1.452 | +0.1% | 0.999811 | yes | no | no | full BF16 |
+| Gemma-4-E2B | candidate | 200 | 35.05 | OOM | n/a | 6.490 / OOM | n/a | n/a | n/a | n/a | n/a | full BF16 |
+| OLMoE-1B-7B-0924-Instruct | candidate | 200 | 31.28 | OOM | n/a | 6.772 / OOM | n/a | n/a | n/a | n/a | n/a | full BF16 |
 
 `candidate` is deliberate for TinyLlama: the short suite retained exact top-1
 and 0.997788 minimum cosine, but one BF16 fifth-place cutoff tie changed the
@@ -41,6 +44,21 @@ order of two tied entries differed.
 | TinyLlama-1.1B-Chat | max-performance | 180.28 | 2.137 | 0.997788 | yes | no | no |
 | TinyLlama-1.1B-Chat | lab | 107.81 | 2.064 | 0.999836 | yes | no | no |
 | TinyLlama-1.1B-Chat | Transformers | 132.36 | 2.064 | 1.000000 | yes | yes | yes |
+| Qwen3.5-0.8B | safe | 109.86 | 1.450 | 0.999811 | yes | no | no |
+| Qwen3.5-0.8B | balanced | 114.49 | 1.450 | 0.999811 | yes | no | no |
+| Qwen3.5-0.8B | max-performance | 115.91 | 1.453 | 0.999811 | yes | no | no |
+| Qwen3.5-0.8B | lab | 105.12 | 1.450 | 0.999811 | yes | no | no |
+| Qwen3.5-0.8B | Transformers | 64.33 | 1.452 | 1.000000 | yes | yes | yes |
+| Gemma-4-E2B | safe | 35.05 | 6.490 | n/a | n/a | n/a | n/a |
+| Gemma-4-E2B | balanced | 34.26 | 6.490 | n/a | n/a | n/a | n/a |
+| Gemma-4-E2B | max-performance | 34.24 | 6.490 | n/a | n/a | n/a | n/a |
+| Gemma-4-E2B | lab | 35.02 | 6.490 | n/a | n/a | n/a | n/a |
+| Gemma-4-E2B | Transformers | OOM | OOM | n/a | n/a | n/a | n/a |
+| OLMoE-1B-7B-0924-Instruct | safe | 8.99 | 6.935 | n/a | n/a | n/a | n/a |
+| OLMoE-1B-7B-0924-Instruct | balanced | 30.65 | 6.832 | n/a | n/a | n/a | n/a |
+| OLMoE-1B-7B-0924-Instruct | max-performance | 31.28 | 6.772 | n/a | n/a | n/a | n/a |
+| OLMoE-1B-7B-0924-Instruct | lab | 10.23 | 6.935 | n/a | n/a | n/a | n/a |
+| OLMoE-1B-7B-0924-Instruct | Transformers | OOM | OOM | n/a | n/a | n/a | n/a |
 
 Quality rows are the minimum across the public quick suite at prefill lengths
 1 and 128 and decode steps 1 and 10. Gemma max-performance was additionally

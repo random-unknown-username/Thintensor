@@ -86,11 +86,37 @@ pub struct ModelSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layer_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_conv_kernel_dim: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_key_head_dim: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_value_head_dim: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_num_key_heads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_num_value_heads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_output_gate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_head_dim: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_global_key_value_heads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_kv_shared_layers: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_size_per_layer_input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocab_size_per_layer_input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_double_wide_mlp: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_sinks: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_local_experts: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_experts_per_token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norm_topk_prob: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swiglu_alpha: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -181,12 +181,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass semantic capability checks for an explicit experiment",
     )
     p_run.add_argument(
-        "--residency", choices=["all", "stream"], default="all",
-        help="Weight residency policy",
+        "--residency", choices=["auto", "all", "stream"], default="auto",
+        help="Weight residency policy; auto accounts for weights, KV, and runtime headroom",
     )
     p_run.add_argument(
-        "--gpu-weight-budget", default="0",
-        help="Streaming GPU weight budget such as 6GiB; required for bounded residency",
+        "--gpu-weight-budget", "--gpu-memory-budget", dest="gpu_weight_budget",
+        default="0",
+        help="Whole-device memory budget such as 6GiB; auto reserves KV and runtime headroom",
+    )
+    p_run.add_argument(
+        "--auto-quant",
+        choices=["auto", "off", "on", "aggressive"],
+        default="auto",
+        help="Layer-aware precision policy; auto follows the selected profile",
     )
     p_run.add_argument("--prefetch-layers", type=int, default=0)
     p_run.add_argument("--cpu-offload", action="store_true")
@@ -245,6 +252,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--trust-remote-code", action="store_true")
     p_chat.add_argument("--profile", default="auto")
     p_chat.add_argument("--force-profile", action="store_true")
+    p_chat.add_argument(
+        "--residency", choices=["auto", "all", "stream"], default="auto"
+    )
+    p_chat.add_argument(
+        "--gpu-weight-budget", "--gpu-memory-budget",
+        dest="gpu_weight_budget", default="0"
+    )
+    p_chat.add_argument(
+        "--auto-quant",
+        choices=["auto", "off", "on", "aggressive"],
+        default="auto",
+    )
+    p_chat.add_argument("--prefetch-layers", type=int, default=0)
     p_chat.add_argument("--tokenizer")
     p_chat.add_argument("--hf-source")
     p_chat.add_argument("--allow-experimental", action="store_true")
@@ -264,6 +284,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p_bench.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p_bench.add_argument("--force-profile", action="store_true")
+    p_bench.add_argument(
+        "--residency", choices=["auto", "all", "stream"], default="auto"
+    )
+    p_bench.add_argument(
+        "--gpu-weight-budget", "--gpu-memory-budget",
+        dest="gpu_weight_budget", default="0"
+    )
+    p_bench.add_argument(
+        "--auto-quant",
+        choices=["auto", "off", "on", "aggressive"],
+        default="auto",
+    )
     p_bench.add_argument("--max-gpu-temp", type=int, default=87)
     p_bench.add_argument("--json", action="store_true")
     p_bench.add_argument("--out", type=str, help="Write JSON results to this file or directory")
@@ -359,6 +391,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Analyze an HF directory or .thin archive",
     )
     p_explain.add_argument("--json", action="store_true")
+    p_explain.add_argument("--context", type=int, default=2048)
+    p_explain.add_argument(
+        "--gpu-memory-budget",
+        default="0",
+        help="Show the automatic fit plan for this whole-device budget",
+    )
 
     p_architectures = sub.add_parser(
         "architectures",
@@ -703,6 +741,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         prefetch_layers=args.prefetch_layers,
         cpu_offload=args.cpu_offload,
         pin_cpu_pages=args.pin_cpu_pages,
+        auto_quant=args.auto_quant,
         tokenizer_source=args.tokenizer,
         json_output=args.json,
     )
@@ -820,6 +859,10 @@ def cmd_chat(args: argparse.Namespace) -> None:
         device=args.device,
         dtype=args.dtype,
         tokenizer_source=args.tokenizer,
+        weight_residency=args.residency,
+        gpu_weight_budget=args.gpu_weight_budget,
+        prefetch_layers=args.prefetch_layers,
+        auto_quant=args.auto_quant,
     )
 
 
@@ -887,6 +930,9 @@ def cmd_bench(args: argparse.Namespace) -> None:
             max_gpu_temp=args.max_gpu_temp,
             dry_run=args.dry_run,
             quiet=args.json,
+            residency=args.residency,
+            gpu_weight_budget=args.gpu_weight_budget,
+            auto_quant=args.auto_quant,
         )
         if result:
             results.append(result)
@@ -1019,7 +1065,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
             print(completed.stderr, file=sys.stderr, end="")
         raise SystemExit(completed.returncode)
     try:
-        result = json.loads(completed.stdout)
+        result = _parse_json_stdout(completed.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             f"validator returned invalid JSON: {exc}"
@@ -1165,13 +1211,22 @@ def cmd_explain(args: argparse.Namespace) -> None:
 
     model = None
     native_support = None
+    automatic_fit = None
     if args.model:
         candidate = Path(args.model)
         if candidate.suffix == ".thin":
             model = _archive_model(args.model)
             from .capabilities import analyze_archive_model
+            import torch
 
             native_support = analyze_archive_model(model)
+            automatic_fit = _automatic_fit_plan(
+                str(candidate),
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                context=args.context,
+                budget_text=args.gpu_memory_budget,
+                auto_quant="on",
+            ).as_dict()
         else:
             from .capabilities import analyze_hf_directory
 
@@ -1209,6 +1264,10 @@ def cmd_explain(args: argparse.Namespace) -> None:
                 payload["compatibility_reason"] = reason
             rows.append(payload)
 
+    if automatic_fit is not None:
+        for row in rows:
+            row["automatic_fit"] = automatic_fit
+
     if args.json:
         print(json.dumps(rows[0] if len(rows) == 1 else rows, indent=2))
         return
@@ -1228,6 +1287,13 @@ def cmd_explain(args: argparse.Namespace) -> None:
             _kv("Engine", engine_decision["engine"])
             if engine_decision["reasons"]:
                 _kv("Native blockers", "; ".join(engine_decision["reasons"]))
+        if row.get("automatic_fit"):
+            fit = row["automatic_fit"]
+            _kv("Automatic fit", fit["mode"])
+            _kv("Device budget", _format_bytes(fit["total_budget_bytes"]))
+            _kv("Weight budget", _format_bytes(fit["weight_budget_bytes"]))
+            if fit.get("expert_int4_layer_spec"):
+                _kv("INT4 expert layers", fit["expert_int4_layer_spec"])
         tradeoffs = row.get("tradeoffs") or ()
         if tradeoffs:
             print("\nTradeoffs:")
@@ -1706,6 +1772,52 @@ def _parse_bytes(value: str) -> int:
     return int(text)
 
 
+def _automatic_fit_plan(
+    archive_path: str,
+    *,
+    device: str,
+    context: int,
+    budget_text: str,
+    auto_quant: str,
+):
+    from .auto_fit import plan_auto_fit
+
+    if device == "cuda":
+        import torch
+
+        total_device_bytes = int(
+            torch.cuda.get_device_properties(torch.device(device)).total_memory
+        )
+    else:
+        try:
+            import psutil
+
+            total_device_bytes = int(psutil.virtual_memory().available)
+        except Exception:
+            total_device_bytes = 16 * 1024**3
+    return plan_auto_fit(
+        archive_path,
+        total_device_bytes=total_device_bytes,
+        total_budget_bytes=_parse_bytes(budget_text),
+        context_tokens=context,
+        mode=auto_quant,
+    )
+
+
+def _profile_auto_quant_mode(profile: dict[str, Any], requested: str) -> str:
+    if requested != "auto":
+        return requested
+    preferred = profile.get("preferred_auto_quant")
+    if preferred in {"off", "on", "aggressive"}:
+        return str(preferred)
+    name = str(profile.get("name") or "balanced")
+    if name in {"safe", "lab"}:
+        return "off"
+    if name == "max-performance":
+        return "aggressive"
+    return "on"
+
+
 def _emit_command(command: list[str], *, json_output: bool) -> None:
     import shlex
 
@@ -2105,6 +2217,7 @@ def _run_inference(
     prefetch_layers: int,
     cpu_offload: bool,
     pin_cpu_pages: bool,
+    auto_quant: str,
     tokenizer_source: Optional[str],
     json_output: bool,
 ) -> None:
@@ -2135,12 +2248,48 @@ def _run_inference(
         ThinGpuWeights,
     )
 
+    auto_fit_plan = None
+    auto_quant = _profile_auto_quant_mode(profile, auto_quant)
+    if weight_residency == "auto":
+        auto_fit_plan = _automatic_fit_plan(
+            archive_path,
+            device=device,
+            context=context,
+            budget_text=gpu_weight_budget,
+            auto_quant=auto_quant,
+        )
+        weight_residency = auto_fit_plan.residency
+    elif weight_residency == "stream":
+        auto_fit_plan = _automatic_fit_plan(
+            archive_path,
+            device=device,
+            context=context,
+            budget_text=gpu_weight_budget,
+            auto_quant="off",
+        )
+
     if weight_residency == "stream":
-        budget = _parse_bytes(gpu_weight_budget)
+        budget = (
+            auto_fit_plan.weight_budget_bytes
+            if auto_fit_plan is not None
+            else _parse_bytes(gpu_weight_budget)
+        )
         if budget <= 0:
             raise ValueError(
-                "--residency stream requires a positive --gpu-weight-budget"
+                "streaming requires a positive device budget after KV and runtime reserves"
             )
+        if auto_fit_plan is not None and auto_fit_plan.dense_fp8:
+            profile = {
+                **profile,
+                "gate_up_fp8": True,
+                "down_proj_fp8": True,
+                "qkv_fp8": True,
+                "o_proj_fp8": True,
+                "down_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+                "fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+                "qkv_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+                "o_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+            }
         weights = ThinGpuPagePool(
             archive_path,
             device=device,
@@ -2154,6 +2303,35 @@ def _run_inference(
             qkv_fp8=bool(profile.get("qkv_fp8")),
             o_proj_fp8=bool(profile.get("o_proj_fp8")),
             down_fp8_layer_spec=profile.get("down_fp8_layer_spec"),
+            fp8_layer_spec=profile.get("fp8_layer_spec"),
+            qkv_fp8_layer_spec=profile.get("qkv_fp8_layer_spec"),
+            o_fp8_layer_spec=profile.get("o_fp8_layer_spec"),
+            expert_int4=bool(
+                auto_fit_plan is not None and auto_fit_plan.expert_int4
+            ),
+            expert_int4_layer_spec=(
+                auto_fit_plan.expert_int4_layer_spec
+                if auto_fit_plan is not None
+                else None
+            ),
+            expert_int4_group_size=(
+                auto_fit_plan.expert_int4_group_size
+                if auto_fit_plan is not None
+                else 32
+            ),
+            dense_int4=bool(
+                auto_fit_plan is not None and auto_fit_plan.dense_int4
+            ),
+            dense_int4_layer_spec=(
+                auto_fit_plan.dense_int4_layer_spec
+                if auto_fit_plan is not None
+                else None
+            ),
+            dense_int4_group_size=(
+                auto_fit_plan.dense_int4_group_size
+                if auto_fit_plan is not None
+                else 32
+            ),
         )
         weights.warm_start()
     else:
@@ -2178,9 +2356,16 @@ def _run_inference(
 
     runtime_kwargs = profile_to_runtime_kwargs(profile)
     exact_prefill = bool(profile.get("exact_prefill"))
-    if exact_prefill and weight_residency != "all":
-        weights.close()
-        raise ValueError("exact prefill currently requires all-resident weights")
+    if auto_fit_plan is not None and (auto_fit_plan.expert_int4 or auto_fit_plan.dense_fp8 or auto_fit_plan.dense_int4):
+        exact_prefill = False
+        runtime_kwargs["adaptive_body_int8_start_token"] = -1
+    if exact_prefill:
+        is_all_resident = (weight_residency == "all")
+        if not is_all_resident and isinstance(weights, ThinGpuPagePool):
+            is_all_resident = weights.is_fully_pinned
+        if not is_all_resident:
+            weights.close()
+            raise ValueError("exact prefill currently requires all-resident weights")
     prefill_runtime = None
     runtime = None
     if exact_prefill:
@@ -2210,6 +2395,14 @@ def _run_inference(
     if not json_output:
         _kv("Load time", f"{load_time:.2f}s")
         _kv("Resident weights", _format_bytes(weights.resident_weight_bytes))
+        if auto_fit_plan is not None:
+            _kv("Automatic fit", auto_fit_plan.mode)
+            _kv("Weight budget", _format_bytes(auto_fit_plan.weight_budget_bytes))
+            if auto_fit_plan.expert_int4_layers:
+                _kv(
+                    "INT4 expert layers",
+                    auto_fit_plan.expert_int4_layer_spec,
+                )
         print()
 
     token_ids = _tokenize_prompt(
@@ -2316,6 +2509,8 @@ def _run_inference(
             "measurement_mode": "interactive_synchronous",
             "benchmark_comparable": False,
         }
+        if auto_fit_plan is not None:
+            result["auto_fit"] = auto_fit_plan.as_dict()
         if device == "cuda":
             result["peak_gpu_memory_bytes"] = torch.cuda.max_memory_allocated()
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -2346,6 +2541,10 @@ def _run_chat_loop(
     device: str,
     dtype: str,
     tokenizer_source: Optional[str],
+    weight_residency: str,
+    gpu_weight_budget: str,
+    prefetch_layers: int,
+    auto_quant: str,
 ) -> None:
     """Interactive chat loop."""
     import torch
@@ -2367,10 +2566,64 @@ def _run_chat_loop(
     from .gpu_runtime import (
         PagedKVCache,
         ThinGpuCausalLMRuntime,
+        ThinGpuPagePool,
         ThinGpuWeights,
     )
 
-    weights = ThinGpuWeights(archive_path, device=device, dtype=torch_dtype)
+    auto_fit_plan = None
+    auto_quant = _profile_auto_quant_mode(profile, auto_quant)
+    if weight_residency == "auto":
+        auto_fit_plan = _automatic_fit_plan(
+            archive_path,
+            device=device,
+            context=context,
+            budget_text=gpu_weight_budget,
+            auto_quant=auto_quant,
+        )
+        weight_residency = auto_fit_plan.residency
+    elif weight_residency == "stream":
+        auto_fit_plan = _automatic_fit_plan(
+            archive_path,
+            device=device,
+            context=context,
+            budget_text=gpu_weight_budget,
+            auto_quant="off",
+        )
+    if weight_residency == "stream":
+        assert auto_fit_plan is not None
+        if auto_fit_plan.dense_fp8:
+            profile = {
+                **profile,
+                "gate_up_fp8": True,
+                "down_proj_fp8": True,
+                "qkv_fp8": True,
+                "o_proj_fp8": True,
+                "fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+                "down_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+                "qkv_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+                "o_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
+            }
+        weights = ThinGpuPagePool(
+            archive_path,
+            device=device,
+            dtype=torch_dtype,
+            vram_budget_bytes=auto_fit_plan.weight_budget_bytes,
+            prefetch_distance=prefetch_layers,
+            down_proj_fp8=bool(profile.get("down_proj_fp8")),
+            gate_up_fp8=bool(profile.get("gate_up_fp8")),
+            qkv_fp8=bool(profile.get("qkv_fp8")),
+            o_proj_fp8=bool(profile.get("o_proj_fp8")),
+            fp8_layer_spec=profile.get("fp8_layer_spec"),
+            down_fp8_layer_spec=profile.get("down_fp8_layer_spec"),
+            qkv_fp8_layer_spec=profile.get("qkv_fp8_layer_spec"),
+            o_fp8_layer_spec=profile.get("o_fp8_layer_spec"),
+            expert_int4=auto_fit_plan.expert_int4,
+            expert_int4_layer_spec=auto_fit_plan.expert_int4_layer_spec,
+            expert_int4_group_size=auto_fit_plan.expert_int4_group_size,
+        )
+        weights.warm_start()
+    else:
+        weights = ThinGpuWeights(archive_path, device=device, dtype=torch_dtype)
     manifest = weights.manifest
     model_info = manifest.get("model", {})
     layers = int(model_info.get("layers", 28))
@@ -2388,6 +2641,9 @@ def _run_chat_loop(
 
     runtime_kwargs = profile_to_runtime_kwargs(profile)
     exact_prefill = bool(profile.get("exact_prefill"))
+    if exact_prefill and weight_residency != "all":
+        weights.close()
+        raise ValueError("exact prefill currently requires all-resident weights")
     if exact_prefill:
         runtime = ThinGpuCausalLMRuntime(
             weights,
@@ -2401,6 +2657,10 @@ def _run_chat_loop(
         runtime = ThinGpuCausalLMRuntime(
             weights,
             kv_cache=kv_cache,
+            prefetch_distance=(
+                prefetch_layers if weight_residency == "stream" else 0
+            ),
+            evict_completed_layers=weight_residency == "stream",
             **runtime_kwargs,
         )
     adaptive_weights_active = False
@@ -2408,6 +2668,8 @@ def _run_chat_loop(
     load_time = time.perf_counter() - t0
     _kv("Loaded in", f"{load_time:.2f}s")
     _kv("Resident weights", _format_bytes(weights.resident_weight_bytes))
+    if auto_fit_plan is not None:
+        _kv("Automatic fit", auto_fit_plan.mode)
     print()
 
     total_tokens = 0
@@ -2595,6 +2857,9 @@ def _run_benchmark_profile(
     max_gpu_temp: int,
     dry_run: bool,
     quiet: bool,
+    residency: str,
+    gpu_weight_budget: str,
+    auto_quant: str,
 ) -> Optional[dict]:
     """Run the trusted real causal-KV decode benchmark in a fresh process."""
     from .profile_presets import (
@@ -2607,6 +2872,26 @@ def _run_benchmark_profile(
         for flag in profile_to_runtime_flags(profile)
         if flag != "--exact-prefill"
     ]
+    auto_fit_plan = None
+    effective_residency = residency
+    auto_quant = _profile_auto_quant_mode(profile, auto_quant)
+    if residency == "auto":
+        auto_fit_plan = _automatic_fit_plan(
+            archive_path,
+            device=device,
+            context=max(512, steps + warmup + 1),
+            budget_text=gpu_weight_budget,
+            auto_quant=auto_quant,
+        )
+        effective_residency = auto_fit_plan.residency
+    elif residency == "stream":
+        auto_fit_plan = _automatic_fit_plan(
+            archive_path,
+            device=device,
+            context=max(512, steps + warmup + 1),
+            budget_text=gpu_weight_budget,
+            auto_quant="off",
+        )
     command = [
         sys.executable,
         str(_tool_script("thin_runtime.py")),
@@ -2617,7 +2902,7 @@ def _run_benchmark_profile(
         "--dtype",
         dtype,
         "--residency",
-        "all",
+        effective_residency,
         "--steps",
         str(steps),
         "--warmup-steps",
@@ -2629,6 +2914,44 @@ def _run_benchmark_profile(
         "--json",
         *runtime_flags,
     ]
+    if auto_fit_plan is not None and effective_residency == "stream":
+        command.extend(
+            [
+                "--gpu-weight-budget",
+                str(auto_fit_plan.weight_budget_bytes),
+            ]
+        )
+        if auto_fit_plan.expert_int4:
+            command.append("--expert-int4")
+            if auto_fit_plan.expert_int4_layer_spec:
+                command.extend(
+                    [
+                        "--expert-int4-layers",
+                        auto_fit_plan.expert_int4_layer_spec,
+                    ]
+                )
+            command.extend(
+                [
+                    "--expert-int4-group-size",
+                    str(auto_fit_plan.expert_int4_group_size),
+                ]
+            )
+        if auto_fit_plan.dense_fp8:
+            layer_spec = auto_fit_plan.dense_fp8_layer_spec
+            command.extend(
+                [
+                    "--mlp-fp8",
+                    "--attn-proj-fp8",
+                    "--fp8-layers",
+                    str(layer_spec),
+                    "--down-fp8-layers",
+                    str(layer_spec),
+                    "--qkv-fp8-layers",
+                    str(layer_spec),
+                    "--o-fp8-layers",
+                    str(layer_spec),
+                ]
+            )
     if profile.get("experimental_int8_tensorcore"):
         command.append("--experimental-int8-tensorcore")
     if dry_run:
@@ -2655,7 +2978,7 @@ def _run_benchmark_profile(
             "command": command,
         }
     try:
-        raw = json.loads(completed.stdout)
+        raw = _parse_json_stdout(completed.stdout)
     except json.JSONDecodeError as exc:
         return {
             "profile": profile_name,
@@ -2673,6 +2996,9 @@ def _run_benchmark_profile(
         "bytes_moved_per_token": raw.get("bytes_moved_per_token"),
         "steps": raw.get("steps"),
         "warmup_steps": raw.get("warmup_steps"),
+        "auto_fit": (
+            auto_fit_plan.as_dict() if auto_fit_plan is not None else None
+        ),
         "attention_mode": "causal_kv",
         "correctness_required": True,
         "steady_state_eligible": steps >= 200 and warmup >= 10,
@@ -2740,7 +3066,7 @@ def _run_transformers_benchmark(
             "command": command,
         }
     try:
-        raw = json.loads(completed.stdout)
+        raw = _parse_json_stdout(completed.stdout)
     except json.JSONDecodeError as exc:
         return {
             "profile": "transformers",
@@ -2761,6 +3087,27 @@ def _run_transformers_benchmark(
         "steady_state_eligible": steps >= 200 and warmup >= 10,
         "raw": raw,
     }
+
+
+def _parse_json_stdout(stdout: str) -> Any:
+    """Parse a tool result even when an upstream library logs to stdout."""
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as original:
+        starts = [
+            index + 1
+            for index in range(len(stdout))
+            if stdout.startswith("\n{", index)
+            or stdout.startswith("\n[", index)
+        ]
+        if stdout.startswith(("{", "[")):
+            starts.insert(0, 0)
+        for start in reversed(starts):
+            try:
+                return json.loads(stdout[start:])
+            except json.JSONDecodeError:
+                continue
+        raise original
 
 
 def _print_bench_table(results: list[dict], json_output: bool = False, out_dir: Optional[str] = None) -> None:

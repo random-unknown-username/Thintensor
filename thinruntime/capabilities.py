@@ -51,6 +51,19 @@ def analyze_hf_directory(path: str | Path) -> NativeSupport:
         )
 
     tensor_names = _tensor_names(root)
+    text = config.get("text_config")
+    if isinstance(text, dict):
+        effective = dict(text)
+        for key in ("architectures", "tie_word_embeddings", "model_type"):
+            if key in config:
+                effective[key] = config[key]
+        config = effective
+        prefix = "model.language_model."
+        tensor_names = tuple(
+            f"model.{name.removeprefix(prefix)}"
+            for name in tensor_names
+            if name.startswith(prefix)
+        )
     return analyze_config(config, tensor_names=tensor_names)
 
 
@@ -99,7 +112,13 @@ def analyze_config(
         or config.get("n_routed_experts")
         or 0
     )
-    family = "decoder_moe" if experts else "decoder_dense"
+    family = (
+        "decoder_moe"
+        if experts
+        else "hybrid_decoder"
+        if "linear_attention" in (config.get("layer_types") or ())
+        else "decoder_dense"
+    )
     reasons = _semantic_reasons(
         config,
         activation=activation,
@@ -141,7 +160,9 @@ def _semantic_reasons(
             reasons.append(f"missing required geometry field {field}")
 
     supported_activations = {"silu", "swish"}
-    if str(config.get("model_type") or "").lower() == "gemma2":
+    if str(config.get("model_type") or "").lower() == "gemma2" or str(
+        config.get("model_type") or ""
+    ).lower().startswith("gemma4"):
         supported_activations.add("gelu_pytorch_tanh")
     if activation not in supported_activations:
         reasons.append(
@@ -151,6 +172,7 @@ def _semantic_reasons(
         config.get("rms_norm_eps") is None
         and config.get("layer_norm_eps") is None
         and config.get("norm_eps") is None
+        and str(config.get("model_type") or "").lower() != "olmoe"
     ):
         reasons.append(
             "native engine requires RMSNorm or LayerNorm epsilon metadata"
@@ -166,29 +188,57 @@ def _semantic_reasons(
     if not heads or not head_dim or head_dim % 2:
         reasons.append("attention head geometry is missing or has odd head_dim")
 
-    if family not in {"decoder_dense", "decoder_moe"}:
+    if family not in {"decoder_dense", "decoder_moe", "hybrid_decoder"}:
         reasons.append(f"unsupported architecture family {family!r}")
+
+    if family == "hybrid_decoder":
+        for field in (
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        ):
+            if not int(config.get(field) or 0):
+                reasons.append(f"hybrid decoder is missing {field}")
 
     if tensor_names and not archive:
         names = set(tensor_names)
-        required = (
+        required = [
             "model.embed_tokens.weight",
             "model.layers.0.input_layernorm.weight",
-            "model.layers.0.self_attn.o_proj.weight",
             "model.layers.0.post_attention_layernorm.weight",
             "model.norm.weight",
-        )
+        ]
+        if family == "hybrid_decoder":
+            required.extend(
+                f"model.layers.0.linear_attn.{name}"
+                for name in (
+                    "in_proj_qkv.weight",
+                    "in_proj_z.weight",
+                    "in_proj_a.weight",
+                    "in_proj_b.weight",
+                    "conv1d.weight",
+                    "dt_bias",
+                    "A_log",
+                    "norm.weight",
+                    "out_proj.weight",
+                )
+            )
+        else:
+            required.append("model.layers.0.self_attn.o_proj.weight")
         for name in required:
             if name not in names:
                 reasons.append(f"native tensor layout is missing {name}")
-        separate_qkv = all(
-            f"model.layers.0.self_attn.{part}_proj.weight" in names
-            for part in ("q", "k", "v")
-        )
-        fused_qkv = "model.layers.0.self_attn.qkv_proj.weight" in names
-        if not separate_qkv and not fused_qkv:
-            reasons.append("native tensor layout requires separate or fused QKV")
-        if family == "decoder_dense":
+        if family != "hybrid_decoder":
+            separate_qkv = all(
+                f"model.layers.0.self_attn.{part}_proj.weight" in names
+                for part in ("q", "k", "v")
+            )
+            fused_qkv = "model.layers.0.self_attn.qkv_proj.weight" in names
+            if not separate_qkv and not fused_qkv:
+                reasons.append("native tensor layout requires separate or fused QKV")
+        if family in {"decoder_dense", "hybrid_decoder"}:
             separate_mlp = all(
                 f"model.layers.0.mlp.{part}_proj.weight" in names
                 for part in ("gate", "up", "down")
@@ -259,11 +309,25 @@ def _result(
             else "rms_norm"
         ),
     ]
-    partial_rotary = float(config.get("partial_rotary_factor") or 1.0)
+    partial_rotary = float(
+        config.get("partial_rotary_factor")
+        or (config.get("rope_parameters") or {}).get(
+            "partial_rotary_factor"
+        )
+        or 1.0
+    )
     if partial_rotary < 1.0:
         capabilities.append(f"partial_rope:{partial_rotary:g}")
-    if family == "decoder_dense":
+    if family in {"decoder_dense", "hybrid_decoder"}:
         capabilities.extend(("fp8_projections", "adaptive_int8"))
+    if family == "hybrid_decoder":
+        capabilities.extend(
+            (
+                "gated_deltanet",
+                "recurrent_state_cache",
+                "gated_full_attention",
+            )
+        )
     if config.get("layer_types") or (
         config.get("sliding_window") is not None
         and bool(config.get("use_sliding_window", True))

@@ -39,21 +39,28 @@ pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
         bail!("config.json missing in {}", options.hf_dir.display());
     }
 
-    let config: Value = serde_json::from_reader(
+    let source_config: Value = serde_json::from_reader(
         File::open(&config_path).with_context(|| format!("open {}", config_path.display()))?,
     )
     .with_context(|| format!("parse {}", config_path.display()))?;
+    let config = effective_text_config(&source_config);
     let safetensor_paths = collect_safetensors(&options.hf_dir)?;
     if safetensor_paths.is_empty() {
         bail!("no safetensors files found in {}", options.hf_dir.display());
     }
 
     let mut warnings = Vec::new();
-    let tensors = collect_tensors(&safetensor_paths)?;
+    let raw_tensors = collect_tensors(&safetensor_paths)?;
+    let (tensors, excluded_tensors) = canonical_text_tensors(&source_config, raw_tensors)?;
+    if excluded_tensors > 0 {
+        warnings.push(format!(
+            "excluded {excluded_tensors} non-text vision/MTP tensors from the native text archive"
+        ));
+    }
     let layers = required_u32(&config, "num_hidden_layers")?;
     let model = build_model_spec(&config, layers, &tensors, &options, &mut warnings)?;
     let pages = build_pages(&tensors, &config)?;
-    let execution_tape = build_execution_tape(layers, &tensors, &mut warnings)?;
+    let execution_tape = build_execution_tape(layers, &tensors, &config, &mut warnings)?;
     warn_unknown_tensors(&tensors, layers, &execution_tape, &mut warnings);
     let archive_pages = archive_pages(&tensors, &execution_tape);
 
@@ -78,6 +85,48 @@ pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
     }
 
     Ok(ConvertHfResult { archive, warnings })
+}
+
+fn effective_text_config(source: &Value) -> Value {
+    let Some(text) = source.get("text_config").and_then(Value::as_object) else {
+        return source.clone();
+    };
+    let mut config = text.clone();
+    for key in ["architectures", "tie_word_embeddings"] {
+        if let Some(value) = source.get(key) {
+            config.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(model_type) = source.get("model_type") {
+        config.insert("model_type".to_string(), model_type.clone());
+    }
+    Value::Object(config)
+}
+
+fn canonical_text_tensors(
+    source_config: &Value,
+    tensors: BTreeMap<String, TensorPage>,
+) -> Result<(BTreeMap<String, TensorPage>, usize)> {
+    if source_config.get("text_config").is_none() {
+        return Ok((tensors, 0));
+    }
+    const PREFIX: &str = "model.language_model.";
+    let mut canonical = BTreeMap::new();
+    let mut excluded = 0;
+    for (name, mut page) in tensors {
+        let Some(suffix) = name.strip_prefix(PREFIX) else {
+            excluded += 1;
+            continue;
+        };
+        page.id = format!("model.{suffix}");
+        if canonical.insert(page.id.clone(), page).is_some() {
+            bail!("canonical text tensor name collision for {name}");
+        }
+    }
+    if canonical.is_empty() {
+        bail!("text_config exists but no {PREFIX} tensors were found");
+    }
+    Ok((canonical, excluded))
 }
 
 fn collect_safetensors(hf_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -184,7 +233,8 @@ fn build_model_spec(
     if optional_u32(config, "num_key_value_heads").is_none() && kv_heads != heads {
         warnings.push(format!("num_key_value_heads inferred as {kv_heads}"));
     }
-    let source_dtype = optional_string(config, "torch_dtype");
+    let source_dtype =
+        optional_string(config, "torch_dtype").or_else(|| optional_string(config, "dtype"));
     let dtype = source_dtype
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -218,6 +268,35 @@ fn build_model_spec(
         "o_projection".to_string(),
         "lm_head".to_string(),
     ];
+    let has_linear_attention = config
+        .get("layer_types")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some("linear_attention"))
+        });
+    if has_linear_attention {
+        required_operators.extend([
+            "gated_delta_net".to_string(),
+            "depthwise_causal_conv1d".to_string(),
+            "recurrent_state_cache".to_string(),
+            "gated_full_attention".to_string(),
+        ]);
+    }
+    if config
+        .get("model_type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.starts_with("gemma4"))
+    {
+        required_operators.extend([
+            "per_layer_embeddings".to_string(),
+            "variable_head_dim_attention".to_string(),
+            "shared_kv_attention".to_string(),
+            "post_attention_norm".to_string(),
+            "post_feedforward_norm".to_string(),
+        ]);
+    }
     if attention_sinks {
         required_operators.push("attention_sinks".to_string());
     }
@@ -260,8 +339,12 @@ fn build_model_spec(
         head_dim: optional_u64(config, "head_dim"),
         dtype,
         intermediate_size: optional_u64(config, "intermediate_size"),
-        rms_norm_eps: optional_f64(config, "rms_norm_eps"),
-        norm_kind: if optional_f64(config, "rms_norm_eps").is_some() {
+        rms_norm_eps: optional_f64(config, "rms_norm_eps").or_else(|| {
+            (config.get("model_type").and_then(Value::as_str) == Some("olmoe")).then_some(1e-5)
+        }),
+        norm_kind: if optional_f64(config, "rms_norm_eps").is_some()
+            || config.get("model_type").and_then(Value::as_str) == Some("olmoe")
+        {
             Some("rms_norm".to_string())
         } else if optional_f64(config, "layer_norm_eps").is_some() {
             Some("layer_norm".to_string())
@@ -269,9 +352,22 @@ fn build_model_spec(
             None
         },
         norm_eps: optional_f64(config, "rms_norm_eps")
-            .or_else(|| optional_f64(config, "layer_norm_eps")),
-        rope_theta: optional_f64(config, "rope_theta"),
-        partial_rotary_factor: optional_f64(config, "partial_rotary_factor"),
+            .or_else(|| optional_f64(config, "layer_norm_eps"))
+            .or_else(|| {
+                (config.get("model_type").and_then(Value::as_str) == Some("olmoe")).then_some(1e-5)
+            }),
+        rope_theta: optional_f64(config, "rope_theta").or_else(|| {
+            config
+                .get("rope_parameters")
+                .and_then(|value| value.get("rope_theta"))
+                .and_then(Value::as_f64)
+        }),
+        partial_rotary_factor: optional_f64(config, "partial_rotary_factor").or_else(|| {
+            config
+                .get("rope_parameters")
+                .and_then(|value| value.get("partial_rotary_factor"))
+                .and_then(Value::as_f64)
+        }),
         rope_scaling: config
             .get("rope_scaling")
             .filter(|value| !value.is_null())
@@ -336,7 +432,9 @@ fn build_model_spec(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         architecture_family: Some(
-            if is_moe {
+            if has_linear_attention {
+                "hybrid_decoder"
+            } else if is_moe {
                 "decoder_moe"
             } else {
                 "decoder_dense"
@@ -371,17 +469,37 @@ fn build_model_spec(
                     Vec::new()
                 }
             }),
+        linear_conv_kernel_dim: optional_u64(config, "linear_conv_kernel_dim"),
+        linear_key_head_dim: optional_u64(config, "linear_key_head_dim"),
+        linear_value_head_dim: optional_u64(config, "linear_value_head_dim"),
+        linear_num_key_heads: optional_u64(config, "linear_num_key_heads"),
+        linear_num_value_heads: optional_u64(config, "linear_num_value_heads"),
+        attention_output_gate: config.get("attn_output_gate").and_then(Value::as_bool),
+        global_head_dim: optional_u64(config, "global_head_dim"),
+        num_global_key_value_heads: optional_u64(config, "num_global_key_value_heads"),
+        num_kv_shared_layers: optional_u64(config, "num_kv_shared_layers"),
+        hidden_size_per_layer_input: optional_u64(config, "hidden_size_per_layer_input"),
+        vocab_size_per_layer_input: optional_u64(config, "vocab_size_per_layer_input"),
+        use_double_wide_mlp: config.get("use_double_wide_mlp").and_then(Value::as_bool),
         attention_sinks: Some(attention_sinks),
         num_local_experts,
         num_experts_per_token,
+        norm_topk_prob: config.get("norm_topk_prob").and_then(Value::as_bool),
         swiglu_alpha: optional_f64(config, "swiglu_alpha"),
         swiglu_limit: optional_f64(config, "swiglu_limit"),
-        norm_weight_offset: if config.get("model_type").and_then(Value::as_str) == Some("gemma2") {
+        norm_weight_offset: if matches!(
+            config.get("model_type").and_then(Value::as_str),
+            Some("gemma2" | "qwen3_5")
+        ) {
             Some(1.0)
         } else {
             None
         },
-        embedding_scale: if config.get("model_type").and_then(Value::as_str) == Some("gemma2") {
+        embedding_scale: if config
+            .get("model_type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "gemma2" || value.starts_with("gemma4"))
+        {
             Some((hidden_size as f64).sqrt())
         } else {
             None
@@ -509,6 +627,7 @@ fn build_pages(tensors: &BTreeMap<String, TensorPage>, config: &Value) -> Result
 fn build_execution_tape(
     layers: u32,
     tensors: &BTreeMap<String, TensorPage>,
+    config: &Value,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<ExecutionStage>> {
     if !tensors.contains_key(EMBED) {
@@ -517,10 +636,40 @@ fn build_execution_tape(
 
     let mut stages = Vec::new();
     stages.push(stage("embed", vec![EMBED.to_string()]));
+    let per_layer_input_refs = [
+        "model.embed_tokens_per_layer.weight",
+        "model.per_layer_model_projection.weight",
+        "model.per_layer_projection_norm.weight",
+    ];
+    if per_layer_input_refs
+        .iter()
+        .all(|name| tensors.contains_key(*name))
+    {
+        stages.push(stage(
+            "per_layer_inputs",
+            per_layer_input_refs
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        ));
+    }
 
     let mut missing_q_norm = 0_u32;
     let mut missing_k_norm = 0_u32;
     for layer in 0..layers {
+        let is_linear_attention = config
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .and_then(|values| values.get(layer as usize))
+            .and_then(Value::as_str)
+            == Some("linear_attention");
+        let first_kv_shared_layer = layers.saturating_sub(
+            optional_u64(config, "num_kv_shared_layers")
+                .unwrap_or(0)
+                .try_into()
+                .unwrap_or(layers),
+        );
+        let is_kv_shared = layer >= first_kv_shared_layer;
         let input_norm = layer_tensor(layer, "input_layernorm.weight");
         let q_proj = layer_tensor(layer, "self_attn.q_proj.weight");
         let k_proj = layer_tensor(layer, "self_attn.k_proj.weight");
@@ -560,8 +709,13 @@ fn build_execution_tape(
         );
 
         require_tensor(tensors, &input_norm)?;
-        let fused_qkv_refs = tensor_group(tensors, &fused_qkv).ok();
-        let separate_qkv_refs = if fused_qkv_refs.is_none() {
+        let fused_qkv_refs = if is_linear_attention {
+            None
+        } else {
+            tensor_group(tensors, &fused_qkv).ok()
+        };
+        let separate_qkv_refs = if !is_linear_attention && !is_kv_shared && fused_qkv_refs.is_none()
+        {
             Some([
                 tensor_group(tensors, &q_proj)?,
                 tensor_group(tensors, &k_proj)?,
@@ -570,7 +724,11 @@ fn build_execution_tape(
         } else {
             None
         };
-        let o_projection_refs = tensor_group(tensors, &o_proj)?;
+        let o_projection_refs = if is_linear_attention {
+            Vec::new()
+        } else {
+            tensor_group(tensors, &o_proj)?
+        };
         require_tensor(tensors, &post_norm)?;
 
         let mut input_norm_refs = vec![input_norm.clone()];
@@ -581,45 +739,69 @@ fn build_execution_tape(
         );
         stages.push(stage(format!("layer_{layer}_input_norm"), input_norm_refs));
 
-        let mut qkv_refs = if let Some(refs) = fused_qkv_refs {
-            refs
-        } else {
-            separate_qkv_refs
-                .expect("separate QKV groups were built")
-                .into_iter()
-                .flatten()
-                .collect()
-        };
-        for suffix in [
-            "self_attn.qkv_proj.bias",
-            "self_attn.q_proj.bias",
-            "self_attn.k_proj.bias",
-            "self_attn.v_proj.bias",
-            "self_attn.sinks",
-        ] {
-            let name = layer_tensor(layer, suffix);
-            if tensors.contains_key(&name) {
-                qkv_refs.push(name);
+        if is_linear_attention {
+            let mut refs = Vec::new();
+            for suffix in [
+                "linear_attn.in_proj_qkv.weight",
+                "linear_attn.in_proj_z.weight",
+                "linear_attn.in_proj_a.weight",
+                "linear_attn.in_proj_b.weight",
+                "linear_attn.conv1d.weight",
+                "linear_attn.dt_bias",
+                "linear_attn.A_log",
+                "linear_attn.norm.weight",
+                "linear_attn.out_proj.weight",
+            ] {
+                let name = layer_tensor(layer, suffix);
+                require_tensor(tensors, &name)?;
+                refs.push(name);
             }
-        }
-        if tensors.contains_key(&q_norm) {
-            qkv_refs.push(q_norm);
+            stages.push(stage(format!("layer_{layer}_linear_attention"), refs));
         } else {
-            missing_q_norm += 1;
+            let mut qkv_refs = if let Some(refs) = fused_qkv_refs {
+                refs
+            } else if is_kv_shared {
+                tensor_group(tensors, &q_proj)?
+            } else {
+                separate_qkv_refs
+                    .expect("separate QKV groups were built")
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
+            for suffix in [
+                "self_attn.qkv_proj.bias",
+                "self_attn.q_proj.bias",
+                "self_attn.k_proj.bias",
+                "self_attn.v_proj.bias",
+                "self_attn.sinks",
+            ] {
+                let name = layer_tensor(layer, suffix);
+                if tensors.contains_key(&name) {
+                    qkv_refs.push(name);
+                }
+            }
+            if tensors.contains_key(&q_norm) {
+                qkv_refs.push(q_norm);
+            } else {
+                missing_q_norm += 1;
+            }
+            if tensors.contains_key(&k_norm) {
+                qkv_refs.push(k_norm);
+            } else if !is_kv_shared {
+                missing_k_norm += 1;
+            }
+            stages.push(stage(format!("layer_{layer}_attn_qkv"), qkv_refs));
+            stages.push(stage(format!("layer_{layer}_rope"), Vec::new()));
         }
-        if tensors.contains_key(&k_norm) {
-            qkv_refs.push(k_norm);
-        } else {
-            missing_k_norm += 1;
+        if !is_linear_attention {
+            let mut o_refs = o_projection_refs;
+            let o_bias = layer_tensor(layer, "self_attn.o_proj.bias");
+            if tensors.contains_key(&o_bias) {
+                o_refs.push(o_bias);
+            }
+            stages.push(stage(format!("layer_{layer}_attn_out"), o_refs));
         }
-        stages.push(stage(format!("layer_{layer}_attn_qkv"), qkv_refs));
-        stages.push(stage(format!("layer_{layer}_rope"), Vec::new()));
-        let mut o_refs = o_projection_refs;
-        let o_bias = layer_tensor(layer, "self_attn.o_proj.bias");
-        if tensors.contains_key(&o_bias) {
-            o_refs.push(o_bias);
-        }
-        stages.push(stage(format!("layer_{layer}_attn_out"), o_refs));
         let mut post_norm_refs = vec![post_norm];
         push_if_present(
             tensors,
@@ -712,6 +894,18 @@ fn build_execution_tape(
                 format!("layer_{layer}_post_feedforward_norm"),
                 vec![post_feedforward_norm],
             ));
+        }
+        let per_layer_gate = layer_tensor(layer, "per_layer_input_gate.weight");
+        let per_layer_projection = layer_tensor(layer, "per_layer_projection.weight");
+        let post_per_layer_norm = layer_tensor(layer, "post_per_layer_input_norm.weight");
+        let layer_scalar = layer_tensor(layer, "layer_scalar");
+        if tensors.contains_key(&per_layer_gate)
+            && tensors.contains_key(&per_layer_projection)
+            && tensors.contains_key(&post_per_layer_norm)
+        {
+            let mut refs = vec![per_layer_gate, per_layer_projection, post_per_layer_norm];
+            push_if_present(tensors, &mut refs, layer_scalar);
+            stages.push(stage(format!("layer_{layer}_per_layer_input"), refs));
         }
     }
 
@@ -980,6 +1174,30 @@ fn op_from_tensor(name: &str) -> &str {
         "pre_feedforward_layernorm"
     } else if name.ends_with("post_feedforward_layernorm.weight") {
         "post_feedforward_layernorm"
+    } else if name == "model.embed_tokens_per_layer.weight" {
+        "per_layer_token_embeddings"
+    } else if name == "model.per_layer_model_projection.weight" {
+        "per_layer_model_projection"
+    } else if name == "model.per_layer_projection_norm.weight" {
+        "per_layer_projection_norm"
+    } else if name.ends_with("per_layer_input_gate.weight") {
+        "per_layer_input_gate"
+    } else if name.ends_with("per_layer_projection.weight") {
+        "per_layer_projection"
+    } else if name.ends_with("post_per_layer_input_norm.weight") {
+        "post_per_layer_input_norm"
+    } else if name.ends_with("layer_scalar") {
+        "layer_scalar"
+    } else if name.contains(".linear_attn.in_proj_") {
+        "linear_attn_input_projection"
+    } else if name.ends_with(".linear_attn.conv1d.weight") {
+        "linear_attn_depthwise_conv"
+    } else if name.ends_with(".linear_attn.A_log") || name.ends_with(".linear_attn.dt_bias") {
+        "linear_attn_recurrence_parameters"
+    } else if name.ends_with(".linear_attn.norm.weight") {
+        "linear_attn_gated_norm"
+    } else if name.ends_with(".linear_attn.out_proj.weight") {
+        "linear_attn_output_projection"
     } else if name.ends_with("self_attn.sinks") {
         "attention_sinks"
     } else if name.ends_with("mlp.router.weight") || name.ends_with("block_sparse_moe.gate.weight")
@@ -1029,7 +1247,9 @@ fn backend_layout(name: &str) -> String {
 
 fn normalize_arch(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("qwen") {
+    if lower.contains("qwen3_5") || lower.contains("qwen3.5") {
+        "qwen3_5".to_string()
+    } else if lower.contains("qwen") {
         "qwen".to_string()
     } else if lower.contains("llama") {
         "llama".to_string()

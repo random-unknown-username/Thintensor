@@ -203,6 +203,9 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--prefetch-layers", type=int, default=0)
     run.add_argument("--pin-cpu-pages", action="store_true")
     run.add_argument("--debug-stream-refs", action="store_true")
+    run.add_argument("--expert-int4", action="store_true")
+    run.add_argument("--expert-int4-layers")
+    run.add_argument("--expert-int4-group-size", type=int, default=32)
     run.add_argument("--down-proj-fp8", action="store_true")
     run.add_argument("--mlp-fp8", action="store_true")
     run.add_argument("--gate-up-fp8", action="store_true")
@@ -608,6 +611,9 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 o_fp8_layer_spec=args.o_fp8_layers,
                 fp8_scale_block=args.fp8_scale_block,
                 lm_head_fp8_scale_block=args.lm_head_fp8_scale_block,
+                expert_int4=args.expert_int4,
+                expert_int4_layer_spec=args.expert_int4_layers,
+                expert_int4_group_size=args.expert_int4_group_size,
             )
             weights.warm_start()
             pool_telemetry = weights.telemetry()

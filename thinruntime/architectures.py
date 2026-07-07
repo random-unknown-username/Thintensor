@@ -147,6 +147,33 @@ ARCHITECTURES: tuple[ArchitectureStatus, ...] = (
         ),
     ),
     ArchitectureStatus(
+        name="qwen3_5",
+        aliases=("qwen3_5", "qwen3.5", "qwen35"),
+        family="hybrid_decoder",
+        tensor_schema="hf_hybrid_gated_deltanet_full_attention",
+        normalization="unit_offset_rms_norm_with_qk_norm",
+        attention="gated_deltanet_and_gated_gqa_mrope",
+        mlp="swiglu",
+        native_status="verified",
+        validated_profile="max-performance",
+        minimum_cosine=0.999297619,
+        top1_exact=True,
+        top5_set_exact=True,
+        top5_ordered_exact=False,
+        thin_tokens_per_s=119.963785,
+        hf_tokens_per_s=75.840692,
+        speedup_vs_hf=1.581786,
+        evidence_scope=(
+            "Qwen3.5-0.8B text path, RTX 5050 Laptop GPU, matched 200-token "
+            "warmed causal decode versus Transformers BF16; retained "
+            "500-token run 123.38 tok/s; exact top-1/top-5 sets through "
+            "1024-token prefill"
+        ),
+        blockers=(
+            "vision tower execution is not yet native",
+        ),
+    ),
+    ArchitectureStatus(
         name="qwen3",
         aliases=("qwen3",),
         family="dense_decoder",
@@ -192,6 +219,17 @@ ARCHITECTURES: tuple[ArchitectureStatus, ...] = (
         blockers=("matched correctness and HF speed gates not recorded",),
     ),
     ArchitectureStatus(
+        name="olmoe",
+        aliases=("olmoe",),
+        family="moe_decoder",
+        tensor_schema="hf_separate_expert_moe",
+        normalization="rms_norm_with_full_qk_norm",
+        attention="mha_rope_qk_norm",
+        mlp="topk_swiglu_moe",
+        native_status="candidate",
+        blockers=("full-checkpoint correctness and speed gates are in progress",),
+    ),
+    ArchitectureStatus(
         name="mixtral",
         aliases=("mixtral",),
         family="moe_decoder",
@@ -201,6 +239,20 @@ ARCHITECTURES: tuple[ArchitectureStatus, ...] = (
         mlp="topk_swiglu_moe",
         native_status="candidate",
         blockers=("separate-expert repack and matched performance gate pending",),
+    ),
+    ArchitectureStatus(
+        name="gemma4",
+        aliases=("gemma4", "gemma4_text"),
+        family="dense_decoder",
+        tensor_schema="gemma4_ple_shared_kv",
+        normalization="scaled_rms_norm",
+        attention="variable_head_dim_shared_kv_local_global",
+        mlp="geglu_double_wide_with_per_layer_embeddings",
+        native_status="candidate",
+        blockers=(
+            "native PLE compression and shared-KV correctness gates are in progress",
+            "vision and audio towers are not yet native",
+        ),
     ),
     ArchitectureStatus(
         name="gemma2",

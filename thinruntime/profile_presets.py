@@ -12,7 +12,11 @@ from typing import Any, Mapping
 
 
 DENSE_GATED_CAPABILITY = {
-    "architecture_family": "decoder_dense",
+    "architecture_family": (
+        "decoder_dense",
+        "decoder_moe",
+        "hybrid_decoder",
+    ),
     "activation": ("silu", "swish", "gelu_pytorch_tanh"),
 }
 
@@ -317,6 +321,108 @@ def get_profile(
             f"unknown profile {name!r}; available profiles: {available}"
         )
     result = dict(PROFILES[canonical])
+    if (
+        canonical == "max-performance"
+        and model is not None
+        and _model_value(model, "architecture_family") == "decoder_moe"
+    ):
+        # Dense adaptive-INT8 flags are semantically invalid for MoE. MoE
+        # throughput comes from full-device expert packs and batched routing.
+        result.update(
+            {
+                "label": "Maximum MoE single-stream performance",
+                "description": (
+                    "Full-VRAM selected-expert packing with fused causal "
+                    "attention and RoPE."
+                ),
+                "gate_up_fp8": False,
+                "down_proj_fp8": False,
+                "o_proj_fp8": False,
+                "qkv_fp8": False,
+                "lm_head_fp8": False,
+                "keep_bf16_lm_head": True,
+                "lm_head_backend": None,
+                "lm_head_topk_guard": 0,
+                "exact_prefill": False,
+                "adaptive_body_int8_start_token": -1,
+                "experimental_int8_tensorcore": False,
+                "fused_rope": True,
+                "required_capabilities": {
+                    "architecture_family": "decoder_moe",
+                    "activation": ("silu", "swish"),
+                },
+                "quality_contract": (
+                    "Expert precision is selected by the device-aware fit "
+                    "plan; full causal KV history remains exact."
+                ),
+                "speed_contract": (
+                    "Uses the full safe VRAM envelope and batched selected-"
+                    "expert kernels."
+                ),
+            }
+        )
+    if (
+        model is not None
+        and str(model.get("model_type") or "") == "qwen3_5"
+        and canonical in {"balanced", "max-performance"}
+    ):
+        # Qwen3.5's retained winner is its exact-BF16 fused recurrent path.
+        # Dense adaptive quantization and fused short-context GQA both regress
+        # this shape, so do not inherit model-specific legacy defaults.
+        result.update(
+            {
+                "kernel_backend": "triton-matvec",
+                "attention_backend": "torch",
+                "gate_up_fp8": False,
+                "down_proj_fp8": False,
+                "o_proj_fp8": False,
+                "qkv_fp8": False,
+                "lm_head_fp8": False,
+                "keep_bf16_lm_head": True,
+                "lm_head_topk_guard": 0,
+                "exact_prefill": False,
+                "adaptive_body_int8_start_token": -1,
+                "experimental_int8_tensorcore": False,
+                "fused_rope": False,
+                "preferred_auto_quant": "off",
+                "quality_contract": (
+                    "BF16 weights, FP32 recurrent DeltaNet state, and full "
+                    "uncompressed BF16 KV history."
+                ),
+                "speed_contract": (
+                    "Uses the architecture-native fused recurrent kernel; "
+                    "quantized dense modes are disabled because they lost "
+                    "end-to-end throughput on the retained checkpoint."
+                ),
+            }
+        )
+    if (
+        model is not None
+        and str(model.get("model_type") or "") == "gemma4"
+        and canonical in {"balanced", "max-performance"}
+    ):
+        result.update(
+            {
+                "kernel_backend": "triton-matvec",
+                "attention_backend": "torch",
+                "gate_up_fp8": False,
+                "down_proj_fp8": False,
+                "o_proj_fp8": False,
+                "qkv_fp8": False,
+                "lm_head_fp8": False,
+                "keep_bf16_lm_head": True,
+                "lm_head_topk_guard": 0,
+                "exact_prefill": False,
+                "adaptive_body_int8_start_token": -1,
+                "experimental_int8_tensorcore": False,
+                "fused_rope": False,
+                "preferred_auto_quant": "on",
+                "quality_contract": (
+                    "All projection weights remain BF16. Only the 4.375-GiB "
+                    "token-indexed PLE table uses row-scaled INT8 storage."
+                ),
+            }
+        )
     result["name"] = canonical
     if normalized in PROFILE_ALIASES:
         result["alias_used"] = normalized

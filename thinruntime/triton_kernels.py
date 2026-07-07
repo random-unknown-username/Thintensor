@@ -904,6 +904,78 @@ def _int4_scaled_matvec_looped_kernel(
 
 
 @triton.jit
+def _int4_selected_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    expert_indices,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wr: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sr: tl.constexpr,
+    stride_sg: tl.constexpr,
+    stride_xe: tl.constexpr,
+    stride_oe: tl.constexpr,
+    stride_or: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+) -> None:
+    row_pid = tl.program_id(0)
+    selected_slot = tl.program_id(1)
+    expert = tl.load(expert_indices + selected_slot)
+    offs_m = row_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_b = tl.arange(0, BLOCK_B)
+    packed_cols: tl.constexpr = (cols + 1) // 2
+    mask_m = offs_m < rows
+    mask_b = offs_b < packed_cols
+    packed = tl.load(
+        packed_weight
+        + expert * stride_we
+        + offs_m[:, None] * stride_wr
+        + offs_b[None, :],
+        mask=mask_m[:, None] & mask_b[None, :],
+        other=0,
+    ).to(tl.int32)
+    quantized_low = (packed & 0x0F) - 8
+    quantized_high = ((packed >> 4) & 0x0F) - 8
+    scale = tl.load(
+        scales
+        + expert * stride_se
+        + offs_m[:, None] * stride_sr
+        + ((offs_b[None, :] * 2) // GROUP_SIZE) * stride_sg,
+        mask=mask_m[:, None] & mask_b[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    vector_low = tl.load(
+        x + selected_slot * stride_xe + offs_b * 2,
+        mask=mask_b,
+        other=0.0,
+    ).to(tl.float32)
+    vector_high = tl.load(
+        x + selected_slot * stride_xe + offs_b * 2 + 1,
+        mask=mask_b & (offs_b * 2 + 1 < cols),
+        other=0.0,
+    ).to(tl.float32)
+    accumulator = tl.sum(
+        (
+            quantized_low.to(tl.float32) * vector_low[None, :]
+            + quantized_high.to(tl.float32) * vector_high[None, :]
+        )
+        * scale,
+        axis=1,
+    )
+    tl.store(
+        out + selected_slot * stride_oe + offs_m * stride_or,
+        accumulator,
+        mask=mask_m,
+    )
+
+
+@triton.jit
 def _int4_dot_matvec_kernel(
     packed_weight,
     scales,
@@ -2213,6 +2285,155 @@ def _fused_scaled_gate_up_silu_nomask_n_kernel(
     tl.store(out + offs_m, silu * up, mask=mask_m)
 
 
+@triton.jit
+def _qwen35_conv_update_kernel(
+    mixed_ptr,
+    state_ptr,
+    weight_ptr,
+    out_ptr,
+    conv_dim: tl.constexpr,
+    kernel_size: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    channels = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask = channels < conv_dim
+    new_value = tl.load(mixed_ptr + channels, mask=mask, other=0.0)
+    acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    for index in range(kernel_size):
+        if index + 1 < kernel_size:
+            value = tl.load(
+                state_ptr + channels * kernel_size + index + 1,
+                mask=mask,
+                other=0.0,
+            )
+        else:
+            value = new_value
+        tl.store(
+            state_ptr + channels * kernel_size + index,
+            value,
+            mask=mask,
+        )
+        weight = tl.load(
+            weight_ptr + channels * kernel_size + index,
+            mask=mask,
+            other=0.0,
+        )
+        acc += value.to(tl.float32) * weight.to(tl.float32)
+    activated = acc / (1.0 + tl.exp(-acc))
+    tl.store(out_ptr + channels, activated, mask=mask)
+
+
+@triton.jit
+def _qwen35_delta_recurrence_kernel(
+    convolved_ptr,
+    a_ptr,
+    b_ptr,
+    a_log_ptr,
+    dt_bias_ptr,
+    state_ptr,
+    core_ptr,
+    key_heads: tl.constexpr,
+    value_heads: tl.constexpr,
+    key_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    value_head = tl.program_id(0)
+    value_cols = (
+        tl.program_id(1) * BLOCK_V + tl.arange(0, BLOCK_V)
+    )
+    value_mask = value_cols < value_dim
+    key_rows = tl.arange(0, BLOCK_K)
+    key_mask = key_rows < key_dim
+    repeats = value_heads // key_heads
+    key_head = value_head // repeats
+    query_base = key_head * key_dim
+    key_base = key_heads * key_dim + key_head * key_dim
+    value_base = 2 * key_heads * key_dim + value_head * value_dim
+
+    query = tl.load(
+        convolved_ptr + query_base + key_rows,
+        mask=key_mask,
+        other=0.0,
+    ).to(tl.float32)
+    key = tl.load(
+        convolved_ptr + key_base + key_rows,
+        mask=key_mask,
+        other=0.0,
+    ).to(tl.float32)
+    query *= tl.rsqrt(tl.sum(query * query, axis=0) + 1.0e-6)
+    key *= tl.rsqrt(tl.sum(key * key, axis=0) + 1.0e-6)
+    query *= key_dim ** -0.5
+
+    beta_raw = tl.load(b_ptr + value_head).to(tl.float32)
+    beta = 1.0 / (1.0 + tl.exp(-beta_raw))
+    a_value = (
+        tl.load(a_ptr + value_head).to(tl.float32)
+        + tl.load(dt_bias_ptr + value_head).to(tl.float32)
+    )
+    softplus = tl.log(1.0 + tl.exp(a_value))
+    g = -tl.exp(
+        tl.load(a_log_ptr + value_head).to(tl.float32)
+    ) * softplus
+    decay = tl.exp(g)
+
+    state_offsets = (
+        value_head * key_dim * value_dim
+        + key_rows[:, None] * value_dim
+        + value_cols[None, :]
+    )
+    state_mask = key_mask[:, None] & value_mask[None, :]
+    state = tl.load(
+        state_ptr + state_offsets,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    state *= decay
+    memory = tl.sum(state * key[:, None], axis=0)
+    value = tl.load(
+        convolved_ptr + value_base + value_cols,
+        mask=value_mask,
+        other=0.0,
+    ).to(tl.float32)
+    delta = (value - memory) * beta
+    state += key[:, None] * delta[None, :]
+    tl.store(state_ptr + state_offsets, state, mask=state_mask)
+    output = tl.sum(state * query[:, None], axis=0)
+    tl.store(
+        core_ptr + value_head * value_dim + value_cols,
+        output,
+        mask=value_mask,
+    )
+
+
+@triton.jit
+def _qwen35_gated_norm_kernel(
+    core_ptr,
+    z_ptr,
+    weight_ptr,
+    out_ptr,
+    value_dim: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    eps: tl.constexpr,
+):
+    head = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_V)
+    mask = cols < value_dim
+    offsets = head * value_dim + cols
+    core = tl.load(
+        core_ptr + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    variance = tl.sum(core * core, axis=0) / value_dim
+    normed = core * tl.rsqrt(variance + eps)
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0)
+    z = tl.load(z_ptr + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    gate = z / (1.0 + tl.exp(-z))
+    tl.store(out_ptr + offsets, normed * weight * gate, mask=mask)
+
+
 @dataclass
 class TritonDecodeBuffers:
     hidden_a: torch.Tensor
@@ -2233,12 +2454,15 @@ def select_matvec_config(rows: int, cols: int) -> tuple[int, int]:
     """Small static launch table established by scripts/profile_raw_forward_shapes.py."""
     if rows >= 65536:
         return 64, 4
+    # Small-hidden down projections are harmed badly by the generic wide-K
+    # tile: 1024x3584 measured ~17x slower with (64, 4) than (16, 8) on
+    # Blackwell. Select by output geometry before the broad cols>=3072 rule.
+    if rows <= 1024 and cols >= 2048:
+        return 16, 8
     if cols >= 3072:
         return 64, 4
     if cols <= 1024 and rows >= cols * 3:
         return 8, 8
-    if rows <= 1024 and cols >= 2048:
-        return 8, 4
     if rows == cols * 2 and cols <= 1024:
         return 32, 8
     return 16, 8
@@ -2308,6 +2532,71 @@ class TritonDecodeBackend:
             Any,
             tuple[object, ...],
         ] = {}
+
+    def qwen35_gated_deltanet(
+        self,
+        mixed_qkv: torch.Tensor,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_weight: torch.Tensor,
+        dt_bias: torch.Tensor,
+        a_log: torch.Tensor,
+        norm_weight: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        core_buffer: torch.Tensor,
+        *,
+        key_heads: int,
+        value_heads: int,
+        key_dim: int,
+        value_dim: int,
+        eps: float,
+    ) -> torch.Tensor:
+        conv_dim = int(mixed_qkv.numel())
+        kernel_size = int(conv_state.shape[1])
+        _qwen35_conv_update_kernel[
+            (triton.cdiv(conv_dim, 256),)
+        ](
+            mixed_qkv,
+            conv_state,
+            conv_weight,
+            mixed_qkv,
+            conv_dim=conv_dim,
+            kernel_size=kernel_size,
+            BLOCK_C=256,
+            num_warps=4,
+        )
+        block_v = 32
+        _qwen35_delta_recurrence_kernel[
+            (value_heads, triton.cdiv(value_dim, block_v))
+        ](
+            mixed_qkv,
+            a,
+            b,
+            a_log,
+            dt_bias,
+            recurrent_state,
+            core_buffer,
+            key_heads=key_heads,
+            value_heads=value_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            BLOCK_K=triton.next_power_of_2(key_dim),
+            BLOCK_V=block_v,
+            num_warps=4,
+        )
+        _qwen35_gated_norm_kernel[(value_heads,)](
+            core_buffer,
+            z,
+            norm_weight,
+            core_buffer,
+            value_dim=value_dim,
+            BLOCK_V=triton.next_power_of_2(value_dim),
+            eps=eps,
+            num_warps=4,
+        )
+        return core_buffer
 
     def matvec(
         self,
@@ -2896,6 +3185,68 @@ class TritonDecodeBackend:
                 BLOCK_N=block_n,
                 num_warps=num_warps,
             )
+        return out
+
+    def int4_selected_matvec(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        expert_indices: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        group_size: int,
+        block_m: int = 8,
+        num_warps: int = 8,
+    ) -> torch.Tensor:
+        if packed_weight.ndim != 3 or scales.ndim != 3:
+            raise ValueError(
+                "selected INT4 expert weights/scales must both be rank 3"
+            )
+        experts, rows, packed_cols = map(int, packed_weight.shape)
+        if int(scales.shape[0]) != experts or int(scales.shape[1]) != rows:
+            raise ValueError("selected INT4 expert scale shape mismatch")
+        cols = packed_cols * 2
+        selected = int(expert_indices.numel())
+        if x.ndim == 1:
+            if int(x.numel()) != cols:
+                raise ValueError("selected INT4 shared input width mismatch")
+            stride_xe = 0
+        elif x.ndim == 2 and tuple(x.shape) == (selected, cols):
+            stride_xe = int(x.stride(0))
+        else:
+            raise ValueError(
+                f"selected INT4 input must be {(cols,)} or "
+                f"{(selected, cols)}, got {tuple(x.shape)}"
+            )
+        if tuple(out.shape) != (selected, rows):
+            raise ValueError(
+                f"selected INT4 output must be {(selected, rows)}, "
+                f"got {tuple(out.shape)}"
+            )
+        _int4_selected_matvec_kernel[
+            (triton.cdiv(rows, block_m), selected)
+        ](
+            packed_weight,
+            scales,
+            x,
+            expert_indices,
+            out,
+            rows=rows,
+            cols=cols,
+            stride_we=int(packed_weight.stride(0)),
+            stride_wr=int(packed_weight.stride(1)),
+            stride_se=int(scales.stride(0)),
+            stride_sr=int(scales.stride(1)),
+            stride_sg=int(scales.stride(2)),
+            stride_xe=stride_xe,
+            stride_oe=int(out.stride(0)),
+            stride_or=int(out.stride(1)),
+            GROUP_SIZE=group_size,
+            BLOCK_M=block_m,
+            BLOCK_B=triton.next_power_of_2(packed_cols),
+            num_warps=num_warps,
+        )
         return out
 
     def mxfp4_tensorcore_matvec(

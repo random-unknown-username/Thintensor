@@ -15,13 +15,16 @@ KNOWN_MODEL_TYPES = {
     "qwen2",
     "qwen2_5",
     "qwen3",
+    "qwen3_5",
     "smollm",
     "smollm3",
     "tinyllama",
     "phi3",
     "gpt_oss",
+    "olmoe",
     "gemma",
     "gemma2",
+    "gemma4",
 }
 
 @dataclass(frozen=True)
@@ -61,6 +64,7 @@ class ModelDescriptor:
     attention_sinks: bool = False
     num_local_experts: int = 0
     num_experts_per_token: int = 0
+    norm_topk_prob: bool = True
     swiglu_alpha: float = 1.0
     swiglu_limit: float | None = None
     norm_weight_offset: float = 0.0
@@ -68,6 +72,18 @@ class ModelDescriptor:
     query_pre_attn_scalar: float | None = None
     attention_logit_softcap: float | None = None
     final_logit_softcap: float | None = None
+    linear_conv_kernel_dim: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    attention_output_gate: bool = False
+    global_head_dim: int = 0
+    num_global_key_value_heads: int = 0
+    num_kv_shared_layers: int = 0
+    hidden_size_per_layer_input: int = 0
+    vocab_size_per_layer_input: int = 0
+    use_double_wide_mlp: bool = False
     required_operators: tuple[str, ...] = ()
     quantization: QuantizationDescriptor = field(
         default_factory=lambda: descriptor_from_config({})
@@ -115,13 +131,18 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
             config_path = path / "config.json"
         else:
             config_path = path
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        source_config = json.loads(config_path.read_text(encoding="utf-8"))
+        config = _effective_text_config(source_config)
+        tensor_names = _canonical_text_tensor_names(
+            source_config, tensor_names
+        )
     else:
-        config = config_or_path
+        config = _effective_text_config(config_or_path)
 
     model_type = _normalize_model_type(
         str(config.get("model_type") or _raw_arch(config))
     )
+    default_norm_eps = 1e-5 if model_type == "olmoe" else 1e-6
     hidden = _required_int(config, "hidden_size")
     heads = _required_int(config, "num_attention_heads")
     layers = _required_int(config, "num_hidden_layers")
@@ -148,12 +169,16 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
                 model_type in {"gemma", "gemma2"},
             )
         ),
-        rope_theta=float(config.get("rope_theta", 10_000.0)),
+        rope_theta=float(
+            config.get("rope_theta")
+            or (config.get("rope_parameters") or {}).get("rope_theta")
+            or 10_000.0
+        ),
         rope_scaling=config.get("rope_scaling") or config.get("rope_parameters"),
         rms_norm_eps=float(
             config.get("rms_norm_eps")
             or config.get("layer_norm_eps")
-            or 1e-6
+            or default_norm_eps
         ),
         norm_kind=(
             "rms_norm"
@@ -165,10 +190,14 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         norm_eps=float(
             config.get("rms_norm_eps")
             or config.get("layer_norm_eps")
-            or 1e-6
+            or default_norm_eps
         ),
         partial_rotary_factor=float(
-            config.get("partial_rotary_factor") or 1.0
+            config.get("partial_rotary_factor")
+            or (config.get("rope_parameters") or {}).get(
+                "partial_rotary_factor"
+            )
+            or 1.0
         ),
         activation=str(
             config.get("hidden_act")
@@ -200,15 +229,20 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         attention_sinks=traits["attention_sinks"],
         num_local_experts=traits["num_local_experts"],
         num_experts_per_token=traits["num_experts_per_token"],
+        norm_topk_prob=bool(config.get("norm_topk_prob", True)),
         swiglu_alpha=float(config.get("swiglu_alpha", 1.702)),
         swiglu_limit=(
             float(config["swiglu_limit"])
             if config.get("swiglu_limit") is not None
             else None
         ),
-        norm_weight_offset=(1.0 if model_type == "gemma2" else 0.0),
+        norm_weight_offset=(
+            1.0 if model_type in {"gemma2", "qwen3_5"} else 0.0
+        ),
         embedding_scale=(
-            hidden**0.5 if model_type == "gemma2" else 1.0
+            hidden**0.5
+            if model_type in {"gemma2", "gemma4"}
+            else 1.0
         ),
         query_pre_attn_scalar=(
             float(config["query_pre_attn_scalar"])
@@ -224,6 +258,41 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
             float(config["final_logit_softcapping"])
             if config.get("final_logit_softcapping") is not None
             else None
+        ),
+        linear_conv_kernel_dim=int(
+            config.get("linear_conv_kernel_dim") or 0
+        ),
+        linear_key_head_dim=int(
+            config.get("linear_key_head_dim") or 0
+        ),
+        linear_value_head_dim=int(
+            config.get("linear_value_head_dim") or 0
+        ),
+        linear_num_key_heads=int(
+            config.get("linear_num_key_heads") or 0
+        ),
+        linear_num_value_heads=int(
+            config.get("linear_num_value_heads") or 0
+        ),
+        attention_output_gate=bool(
+            config.get("attn_output_gate")
+            or config.get("attention_output_gate")
+        ),
+        global_head_dim=int(config.get("global_head_dim") or 0),
+        num_global_key_value_heads=int(
+            config.get("num_global_key_value_heads") or 0
+        ),
+        num_kv_shared_layers=int(
+            config.get("num_kv_shared_layers") or 0
+        ),
+        hidden_size_per_layer_input=int(
+            config.get("hidden_size_per_layer_input") or 0
+        ),
+        vocab_size_per_layer_input=int(
+            config.get("vocab_size_per_layer_input") or 0
+        ),
+        use_double_wide_mlp=bool(
+            config.get("use_double_wide_mlp", False)
         ),
         required_operators=traits["required_operators"],
         quantization=descriptor_from_config(config, tensor_names),
@@ -244,6 +313,7 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         or ""
     )
     model_type = _normalize_model_type(raw_type)
+    default_norm_eps = 1e-5 if model_type == "olmoe" else 1e-6
 
     hidden = int(model["hidden_size"])
     heads = int(model["heads"])
@@ -284,7 +354,7 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         rms_norm_eps=float(
             model.get("norm_eps")
             or model.get("rms_norm_eps")
-            or 1e-6
+            or default_norm_eps
         ),
         norm_kind=str(
             model.get("norm_kind")
@@ -300,7 +370,7 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
             model.get("norm_eps")
             or model.get("rms_norm_eps")
             or model.get("layer_norm_eps")
-            or 1e-6
+            or default_norm_eps
         ),
         partial_rotary_factor=float(
             model.get("partial_rotary_factor") or 1.0
@@ -353,6 +423,7 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
             model.get("num_experts_per_token")
             or traits["num_experts_per_token"]
         ),
+        norm_topk_prob=bool(model.get("norm_topk_prob", True)),
         swiglu_alpha=float(model.get("swiglu_alpha") or 1.702),
         swiglu_limit=(
             float(model["swiglu_limit"])
@@ -362,12 +433,20 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         norm_weight_offset=float(
             model.get("norm_weight_offset")
             if model.get("norm_weight_offset") is not None
-            else (1.0 if model_type == "gemma2" else 0.0)
+            else (
+                1.0
+                if model_type in {"gemma2", "qwen3_5"}
+                else 0.0
+            )
         ),
         embedding_scale=float(
             model.get("embedding_scale")
             if model.get("embedding_scale") is not None
-            else (hidden**0.5 if model_type == "gemma2" else 1.0)
+            else (
+                hidden**0.5
+                if model_type in {"gemma2", "gemma4"}
+                else 1.0
+            )
         ),
         query_pre_attn_scalar=(
             float(model["query_pre_attn_scalar"])
@@ -383,6 +462,40 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
             float(model["final_logit_softcap"])
             if model.get("final_logit_softcap") is not None
             else None
+        ),
+        linear_conv_kernel_dim=int(
+            model.get("linear_conv_kernel_dim") or 0
+        ),
+        linear_key_head_dim=int(
+            model.get("linear_key_head_dim") or 0
+        ),
+        linear_value_head_dim=int(
+            model.get("linear_value_head_dim") or 0
+        ),
+        linear_num_key_heads=int(
+            model.get("linear_num_key_heads") or 0
+        ),
+        linear_num_value_heads=int(
+            model.get("linear_num_value_heads") or 0
+        ),
+        attention_output_gate=bool(
+            model.get("attention_output_gate", False)
+        ),
+        global_head_dim=int(model.get("global_head_dim") or 0),
+        num_global_key_value_heads=int(
+            model.get("num_global_key_value_heads") or 0
+        ),
+        num_kv_shared_layers=int(
+            model.get("num_kv_shared_layers") or 0
+        ),
+        hidden_size_per_layer_input=int(
+            model.get("hidden_size_per_layer_input") or 0
+        ),
+        vocab_size_per_layer_input=int(
+            model.get("vocab_size_per_layer_input") or 0
+        ),
+        use_double_wide_mlp=bool(
+            model.get("use_double_wide_mlp", False)
         ),
         required_operators=tuple(
             model.get("required_operators")
@@ -411,6 +524,31 @@ def _raw_arch(config: dict[str, Any]) -> str:
     return str(architectures[0] if architectures else "")
 
 
+def _effective_text_config(config: dict[str, Any]) -> dict[str, Any]:
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        return config
+    effective = dict(text)
+    for key in ("architectures", "tie_word_embeddings", "model_type"):
+        if key in config:
+            effective[key] = config[key]
+    return effective
+
+
+def _canonical_text_tensor_names(
+    config: dict[str, Any],
+    names: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not isinstance(config.get("text_config"), dict):
+        return names
+    prefix = "model.language_model."
+    return tuple(
+        f"model.{name.removeprefix(prefix)}"
+        for name in names
+        if name.startswith(prefix)
+    )
+
+
 def _normalize_model_type(value: str) -> str:
     compact = value.lower().replace("-", "").replace("_", "")
     if "smollm3" in compact:
@@ -419,6 +557,8 @@ def _normalize_model_type(value: str) -> str:
         return "smollm"
     if "tinyllama" in compact:
         return "tinyllama"
+    if "qwen35" in compact:
+        return "qwen3_5"
     if "qwen3" in compact:
         return "qwen3"
     if "qwen25" in compact:
@@ -427,8 +567,12 @@ def _normalize_model_type(value: str) -> str:
         return "qwen2"
     if "phi3" in compact:
         return "phi3"
+    if "olmoe" in compact:
+        return "olmoe"
     if "gptoss" in compact:
         return "gpt_oss"
+    if "gemma4" in compact:
+        return "gemma4"
     if "gemma2" in compact:
         return "gemma2"
     if "gemma" in compact:
@@ -505,6 +649,25 @@ def _semantic_traits(
         required.append("attention_sinks")
     if layer_types:
         required.append("per_layer_attention_window")
+    if "linear_attention" in layer_types:
+        required.extend(
+            (
+                "gated_delta_net",
+                "depthwise_causal_conv1d",
+                "recurrent_state_cache",
+                "gated_full_attention",
+            )
+        )
+    if raw_model_type == "gemma4":
+        required.extend(
+            (
+                "per_layer_embeddings",
+                "variable_head_dim_attention",
+                "shared_kv_attention",
+                "post_attention_norm",
+                "post_feedforward_norm",
+            )
+        )
     if mlp_kind == "sparse_moe":
         required.extend(("topk_router", "sparse_experts", "expert_weighted_sum"))
     else:
