@@ -361,7 +361,7 @@ def get_profile(
         )
     result = dict(PROFILES[canonical])
     if (
-        canonical in {"max-performance", "max-max-perf"}
+        canonical == "max-performance"
         and model is not None
         and _model_value(model, "architecture_family") == "decoder_moe"
     ):
@@ -400,6 +400,52 @@ def get_profile(
                 ),
             }
         )
+    if (
+        canonical == "max-max-perf"
+        and model is not None
+        and _model_value(model, "architecture_family") == "decoder_moe"
+    ):
+        # FP8 attention-projection scale tensors push OLMoE-class 7B models
+        # over the 8 GiB VRAM budget when all expert weights are resident.
+        # Fused residual norm and scaled MLP reduce kernel launch overhead
+        # across all 16 layers without adding any extra VRAM.
+        result.update(
+            {
+                "label": "Maximum aggressive MoE performance",
+                "description": (
+                    "Full-VRAM selected-expert packing with fused residual "
+                    "norm, fused scaled MLP, and RoPE."
+                ),
+                "gate_up_fp8": False,
+                "down_proj_fp8": False,
+                "o_proj_fp8": False,
+                "qkv_fp8": False,
+                "lm_head_fp8": False,
+                "keep_bf16_lm_head": True,
+                "lm_head_backend": None,
+                "lm_head_topk_guard": 0,
+                "exact_prefill": False,
+                "adaptive_body_int8_start_token": -1,
+                "experimental_int8_tensorcore": False,
+                "fused_rope": True,
+                "fused_residual_norm": True,
+                "fused_scaled_mlp": True,
+                "required_capabilities": {
+                    "architecture_family": "decoder_moe",
+                    "activation": ("silu", "swish"),
+                },
+                "quality_contract": (
+                    "All weights remain BF16. Fused residual norm and scaled "
+                    "MLP reduce per-layer kernel launch overhead."
+                ),
+                "speed_contract": (
+                    "Full-VRAM expert packing with fused element-wise ops; "
+                    "FP8 attention projections require more VRAM than a 7B "
+                    "MoE can spare on 8 GiB GPUs."
+                ),
+            }
+        )
+
     if (
         model is not None
         and str(model.get("model_type") or "") == "qwen3_5"
@@ -483,6 +529,49 @@ def get_profile(
                 "quality_contract": (
                     "All projection weights remain BF16. Only the 4.375-GiB "
                     "token-indexed PLE table uses row-scaled INT8 storage."
+                ),
+            }
+        )
+    if (
+        model is not None
+        and str(model.get("model_type") or "") == "gemma4"
+        and canonical == "max-max-perf"
+    ):
+        # Gemma-4's unique forward path does not go through the standard
+        # adaptive-INT8 layer plan. On RTX 5050 / Blackwell, the FP8 body
+        # weight path forces a slower scaled-matvec kernel that more than
+        # erases any bandwidth saving (benchmark: FP8 33.3 vs BF16 35.0 tok/s).
+        # triton-matvec is the fastest kernel backend for this model.
+        # Fused residual norm and scaled MLP reduce kernel launch count
+        # across the 35-layer forward pass.
+        result.update(
+            {
+                "kernel_backend": "triton-matvec",
+                "attention_backend": "triton_fused",
+                "gate_up_fp8": False,
+                "down_proj_fp8": False,
+                "o_proj_fp8": False,
+                "qkv_fp8": False,
+                "lm_head_fp8": True,
+                "keep_bf16_lm_head": True,
+                "lm_head_backend": "triton",
+                "lm_head_topk_guard": 64,
+                "exact_prefill": False,
+                "adaptive_body_int8_start_token": -1,
+                "experimental_int8_tensorcore": False,
+                "fused_rope": True,
+                "fused_residual_norm": True,
+                "fused_scaled_mlp": True,
+                "preferred_auto_quant": "on",
+                "quality_contract": (
+                    "All body projection weights remain BF16 (FP8 body "
+                    "regresses speed on this GPU). LM head is FP8-guarded. "
+                    "Fused residual norm and scaled MLP reduce kernel launch "
+                    "overhead across the 35-layer Gemma-4 forward pass."
+                ),
+                "speed_contract": (
+                    "triton-matvec + fused kernels; benchmark vs lab/safe on "
+                    "this machine."
                 ),
             }
         )
@@ -619,6 +708,7 @@ _PROFILE_ENV_KEYS = (
     "THINTENSOR_INT8_TC_BLOCK_N",
     "THINTENSOR_INT8_TC_BLOCK_M",
     "THINTENSOR_INT8_TC_BLOCK_K",
+    "THINTENSOR_TENSORCORE_MATVEC",
 )
 
 
@@ -630,6 +720,7 @@ def profile_environment(profile: Mapping[str, Any]) -> dict[str, str]:
         "THINTENSOR_INT8_TC_BLOCK_N": "2",
         "THINTENSOR_INT8_TC_BLOCK_M": "64",
         "THINTENSOR_INT8_TC_BLOCK_K": "256",
+        "THINTENSOR_TENSORCORE_MATVEC": "1",
     }
 
 
