@@ -4920,6 +4920,9 @@ class ThinGpuCausalLMRuntime:
                 [token_id], device=embed.device, dtype=torch.long
             )
             hidden = embed[token_id].clone()
+        if getattr(self, "_gemma4_normed_buffer", None) is None:
+            self._gemma4_normed_buffer = torch.empty_like(hidden)
+            self._gemma4_normed_buffer_2 = torch.empty_like(hidden)
         hidden.mul_(
             torch.tensor(
                 self.embedding_scale,
@@ -4936,6 +4939,7 @@ class ThinGpuCausalLMRuntime:
             normed = self._normalization(
                 hidden,
                 _layer_tensor(layer, "input_layernorm.weight"),
+                out=self._gemma4_normed_buffer,
             )
             attention = self._gemma4_attention(
                 layer, normed, token_index
@@ -4945,6 +4949,7 @@ class ThinGpuCausalLMRuntime:
                 _layer_tensor(
                     layer, "post_attention_layernorm.weight"
                 ),
+                out=self._gemma4_normed_buffer_2,
             )
             hidden = residual + attention
 
@@ -4954,6 +4959,7 @@ class ThinGpuCausalLMRuntime:
                 _layer_tensor(
                     layer, "pre_feedforward_layernorm.weight"
                 ),
+                out=self._gemma4_normed_buffer,
             )
             gate_weight = self.weights.tensor(
                 _layer_tensor(layer, "mlp.gate_proj.weight")
@@ -4998,6 +5004,7 @@ class ThinGpuCausalLMRuntime:
                 _layer_tensor(
                     layer, "post_feedforward_layernorm.weight"
                 ),
+                out=self._gemma4_normed_buffer_2,
             )
             hidden = residual + mlp
 
@@ -5038,6 +5045,7 @@ class ThinGpuCausalLMRuntime:
                 _layer_tensor(
                     layer, "post_per_layer_input_norm.weight"
                 ),
+                out=self._gemma4_normed_buffer_2,
             )
             hidden = hidden + ple
             layer_scalar = self.weights.tensor(
@@ -6153,24 +6161,25 @@ class ThinGpuCausalLMRuntime:
                 k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
                 v = qkv_out[self.q_dim + self.kv_dim :]
             else:
-                q = torch.mv(
-                    self.weights.tensor(
-                        _layer_tensor(layer, "self_attn.q_proj.weight")
-                    ),
-                    normed,
-                )
-                k = torch.mv(
-                    self.weights.tensor(
-                        _layer_tensor(layer, "self_attn.k_proj.weight")
-                    ),
-                    normed,
-                )
-                v = torch.mv(
-                    self.weights.tensor(
-                        _layer_tensor(layer, "self_attn.v_proj.weight")
-                    ),
-                    normed,
-                )
+                qkv_weight_id = f"model.layers.{layer}.self_attn.qkv_fused.weight"
+                if getattr(self.weights, "_use_tensor_cache", False):
+                    try:
+                        qkv_weight = self.weights._cached_tensors[qkv_weight_id]
+                    except KeyError:
+                        q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
+                        k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
+                        v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
+                        qkv_weight = torch.cat((q_proj, k_proj, v_proj), dim=0)
+                        self.weights._cached_tensors[qkv_weight_id] = qkv_weight
+                else:
+                    q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
+                    k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
+                    v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
+                    qkv_weight = torch.cat((q_proj, k_proj, v_proj), dim=0)
+                qkv_out = torch.mv(qkv_weight, normed)
+                q = qkv_out[:self.q_dim]
+                k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
+                v = qkv_out[self.q_dim + self.kv_dim :]
             for projected, suffix in (
                 (q, "self_attn.q_proj.bias"),
                 (k, "self_attn.k_proj.bias"),
@@ -6744,6 +6753,7 @@ class ThinGpuCausalLMRuntime:
             normed = self._normalization(
                 hidden,
                 _layer_tensor(layer, "input_layernorm.weight"),
+                out=buffers.normed if buffers is not None else None,
             )
             self._capture_debug(layer, "post_input_rmsnorm", normed)
             qkv = self._fused_qkv(layer, normed)
@@ -6857,6 +6867,7 @@ class ThinGpuCausalLMRuntime:
                         layer,
                         "post_attention_layernorm.weight",
                     ),
+                    out=buffers.normed if buffers is not None else None,
                 )
                 self._capture_debug(
                     layer,
@@ -6877,6 +6888,7 @@ class ThinGpuCausalLMRuntime:
             normed = self._normalization(
                 hidden,
                 _layer_tensor(layer, mlp_norm_suffix),
+                out=buffers.normed if buffers is not None else None,
             )
             if self.descriptor.model_type == "gemma2":
                 self._capture_debug(
@@ -6988,6 +7000,7 @@ class ThinGpuCausalLMRuntime:
                         layer,
                         "post_feedforward_layernorm.weight",
                     ),
+                    out=buffers.normed if buffers is not None else None,
                 )
                 self._capture_debug(
                     layer,
@@ -8904,11 +8917,13 @@ class ThinGpuCausalLMRuntime:
         self,
         x: torch.Tensor,
         weight_id: str,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.norm_kind == "rms_norm":
             weight = self.weights.tensor(weight_id)
             if self.kernel_backend is not None:
-                out = torch.empty_like(x)
+                if out is None:
+                    out = torch.empty_like(x)
                 return self.kernel_backend.rms_norm(
                     x,
                     weight,

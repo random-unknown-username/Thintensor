@@ -416,7 +416,7 @@ def get_profile(
                     "Full-VRAM selected-expert packing with fused residual "
                     "norm, fused scaled MLP, and RoPE."
                 ),
-                "gate_up_fp8": False,
+                 "gate_up_fp8": False,
                 "down_proj_fp8": False,
                 "o_proj_fp8": False,
                 "qkv_fp8": False,
