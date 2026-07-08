@@ -66,8 +66,8 @@ Follow this fast-path to pull, convert, and execute a lightweight model (Qwen-0.
 > [!NOTE]
 > **Base Model vs. Chat Model Behavior**: The sample `Qwen3.5-0.8B` is a raw **base model** trained only for next-token document completion. It does not engage in interactive conversation.
 > *   **Leading Punctuation**: It completes prompts naturally (e.g. `Hello` -> `, I am working with...` or `What is gravity` -> `, and how does it affect...`).
-> *   **Repetition loops**: Under greedy decoding (temperature=0, required for bit-perfect logit matching), small models (0.8B) lack the stochastic sampling needed to break out of repetitive loops (such as repeating math definitions).
-> *   For interactive chat, download and convert fine-tuned instruct models (e.g. `Qwen/Qwen2.5-3B-Instruct`).
+> *   **Greedy Decoding Only**: To maximize speed and compile highly optimized fused Triton argmax kernels, the runtime is strictly **greedy-only** (temperature=0, top_p=1, top_k=0).
+> *   **Avoiding Loops**: Because there is no stochastic sampling to escape repetition loops, tiny base models (0.8B) may repeat sentences under greedy decoding. To avoid loops and get proper interactive chat responses, always use fine-tuned **instruct models** (e.g., `Qwen/Qwen2.5-3B-Instruct`).
 
 ---
 
