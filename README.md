@@ -4,7 +4,7 @@
 
 ---
 
-## 🚀 Fast-Path: Setting Up on a New Laptop
+## Fast-Path: Setting Up on a New Laptop
 
 Follow these steps to set up `thintensor` from scratch on a new development machine:
 
@@ -40,7 +40,7 @@ Run the doctor command to ensure the GPU runtime and kernel dependencies are ful
 thintensor doctor --strict
 ```
 
-### 🏃 Quickstart: Downloading & Running a Sample Model (Qwen-0.8B)
+### Quickstart: Downloading & Running a Sample Model (Qwen-0.8B)
 Follow this fast-path to pull, convert, and execute a lightweight model (Qwen-0.8B):
 
 1. **Download the Hugging Face weights**:
@@ -65,7 +65,7 @@ Follow this fast-path to pull, convert, and execute a lightweight model (Qwen-0.
 
 ---
 
-## 🏗️ Code Architecture & Core Modules
+## Code Architecture & Core Modules
 
 The engine is split into a **Rust Archive & Conversion Core** and a **Python/Triton GPU Execution Runtime**. Below is a detailed map of the codebase architecture:
 
@@ -103,7 +103,7 @@ The Python runtime classes coordinate host-device memory mapping and layer execu
 
 ---
 
-## ⚡ Profiles & Configuration
+## Profiles & Configuration
 
 Profiles are intent-based presets defined in [thinruntime/profile_presets.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/profile_presets.py):
 
@@ -114,7 +114,7 @@ Profiles are intent-based presets defined in [thinruntime/profile_presets.py](fi
 
 ---
 
-## 📊 Verification & Correctness Testing
+## Verification & Correctness Testing
 
 Logit parity is validated step-by-step against Hugging Face references:
 ```bash
