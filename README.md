@@ -67,7 +67,7 @@ Follow this fast-path to pull, convert, and execute a lightweight model (Qwen-0.
 > **Base Model vs. Chat Model Behavior**: The sample `Qwen3.5-0.8B` is a raw **base model** trained only for next-token document completion. It does not engage in interactive conversation.
 > *   **Leading Punctuation**: It completes prompts naturally (e.g. `Hello` -> `, I am working with...` or `What is gravity` -> `, and how does it affect...`).
 > *   **Greedy Decoding Only**: To maximize speed and compile highly optimized fused Triton argmax kernels, the runtime is strictly **greedy-only** (temperature=0, top_p=1, top_k=0).
-> *   **Avoiding Loops**: Because there is no stochastic sampling to escape repetition loops, tiny base models (0.8B) may repeat sentences under greedy decoding. To avoid loops and get proper interactive chat responses, always use fine-tuned **instruct models** (e.g., `Qwen/Qwen2.5-3B-Instruct`).
+> *   **Avoiding Loops**: Because there is no stochastic sampling to escape repetition loops, tiny base models (0.8B) may repeat sentences under greedy decoding. To avoid loops and get proper interactive chat responses, always use fine-tuned **instruct models** (e.g., `Qwen/Qwen2.5-3B-Instruct`). Bassically right now, we cannot change model parameters like temperature, top_p and top_k, I would try my best to get this fixed in future
 
 ---
 
