@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thintensor"
-version = "1.0.0"
+version = "1.0.1"
 description = "ThinTensor model archive and GPU runtime CLI"
 readme = "README.md"
 requires-python = ">=3.10"

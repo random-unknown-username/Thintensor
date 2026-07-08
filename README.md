@@ -63,6 +63,12 @@ Follow this fast-path to pull, convert, and execute a lightweight model (Qwen-0.
    thintensor validate Qwen3.5-0.8B.thin --hf-model ~/.cache/thintensor/models/Qwen--Qwen3.5-0.8B --profile max-max-perf --suite quick
    ```
 
+> [!NOTE]
+> **Base Model vs. Chat Model Behavior**: The sample `Qwen3.5-0.8B` is a raw **base model** trained only for next-token document completion. It does not engage in interactive conversation.
+> *   **Leading Punctuation**: It completes prompts naturally (e.g. `Hello` -> `, I am working with...` or `What is gravity` -> `, and how does it affect...`).
+> *   **Repetition loops**: Under greedy decoding (temperature=0, required for bit-perfect logit matching), small models (0.8B) lack the stochastic sampling needed to break out of repetitive loops (such as repeating math definitions).
+> *   For interactive chat, download and convert fine-tuned instruct models (e.g. `Qwen/Qwen2.5-3B-Instruct`).
+
 ---
 
 ## Code Architecture & Core Modules
