@@ -124,3 +124,9 @@ thintensor validate google--gemma-4-E2B.thin \
   --suite quick
 ```
 Validation execution isolates processes: it runs the Hugging Face trajectory first, caches reference logits, unloads it from VRAM, and then loads the `.thin` model to calculate the exact minimum cosine similarity across all tokens.
+
+## Benchmark results
+
+<img width="803" height="861" alt="image" src="https://github.com/user-attachments/assets/daf33f59-88cd-4a2b-990c-c7d97cc62758" />
+
+N/A because the models didnt load my 8gb vram gpu without thintensors!
