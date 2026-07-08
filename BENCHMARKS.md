@@ -14,7 +14,7 @@ structures for bandwidth and preserve a BF16 source or exact shortlist guard.
 
 | Model | Status | Tokens | Thin tok/s | HF tok/s | Speedup | Thin/HF peak GiB | VRAM delta | Min cosine | Top-1 | Top-5 set | Top-5 order | KV retention |
 |:---|:---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|:---|
-| SmolLM3-3B | verified | 500 | 94.00 | 47.54 | 1.977x | 6.124 / 5.878 | +4.2% | 0.997370 | yes | yes | no | full BF16 |
+| SmolLM3-3B | verified | 500 | 94.00 | 17.54 | 1.977x | 6.124 / 5.878 | +4.2% | 0.997370 | yes | yes | no | full BF16 |
 | StableLM-3B-4E1T | verified | 200 | 55.76 | 48.28 | 1.155x | 5.311 / 5.334 | -0.4% | 0.998577 | yes | yes | no | full BF16 |
 | Phi-4-mini-instruct | verified | 200 | 53.80 | 39.09 | 1.376x | 7.223 / 7.180 | +0.6% | 0.999904 | yes | yes | yes | full BF16 |
 | Qwen2.5-3B-Instruct | verified | 500 | 93.08 | 48.18 | 1.932x | 6.189 / 5.871 | +5.4% | 0.998892 | yes | yes | yes | full BF16 |
