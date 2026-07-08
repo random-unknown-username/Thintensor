@@ -4,7 +4,7 @@
 
 ---
 
-## Fast-Path: Setting Up on a New Laptop
+## Fast-Path: Setting Up thintensor
 
 Follow these steps to set up `thintensor` from scratch on a new development machine:
 
