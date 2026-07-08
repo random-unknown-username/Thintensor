@@ -1,192 +1,103 @@
 # ThinTensor
 
-`thintensor` is one command for pulling, converting, running, chatting with,
-benchmarking, and validating causal language models.
+`thintensor` is a unified, high-performance command-line engine for pulling, converting, running, benchmarking, and validating causal language models. It compiles a high-speed Rust-based archive core with an optimized PyTorch/Triton GPU execution runtime.
 
-The CLI routes by model capability rather than repository name:
+---
 
-- registered gated-decoder semantics use the native ThinTensor runtime,
-  including standard SiLU blocks and Gemma2's unit-offset RMSNorm, GeGLU, and
-  interleaved local/global attention;
-- other Transformers causal-LM architectures remain runnable through a
-  clearly labelled compatibility engine;
-- compatibility-engine measurements are never reported as ThinTensor speedups.
+## 🚀 Fast-Path: Setting Up on a New Laptop
 
-## Install
+Follow these steps to set up `thintensor` from scratch on a new development machine:
 
-From a platform wheel:
+### 1. Install Prerequisites
+Ensure you have the following installed on your host system:
+*   **Python (>= 3.10)**
+*   **Rust Compiler (`cargo`)**: Install via [rustup.rs](https://rustup.rs/) if missing.
+*   **NVIDIA CUDA Toolkit**: Required for GPU acceleration (ensure `nvcc` is available).
 
+### 2. Set Up a Virtual Environment & Install PyTorch
+Create a fresh python environment and install PyTorch with CUDA support:
 ```bash
-python -m pip install 'thintensor[all]'
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+
+# Install PyTorch with CUDA (matching your system's CUDA version)
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+### 3. Clone and Build ThinTensor
+Clone the repository and install it in editable mode along with all optional dependencies:
+```bash
+git clone https://github.com/random-unknown-username/Thintensor.git
+cd Thintensor
+pip install -e '.[all]'
+```
+*Note: Installing the package automatically compiles the internal Rust core binaries using `setup.py`.*
+
+### 4. Verify the Installation
+Run the doctor command to ensure the GPU runtime and kernel dependencies are fully operational:
+```bash
 thintensor doctor --strict
 ```
 
-From a Git clone:
+---
 
-```bash
-git clone https://github.com/random-unknown-username/Thintensor
-cd Thintensor
-python -m pip install -e '.[all]'
-thintensor --help
+## 🏗️ Code Architecture & Core Modules
+
+The engine is split into a **Rust Archive & Conversion Core** and a **Python/Triton GPU Execution Runtime**. Below is a detailed map of the codebase architecture:
+
+```mermaid
+graph TD
+    CLI[cli.py: User Commands] --> |Load Archive| Archive[archive.py / archive.rs]
+    CLI --> |Deduce Fit/Streaming| Plan[plan.rs: Budget Planning]
+    CLI --> |Execute Runtime| Runtime[gpu_runtime.py: ThinGpuCausalLMRuntime]
+    Runtime --> |Fused Math| Triton[triton_kernels.py: Fused Kernels]
+    Runtime --> |Zero-Copy Views| Archive
+    Runtime --> |Causal GQA/MHA| SDPA[PyTorch C++ SDPA Kernel]
 ```
 
-The repository launcher also works directly:
+### 1. CLI Entrypoint & Routing
+*   **CLI Handler**: [thinruntime/cli.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/cli.py) manages subcommands like `run`, `pull`, `convert`, `bench`, and `validate`.
+*   **Routing Engine**: The CLI inspects model metadata via `auto_fit.py` and routes to the native high-performance runtime for compatible models, falling back to Hugging Face transformers for incompatible architectures.
 
+### 2. Rust Core (Archive & Conversion)
+The Rust modules under [src/](file:///home/satvik/Projects/thintensor-opus/src) handle disk-to-memory layouts and weight packing:
+*   **Archive Reader/Writer**: [src/archive.rs](file:///home/satvik/Projects/thintensor-opus/src/archive.rs) and [src/manifest.rs](file:///home/satvik/Projects/thintensor-opus/src/manifest.rs) define the binary format of `.thin` packages.
+*   **Model Converter**: [src/convert_hf.rs](file:///home/satvik/Projects/thintensor-opus/src/convert_hf.rs) parses Hugging Face safetensors, mapping weights and transforming shapes into contiguous memory layouts.
+*   **VRAM Budget & Fit Planner**: [src/plan.rs](file:///home/satvik/Projects/thintensor-opus/src/plan.rs) inspects available VRAM and maps which weight layers must be streamed or pinned to VRAM.
+
+### 3. High-Performance GPU Runtime
+The Python runtime classes coordinate host-device memory mapping and layer execution:
+*   **ThinGpuCausalLMRuntime**: [thinruntime/gpu_runtime.py#L2490](file:///home/satvik/Projects/thintensor-opus/thinruntime/gpu_runtime.py#L2490) is the execution engine.
+    *   **Memory-Mapped Zero-Copy Views**: [thinruntime/archive.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/archive.py) exposes binary pages as PyTorch tensor views directly from mmap.
+    *   **Forward Causal Decode**: `forward_token` (line 4828+) coordinates prefetch pipelines and sequential layer dispatch.
+    *   **Gated Mixture-of-Experts (MoE)**: `_forward_token_moe` (line 6095+) runs MoE routing. When weights exceed VRAM, experts are streamed dynamically using page-pool overlays (line 6260+).
+    *   **Optimized Eager RoPE**: `_apply_rope` (line 5804+) applies rotary positional embeddings. Eager position embeddings are applied in-place to avoid allocations while matching Hugging Face precision perfectly.
+    *   **Scaled Dot-Product Attention**: `_attention` (line 5948+) leverages PyTorch's native C++ `scaled_dot_product_attention` for fast GQA/MHA execution.
+
+### 4. Triton Custom Kernels
+*   **Fused Normalization**: [thinruntime/triton_kernels.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/triton_kernels.py) implements fused `add_rms_norm` and SwiGLU operations to bypass PyTorch intermediate launch overheads.
+
+---
+
+## ⚡ Profiles & Configuration
+
+Profiles are intent-based presets defined in [thinruntime/profile_presets.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/profile_presets.py):
+
+*   **`safe`**: Preserves full precision (BF16) weights and KV history with the broadest compatibility.
+*   **`balanced`**: Enables native matvec and GQA/MHA attention kernels without weight compression.
+*   **`max-performance`**: Opt-in profile targeting INT8 body and tensor-core quantization.
+*   **`max-max-perf`**: The most aggressive execution preset combining fused projection caches, fast C++ SDPA, and custom in-place memory optimizations.
+
+---
+
+## 📊 Verification & Correctness Testing
+
+Logit parity is validated step-by-step against Hugging Face references:
 ```bash
-./thintensor --help
+thintensor validate google--gemma-4-E2B.thin \
+  --hf-model /path/to/original-gemma-4 \
+  --profile max-max-perf \
+  --suite quick
 ```
-
-Platform wheels bundle the internal Rust archive core. Users invoke
-`thintensor`; `thintensor-core` is an implementation detail.
-
-## Run any Transformers causal LM
-
-```bash
-thintensor run Qwen/Qwen3-0.6B --prompt "Explain paged KV caches."
-thintensor run meta-llama/Llama-3.2-1B --profile balanced
-thintensor run ./local-model --engine transformers
-```
-
-`--engine auto` is the default. It downloads the model once, inspects its
-semantics and tensor layout, converts native-compatible models to `.thin`, and
-uses the Transformers compatibility engine otherwise. Remote custom code is
-disabled unless `--trust-remote-code` is explicitly supplied.
-
-## Convert
-
-```bash
-thintensor pull Qwen/Qwen3-0.6B
-thintensor convert ~/.cache/thintensor/models/Qwen--Qwen3-0.6B \
-  --out Qwen3-0.6B.thin
-thintensor inspect Qwen3-0.6B.thin --verify
-```
-
-For gated models, authenticate with the official Hugging Face CLI and accept
-the model license once on the Hub:
-
-```bash
-hf auth login
-thintensor pull meta-llama/Llama-3.2-1B-Instruct \
-  --download-backend hf-cli
-```
-
-`auto` prefers an authenticated `hf` CLI session. Explicit tokens are passed
-through the environment rather than command-line arguments.
-
-Conversion is deterministic and followed by archive verification unless
-`--no-verify` is explicitly selected.
-
-If an archive uses semantics outside the native engine, retain its original HF
-config and run:
-
-```bash
-thintensor run MODEL.thin --hf-source ./original-model
-```
-
-## Profiles
-
-Profiles are intent-based and shared by run, chat, bench, and validate.
-
-```bash
-thintensor profiles list
-thintensor explain
-thintensor explain max-performance --model ./local-model
-thintensor architectures list
-thintensor architectures audit ./local-model
-```
-
-- `auto`: stays on non-quantized balanced kernels for compatible dense
-  decoders and safe BF16 for unsupported optimization capabilities.
-- `safe`: BF16 weights, full BF16 KV history, broadest compatibility.
-- `balanced`: BF16 weights with native ThinTensor matvec and causal-attention
-  kernels. No approximate weight storage.
-- `max-performance`: opt-in adaptive INT8/tensor-core profile. Quality and speed must be
-  validated for every model and GPU.
-- `lab`: explicit experimental overrides without quality or speed claims.
-
-Legacy names such as `bf16`, `quality`, `fast-90`, and `experimental` remain
-accepted as aliases.
-
-Profile names are not universal throughput promises. `thintensor explain max-performance` includes
-the hardware, context length, cosine, top-1, top-5, and KV-retention scope of
-retained measurements.
-
-Architecture status is stricter than load compatibility:
-
-- `verified`: native correctness is recorded and native decode beat the matched
-  Transformers loop.
-- `candidate`: native semantic/tensor support exists, but correctness and speed
-  gates are incomplete.
-- `fallback`: the model runs through Transformers while its missing native
-  operators are implemented.
-
-Current matched verified results on the development RTX 5050 Laptop GPU:
-
-- SmolLM3-3B: 94.00 tok/s versus Transformers 47.54 tok/s at 500 tokens.
-- Qwen2.5-3B-Instruct: 93.08 tok/s versus Transformers 48.18 tok/s at
-  500 tokens.
-- Phi-4-mini-instruct: 53.80 tok/s versus Transformers 39.09 tok/s at
-  200 tokens, with fused QKV and fused gate/up native dispatch.
-- StableLM-3B-4E1T: 55.76 tok/s versus Transformers 48.28 tok/s at
-  200 tokens.
-- Gemma-2-2B-IT: 57.29 tok/s versus Transformers 53.58 tok/s at 200
-  tokens, with exact ordered top-5 in the retained validation suite.
-
-The full speed, peak-memory, cosine, ranking, and retention matrix is in
-[BENCHMARKS.md](BENCHMARKS.md). It also records candidate results that were
-not promoted to verified status.
-
-## Benchmark and validate
-
-```bash
-thintensor bench MODEL.thin \
-  --profiles safe,balanced,max-performance \
-  --warmup 10 --steps 500 \
-  --hf-model ./original-model \
-  --require-faster-than-hf \
-  --out benchmark_results/cli.json
-
-thintensor validate MODEL.thin \
-  --hf-model ./original-model \
-  --profile max-performance \
-  --suite required \
-  --require-tier ranking
-```
-
-Benchmarks use fresh processes and full causal KV history. Runs shorter than 10
-warmup plus 200 measured tokens are marked smoke-only. Launch count and isolated
-microkernel time are diagnostics, not end-to-end wins.
-
-## Explain profiles and routing
-
-The CLI explains why auto selected the native or compatibility engine, what
-each profile changes, its quality and retention contract, retained measurements,
-compatibility blockers, and the equivalent command:
-
-```bash
-thintensor explain max-performance --model ./local-model --json
-```
-
-## Residency
-
-Full VRAM weight and KV residency are the defaults. Explicit bounded streaming:
-
-```bash
-thintensor run MODEL.thin \
-  --residency stream \
-  --gpu-weight-budget 6GiB \
-  --cpu-offload --pin-cpu-pages
-```
-
-Exact KV modes are `gpu_full`, `hybrid_recent`, and `cpu_exact`. CPU-backed
-modes preserve values but are memory-pressure options, not claimed speedups.
-
-## Operations
-
-```bash
-thintensor cache list
-thintensor cache path
-thintensor doctor --json
-thintensor inspect MODEL.thin --verify --json
-thintensor core --help
-```
+Validation execution isolates processes: it runs the Hugging Face trajectory first, caches reference logits, unloads it from VRAM, and then loads the `.thin` model to calculate the exact minimum cosine similarity across all tokens.
