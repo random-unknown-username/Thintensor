@@ -55,7 +55,7 @@ Follow this fast-path to pull, convert, and execute a lightweight model (Qwen-0.
 
 3. **Run a prompt through the native GPU runtime**:
    ```bash
-   thintensor run ~/.cache/thintensor/models/Qwen--Qwen3.5-0.8B.thin --prompt "Explain quantum computing in one sentence."
+   thintensor run ~/.cache/thintensor/models/Qwen--Qwen3.5-0.8B/Qwen3.5-0.8B.thin --prompt "Explain quantum computing in one sentence."
    ```
 
 4. **Verify correctness similarity metrics**:
