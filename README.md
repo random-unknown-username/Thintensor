@@ -40,6 +40,29 @@ Run the doctor command to ensure the GPU runtime and kernel dependencies are ful
 thintensor doctor --strict
 ```
 
+### 🏃 Quickstart: Downloading & Running a Sample Model (Qwen-0.8B)
+Follow this fast-path to pull, convert, and execute a lightweight model (Qwen-0.8B):
+
+1. **Download the Hugging Face weights**:
+   ```bash
+   thintensor pull Qwen/Qwen3.5-0.8B
+   ```
+
+2. **Convert the weights into a `.thin` archive**:
+   ```bash
+   thintensor convert ~/.cache/thintensor/models/Qwen--Qwen3.5-0.8B --out Qwen3.5-0.8B.thin
+   ```
+
+3. **Run a prompt through the native GPU runtime**:
+   ```bash
+   thintensor run Qwen3.5-0.8B.thin --prompt "Explain quantum computing in one sentence."
+   ```
+
+4. **Verify correctness similarity metrics**:
+   ```bash
+   thintensor validate Qwen3.5-0.8B.thin --hf-model ~/.cache/thintensor/models/Qwen--Qwen3.5-0.8B --profile max-max-perf --suite quick
+   ```
+
 ---
 
 ## 🏗️ Code Architecture & Core Modules
