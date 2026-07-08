@@ -21,8 +21,8 @@ structures for bandwidth and preserve a BF16 source or exact shortlist guard.
 | Gemma-2-2B-IT | verified | 200 | 57.29 | 53.58 | 1.069x | 5.463 / 4.901 | +11.5% | 0.999555 | yes | yes | yes | full BF16 |
 | TinyLlama-1.1B-Chat | candidate | 200 | 180.28 | 132.36 | 1.362x | 2.137 / 2.064 | +3.5% | 0.997788 | yes | no | no | full BF16 |
 | Qwen3.5-0.8B | candidate | 200 | 115.91 | 64.33 | 1.802x | 1.453 / 1.452 | +0.1% | 0.999811 | yes | no | no | full BF16 |
-| Gemma-4-E2B | candidate | 200 | 35.05 | 1.60 | 21.91x | 6.490 / 6.620 | -2.0% | 0.999090 | yes | yes | no | full BF16 |
-| OLMoE-1B-7B-0924-Instruct | candidate | 200 | 31.28 | 1.60 | 19.55x | 6.772 / 6.450 | +5.0% | 0.998586 | yes | yes | no | full BF16 |
+| Gemma-4-E2B | candidate | 200 | 43.60 | 1.60 | 27.25x | 6.490 / 6.620 | -2.0% | 0.999671 | yes | yes | no | full BF16 |
+| OLMoE-1B-7B-0924-Instruct | candidate | 200 | 33.70 | 1.60 | 21.06x | 6.820 / 6.450 | +5.7% | 0.999218 | yes | yes | no | full BF16 |
 
 `candidate` is deliberate for TinyLlama: the short suite retained exact top-1
 and 0.997788 minimum cosine, but one BF16 fifth-place cutoff tie changed the
@@ -56,13 +56,13 @@ Gemma2 is really slow rn ik, its a older and a kind of bad arch for our case
 | Gemma-4-E2B | balanced | 34.26 | 6.490 | n/a | n/a | n/a | n/a |
 | Gemma-4-E2B | max-performance | 34.24 | 6.490 | 0.999090 | yes | yes | no |
 | Gemma-4-E2B | lab | 35.02 | 6.490 | n/a | n/a | n/a | n/a |
-| Gemma-4-E2B | max-max-perf | 37.48 | 6.49 | n/a | n/a | n/a | n/a |
+| Gemma-4-E2B | max-max-perf | 43.60 | 6.49 | 0.999671 | yes | yes | no |
 | Gemma-4-E2B | Transformers | 1.60 | 6.620 | 1.000000 | yes | yes | yes |
 | OLMoE-1B-7B-0924-Instruct | safe | 8.99 | 6.935 | n/a | n/a | n/a | n/a |
 | OLMoE-1B-7B-0924-Instruct | balanced | 30.65 | 6.832 | n/a | n/a | n/a | n/a |
 | OLMoE-1B-7B-0924-Instruct | max-performance | 31.28 | 6.772 | 0.998586 | yes | yes | no |
 | OLMoE-1B-7B-0924-Instruct | lab | 10.23 | 6.935 | n/a | n/a | n/a | n/a |
-| OLMoE-1B-7B-0924-Instruct | max-max-perf | 29.49 | 6.78 | 0.998586 | yes | yes | no |
+| OLMoE-1B-7B-0924-Instruct | max-max-perf | 33.70 | 6.82 | 0.999218 | yes | yes | no |
 | OLMoE-1B-7B-0924-Instruct | Transformers | 1.60 | 6.450 | 1.000000 | yes | yes | yes |
 
 Quality rows are the minimum across the public quick suite at prefill lengths

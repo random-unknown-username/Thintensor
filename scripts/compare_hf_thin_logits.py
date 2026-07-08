@@ -123,6 +123,12 @@ def parse_args() -> argparse.Namespace:
         default=-1,
     )
     parser.add_argument("--body-int4-group-size", type=int, default=0)
+    parser.add_argument("--expert-int4", action="store_true")
+    parser.add_argument("--expert-int4-layers")
+    parser.add_argument("--expert-int4-group-size", type=int, default=32)
+    parser.add_argument("--dense-int4", action="store_true")
+    parser.add_argument("--dense-int4-layers")
+    parser.add_argument("--dense-int4-group-size", type=int, default=32)
     parser.add_argument("--mxfp4-gate-up-layers")
     parser.add_argument("--mxfp4-down-layers")
     parser.add_argument("--mxfp4-qkv-layers")
@@ -364,6 +370,12 @@ def main() -> None:
             o_fp8_layer_spec=args.o_fp8_layers,
             fp8_scale_block=args.fp8_scale_block,
             lm_head_fp8_scale_block=args.lm_head_fp8_scale_block,
+            expert_int4=args.expert_int4,
+            expert_int4_layer_spec=args.expert_int4_layers,
+            expert_int4_group_size=args.expert_int4_group_size,
+            dense_int4=args.dense_int4,
+            dense_int4_layer_spec=args.dense_int4_layers,
+            dense_int4_group_size=args.dense_int4_group_size,
         )
         weights.warm_start()
     else:

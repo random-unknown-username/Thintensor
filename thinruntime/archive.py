@@ -15,9 +15,9 @@ HEADER_LEN = 88
 
 class ThinArchive:
     """
-    Fast Python parser for ThinTensor .thin archives.
+    Python parser for ThinTensor .thin archives.
 
-    Key runtime features:
+    runtime features:
     - mmap-backed zero-copy page views
     - O(1) page metadata lookup
     - O(1) manifest page lookup
