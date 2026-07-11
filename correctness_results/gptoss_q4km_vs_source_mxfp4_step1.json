@@ -1,0 +1,14 @@
+{
+  "centered_logit_cosine": 0.7923501133918762,
+  "jensen_shannon_distance": 0.5273434956867876,
+  "maximum_centered_abs_error": 8.477825164794922,
+  "mean_centered_abs_error": 1.2327563762664795,
+  "q4_gguf": "benchmark_models/gpt-oss-20b-gguf/gpt-oss-20b-Q4_K_M.gguf",
+  "raw_logit_cosine": null,
+  "reference": "ThinTensor original MXFP4 source pages",
+  "step": 1,
+  "token_id": 13225,
+  "top1_same": true,
+  "top5_overlap": 0.2,
+  "total_variation_distance": 0.5734692811965942
+}

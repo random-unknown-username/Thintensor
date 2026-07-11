@@ -209,6 +209,34 @@ PROFILES: dict[str, dict[str, Any]] = {
         "recommended_for": "Developers running an explicit validation plan.",
         "tradeoffs": ("Every override must be benchmarked and correctness-gated.",),
     },
+    "autofit": {
+        "label": "Fit model in VRAM at all costs",
+        "description": (
+            "Aggressive autofit profile that prioritizes fitting the model "
+            "into available VRAM at all costs by dynamically choosing quantization parameters."
+        ),
+        "kernel_backend": "triton",
+        "gate_up_fp8": False,
+        "down_proj_fp8": False,
+        "o_proj_fp8": False,
+        "qkv_fp8": False,
+        "lm_head_fp8": False,
+        "keep_bf16_lm_head": True,
+        "lm_head_topk_guard": 0,
+        "attention_backend": "triton_fused",
+        "fused_scaled_mlp": True,
+        "fused_residual_norm": True,
+        "fused_rope": True,
+        "preferred_auto_quant": "autofit",
+        "experimental": True,
+        "required_capabilities": DENSE_GATED_CAPABILITY,
+        "intent": "Fit the model in VRAM at all costs.",
+        "quality_contract": "May severely degrade quality to fit model in VRAM.",
+        "retention_contract": "Full causal history.",
+        "speed_contract": "Optimized for memory reduction.",
+        "recommended_for": "Running extremely large models on low-VRAM GPUs.",
+        "tradeoffs": ("High quantization noise.",),
+    },
 }
 
 # Preserve the exact behavior of previously published opt-in names without
@@ -296,6 +324,11 @@ def _model_value(model: Mapping[str, Any], key: str) -> Any:
             return "layer_norm"
         return "unknown"
     return model.get(key)
+
+
+def _model_operators(model: Mapping[str, Any]) -> frozenset[str]:
+    values = model.get("required_operators") or ()
+    return frozenset(str(value) for value in values)
 
 
 def geometry_matches(
@@ -451,12 +484,12 @@ def get_profile(
 
     if (
         model is not None
-        and str(model.get("model_type") or "") == "qwen3_5"
+        and "gated_delta_net" in _model_operators(model)
         and canonical in {"balanced", "max-performance"}
     ):
-        # Qwen3.5's retained winner is its exact-BF16 fused recurrent path.
-        # Dense adaptive quantization and fused short-context GQA both regress
-        # this shape, so do not inherit model-specific legacy defaults.
+        # Qwen3.5 uses its architecture-native recurrent path. Balanced stays
+        # exact; max-performance lets the device-aware auto-fit planner choose
+        # mixed precision when the model does not fit in VRAM.
         result.update(
             {
                 "kernel_backend": "triton-matvec",
@@ -472,7 +505,9 @@ def get_profile(
                 "adaptive_body_int8_start_token": -1,
                 "experimental_int8_tensorcore": False,
                 "fused_rope": False,
-                "preferred_auto_quant": "off",
+                "preferred_auto_quant": (
+                    "on" if canonical == "max-performance" else "off"
+                ),
                 "quality_contract": (
                     "BF16 weights, FP32 recurrent DeltaNet state, and full "
                     "uncompressed BF16 KV history."
@@ -486,7 +521,7 @@ def get_profile(
         )
     if (
         model is not None
-        and str(model.get("model_type") or "") == "qwen3_5"
+        and "gated_delta_net" in _model_operators(model)
         and canonical == "max-max-perf"
     ):
         result.update(
@@ -505,12 +540,15 @@ def get_profile(
                 "experimental_int8_tensorcore": False,
                 "fused_rope": True,
                 "fused_residual_norm": True,
-                "preferred_auto_quant": "off",
+                "preferred_auto_quant": "aggressive",
             }
         )
     if (
         model is not None
-        and str(model.get("model_type") or "") == "gemma4"
+        and bool(
+            {"per_layer_embeddings", "shared_kv_attention"}
+            & _model_operators(model)
+        )
         and canonical in {"balanced", "max-performance"}
     ):
         result.update(
@@ -537,7 +575,10 @@ def get_profile(
         )
     if (
         model is not None
-        and str(model.get("model_type") or "") == "gemma4"
+        and bool(
+            {"per_layer_embeddings", "shared_kv_attention"}
+            & _model_operators(model)
+        )
         and canonical == "max-max-perf"
     ):
         # Gemma-4's unique forward path does not go through the standard
@@ -639,9 +680,12 @@ def profile_to_runtime_kwargs(profile: Mapping[str, Any]) -> dict[str, Any]:
         "kernel_backend",
         "gate_up_fp8",
         "down_proj_fp8",
+        "fp8_layer_spec",
         "down_fp8_layer_spec",
         "o_proj_fp8",
+        "o_fp8_layer_spec",
         "qkv_fp8",
+        "qkv_fp8_layer_spec",
         "lm_head_fp8",
         "keep_bf16_lm_head",
         "lm_head_backend",
@@ -679,15 +723,27 @@ def profile_to_runtime_flags(profile: Mapping[str, Any]) -> list[str]:
         "fused_residual_norm": "--fused-residual-norm",
         "fused_rope": "--fused-rope",
         "exact_prefill": "--exact-prefill",
+        "cuda_graphs": "--cuda-graphs",
     }
     for key, flag in booleans.items():
         if profile.get(key):
             flags.append(flag)
     if profile.get("down_fp8_layer_spec"):
         flags.extend(["--down-fp8-layers", str(profile["down_fp8_layer_spec"])])
+    if profile.get("fp8_layer_spec"):
+        flags.extend(["--fp8-layers", str(profile["fp8_layer_spec"])])
+    if profile.get("qkv_fp8_layer_spec"):
+        flags.extend(["--qkv-fp8-layers", str(profile["qkv_fp8_layer_spec"])])
+    if profile.get("o_fp8_layer_spec"):
+        flags.extend(["--o-fp8-layers", str(profile["o_fp8_layer_spec"])])
     guard = int(profile.get("lm_head_topk_guard") or 0)
     if guard:
         flags.extend(["--lm-head-topk-guard", str(guard)])
+    lm_head_int4_group_size = int(profile.get("lm_head_int4_group_size") or 0)
+    if lm_head_int4_group_size > 0:
+        flags.extend(
+            ["--lm-head-int4-group-size", str(lm_head_int4_group_size)]
+        )
     adaptive_start = int(profile.get("adaptive_body_int8_start_token", -1))
     if adaptive_start >= 0:
         flags.extend(["--adaptive-body-int8-start-token", str(adaptive_start)])
@@ -723,7 +779,7 @@ def profile_environment(profile: Mapping[str, Any]) -> dict[str, str]:
         "THINTENSOR_INT8_TC_BLOCK_N": "2",
         "THINTENSOR_INT8_TC_BLOCK_M": "64",
         "THINTENSOR_INT8_TC_BLOCK_K": "256",
-        "THINTENSOR_TENSORCORE_MATVEC": "1",
+        "THINTENSOR_TENSORCORE_MATVEC": "0",
     }
 
 

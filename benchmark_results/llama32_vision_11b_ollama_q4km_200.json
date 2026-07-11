@@ -1,0 +1,21 @@
+{
+  "context_length": 4096,
+  "decode_steps_requested": 200,
+  "engine": "ollama",
+  "eval_count": 200,
+  "eval_duration_ns": 9056011698,
+  "family": "mllama",
+  "load_duration_ns": 114685224,
+  "loaded_size": 11971475200,
+  "model": "llama3.2-vision:11b",
+  "ms_per_token": 45.28005849,
+  "parameter_size": "10.7B",
+  "prompt_chars": 1728,
+  "prompt_eval_count": 265,
+  "prompt_eval_duration_ns": 46816527,
+  "quantization_level": "Q4_K_M",
+  "size_vram": 7450311168,
+  "tokens_per_s": 22.084777125913998,
+  "total_duration_ns": 9259971935,
+  "wall_s": 9.261227816998144
+}

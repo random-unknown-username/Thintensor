@@ -41,13 +41,13 @@ def main() -> None:
     parser.add_argument("--archive", required=True)
     parser.add_argument("--hf-model")
     parser.add_argument("--target-toks", type=float, default=0.0)
-    parser.add_argument("--target-speedup", type=float, default=1.30)
+    parser.add_argument("--target-speedup", type=float, default=3.0)
     parser.add_argument("--max-rounds", type=int, default=20)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--modes", default="auto")
     parser.add_argument("--allow-unsafe", default="false")
-    parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--warmup-steps", type=int, default=5)
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--correctness-prefill-lens", default="1,8")
     parser.add_argument("--correctness-steps", default="1,10")
     parser.add_argument(
@@ -159,6 +159,9 @@ def main() -> None:
                             out_dir / f"round_{round_number:02d}_{mode}.benchmark.json"
                         ),
                         "residency": args.resolved_residency,
+                        "steady_state_eligible": (
+                            args.steps >= 200 and args.warmup_steps >= 10
+                        ),
                     }
                 )
                 if baseline is None:
@@ -378,7 +381,11 @@ def render_summary(summary: dict[str, Any]) -> str:
 
 
 def safe_claims(best: dict[str, Any] | None) -> list[str]:
-    if best is None or not best.get("correctness_passed"):
+    if (
+        best is None
+        or not best.get("correctness_passed")
+        or not best.get("steady_state_eligible")
+    ):
         return []
     return [
         f"{best['mode']} reached {best['tokens_per_s']:.3f} tok/s in "

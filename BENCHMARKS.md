@@ -23,6 +23,7 @@ structures for bandwidth and preserve a BF16 source or exact shortlist guard.
 | Qwen3.5-0.8B | candidate | 200 | 115.91 | 64.33 | 1.802x | 1.453 / 1.452 | +0.1% | 0.999811 | yes | no | no | full BF16 |
 | Gemma-4-E2B | candidate | 200 | 43.60 | 1.62 | 26.91x | 6.490 / 6.620 | -2.0% | 0.999671 | yes | yes | no | full BF16 |
 | OLMoE-1B-7B-0924-Instruct | candidate | 200 | 33.70 | 9.22 | 3.65x | 6.820 / 6.450 | +5.7% | 0.999218 | yes | yes | no | full BF16 |
+| GPT-OSS-20B | verified | 200 | 50.34 | 40.36 | 1.247x | n/a / n/a | n/a | 0.983299 | yes | n/a | n/a | max-max-perf autotune |
 
 `candidate` is deliberate for TinyLlama: the short suite retained exact top-1
 and 0.997788 minimum cosine, but one BF16 fifth-place cutoff tie changed the
@@ -64,6 +65,11 @@ Gemma2 is really slow rn ik, its a older and a kind of bad arch for our case
 | OLMoE-1B-7B-0924-Instruct | lab | 10.23 | 6.935 | n/a | n/a | n/a | n/a |
 | OLMoE-1B-7B-0924-Instruct | max-max-perf | 33.70 | 6.82 | 0.999218 | yes | yes | no |
 | OLMoE-1B-7B-0924-Instruct | Transformers | 9.22 | 6.450 | 1.000000 | yes | yes | yes |
+| GPT-OSS-20B | body-embed-fp8-stream-pageable-tight-budget | 17.01 | 8.55 | 0.983299 | yes | n/a | n/a |
+| GPT-OSS-20B | max-max-perf | 50.34 | 7.38 | 0.983299 | yes | n/a | n/a |
+| Qwen3.5-9B | max-max-perf | 12.16 | 7.13 | 0.997576 | yes | yes | n/a |
+| Llama-3.2-11B-Vision | text-only (ThinTensor) | n/a | 14.96 | 0.939758 | n/a | 0.80 | n/a |
+| Llama-3.2-11B-Vision | Ollama Q4_K_M | 22.08 | n/a | 0.720495 | no | 0.55 | n/a |
 
 Quality rows are the minimum across the public quick suite at prefill lengths
 1 and 128 and decode steps 1 and 10. Gemma max-performance was additionally
@@ -117,3 +123,12 @@ Benchmarks are run in isolated, dedicated Python processes for each engine (Thin
 - **Top-5 Set**: A boolean check indicating whether the set of top-5 highest-probability token IDs is identical between the two models at all steps (ignoring their internal sorted order).
 - **Top-5 Order**: A boolean check indicating whether the exact sorted order of the top-5 token IDs matches between ThinTensor and HF at all steps.
 - **KV Retention**: Specifies the KV cache precision format (e.g. `full BF16`).
+
+## ThinRuntime GPT-OSS-20B vs llama.cpp Q4_K_M (July 11)
+
+| Engine | tok/s (median/mean) | Speedup | Exact embed/LM head | Expert Q | Expert xfers | Top-1 step 4 | Cosine step 1/4 | llama.cpp cosine |
+|:---|---:|---:|:---:|:---:|:---:|:---:|:---:|---:|
+| ThinRuntime (GPT-OSS-20B) | 50.34 median | 24.73% faster | yes | Q1/Q2 | 0 | yes | 0.987 / 0.983 | 0.991 |
+| llama.cpp b9964 Q4_K_M | 40.36 mean | baseline | n/a | n/a | n/a | n/a | n/a | 0.792 |
+
+Three explicit 200-token runs. ThinRuntime uses exact embeddings + LM head with Q1/Q2 quantization only on experts; zero expert transfers during decode. Top-1 unchanged through step 4. One-step accepted config cosine 0.991415.

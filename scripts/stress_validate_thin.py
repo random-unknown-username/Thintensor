@@ -95,7 +95,10 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.hf_model,
+        trust_remote_code=True,
+    )
     cases = build_cases(tokenizer)
     if args.cases:
         selected = {
@@ -116,15 +119,16 @@ def main() -> None:
             torch_dtype=dtype,
             trust_remote_code=True,
             device_map="auto",
+            attn_implementation="eager",
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.hf_model,
             torch_dtype=dtype,
             trust_remote_code=True,
+            attn_implementation="eager",
         ).to(device)
     model.eval()
-    model.config._attn_implementation = "eager"
     references = {}
     with torch.inference_mode():
         for case in cases:

@@ -86,6 +86,9 @@ def thin_row(
         "h2d_bytes_per_token": (
             document.get("gpu_cache", {}).get("h2d_transfer_bytes_per_token")
         ),
+        "decode_steps": document.get("steps"),
+        "warmup_steps": document.get("warmup_steps"),
+        "thermal_stop": document.get("thermal_stop", False),
     }
 
 
@@ -105,6 +108,9 @@ def external_row(path: Path, document: dict[str, Any]) -> dict[str, Any]:
         "selective_quantization": document["quantization"].upper()
         not in {"F16", "BF16"},
         "h2d_bytes_per_token": None,
+        "decode_steps": document.get("decode_steps"),
+        "warmup_steps": document.get("warmup_steps"),
+        "thermal_stop": document.get("thermal_stop", False),
     }
 
 
@@ -143,10 +149,16 @@ def classify_claims(rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
                 "as an external baseline."
             )
             continue
+        steady = (
+            int(row.get("decode_steps") or 0) >= 200
+            and int(row.get("warmup_steps") or 0) >= 10
+            and not row.get("thermal_stop")
+        )
         if (
             row.get("attention_mode") == "causal_kv"
             and not row.get("not_hf_equivalent")
             and row.get("correctness_passed")
+            and steady
         ):
             qualifier = (
                 " selective quantization"
@@ -160,7 +172,7 @@ def classify_claims(rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
         else:
             unsafe.append(
                 f"Do not claim HF-equivalent performance for {label}; causal "
-                "attention and correctness evidence are incomplete."
+                "attention, correctness, or steady-state evidence is incomplete."
             )
 
     stream_rows = [

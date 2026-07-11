@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Compare HF execution loaded from safetensors vs ThinTensor hydration.
+
+Both paths execute the Transformers model. This is a storage/load benchmark,
+not evidence for the native ThinTensor decode runtime.
+"""
+
 import sys
 import time
 import argparse
@@ -12,12 +18,20 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Import conditionally inside trial to avoid importing torch in the manager process
-def run_single_trial(mode: str, hf_dir: Path, thin_file: Path, prompt: str, tokens: int, device: str):
+def run_single_trial(
+    mode: str,
+    hf_dir: Path,
+    thin_file: Path,
+    prompt: str,
+    tokens: int,
+    warmup_tokens: int,
+    device: str,
+):
     import torch
     import gc
     import os
     import ctypes
-    from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     from thinruntime import load_thin_model
 
     try:
@@ -78,7 +92,7 @@ def run_single_trial(mode: str, hf_dir: Path, thin_file: Path, prompt: str, toke
     elif mode == "thin":
         # ThinRuntime path
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
-        model, diagnostics = load_thin_model(
+        model, _diagnostics = load_thin_model(
             archive_path=str(thin_file),
             hf_dir=str(hf_dir),
             device=device,
@@ -104,19 +118,35 @@ def run_single_trial(mode: str, hf_dir: Path, thin_file: Path, prompt: str, toke
         torch.cuda.synchronize()
     first_token_latency = time.perf_counter() - t_prefill_start
 
-    # 2. Decode
-    generated_tokens = [next_token]
+    # 2. Warmup and steady-state decode. The token selected by prefill is an
+    # input to decode, not a timed decoded token.
     curr_input_ids = next_token.unsqueeze(-1)
-    
-    t_decode_start = time.perf_counter()
-    for _ in range(tokens - 1):
+    for _ in range(warmup_tokens):
         with torch.no_grad():
-            outputs = model(input_ids=curr_input_ids, past_key_values=past_key_values, use_cache=True)
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(next_token_logits, dim=-1)
+            outputs = model(
+                input_ids=curr_input_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
             past_key_values = outputs.past_key_values
-            generated_tokens.append(next_token)
-            curr_input_ids = next_token.unsqueeze(-1)
+            curr_input_ids = torch.argmax(
+                outputs.logits[:, -1, :], dim=-1
+            ).unsqueeze(-1)
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+    t_decode_start = time.perf_counter()
+    for _ in range(tokens):
+        with torch.no_grad():
+            outputs = model(
+                input_ids=curr_input_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            curr_input_ids = torch.argmax(
+                outputs.logits[:, -1, :], dim=-1
+            ).unsqueeze(-1)
     if device == "cuda":
         torch.cuda.synchronize()
     decode_time = time.perf_counter() - t_decode_start
@@ -126,7 +156,7 @@ def run_single_trial(mode: str, hf_dir: Path, thin_file: Path, prompt: str, toke
     rss_delta = (rss1 - rss0) if (rss1 is not None and rss0 is not None) else 0
     
     gpu_peak_alloc = int(torch.cuda.max_memory_allocated()) if device == "cuda" else 0
-    decode_tok_s = len(generated_tokens) / decode_time if decode_time > 0 else 0.0
+    decode_tok_s = tokens / decode_time if decode_time > 0 else 0.0
 
     # Cleanup
     del model
@@ -137,6 +167,8 @@ def run_single_trial(mode: str, hf_dir: Path, thin_file: Path, prompt: str, toke
     result = {
         "load_time": load_time,
         "first_token_latency": first_token_latency,
+        "warmup_tokens": warmup_tokens,
+        "decode_tokens": tokens,
         "decode_tok_s": decode_tok_s,
         "rss_delta": rss_delta,
         "gpu_peak_alloc": gpu_peak_alloc,
@@ -149,13 +181,23 @@ def main():
     parser.add_argument("hf_dir", type=Path, help="Hugging Face model directory")
     parser.add_argument("thin_file", type=Path, help="ThinTensor archive path")
     parser.add_argument("--prompt", type=str, default="Explain ThinTensor in one sentence.", help="Benchmark prompt")
-    parser.add_argument("--tokens", type=int, default=128, help="Number of tokens to generate")
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        default=200,
+        help="Number of timed decode tokens",
+    )
+    parser.add_argument("--warmup-tokens", type=int, default=10)
     parser.add_argument("--trials", type=int, default=3, help="Number of benchmark trials")
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda", help="Execution device")
     
     # Internal flag for subprocess trial isolation
     parser.add_argument("--run-trial", choices=["hf", "thin"], default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.tokens < 1:
+        raise ValueError("--tokens must be positive")
+    if args.warmup_tokens < 0:
+        raise ValueError("--warmup-tokens must be non-negative")
 
     if args.run_trial is not None:
         run_single_trial(
@@ -164,17 +206,19 @@ def main():
             thin_file=args.thin_file,
             prompt=args.prompt,
             tokens=args.tokens,
+            warmup_tokens=args.warmup_tokens,
             device=args.device
         )
         return
 
     print("==================================================")
-    print("      ThinTensor vs Hugging Face Benchmark        ")
+    print(" ThinTensor Hydration vs HF Safetensors Benchmark ")
     print("==================================================")
     print(f"HF Dir:      {args.hf_dir}")
     print(f"Thin File:   {args.thin_file}")
     print(f"Prompt:      '{args.prompt}'")
     print(f"Tokens:      {args.tokens}")
+    print(f"Warmup:      {args.warmup_tokens}")
     print(f"Trials:      {args.trials}")
     print(f"Device:      {args.device}")
     print("==================================================")
@@ -191,6 +235,7 @@ def main():
                 str(args.thin_file),
                 "--prompt", args.prompt,
                 "--tokens", str(args.tokens),
+                "--warmup-tokens", str(args.warmup_tokens),
                 "--device", args.device,
                 "--run-trial", mode
             ]
@@ -230,7 +275,7 @@ def main():
 
     # Display comparison table
     print("\n==================== RESULTS COMPARISON ====================")
-    print(f"{'Metric':<25} | {'HF Baseline':<20} | {'ThinRuntime':<20}")
+    print(f"{'Metric':<25} | {'HF Safetensors':<20} | {'Thin Hydration':<20}")
     print("-" * 72)
     
     def format_val(val_dict, fmt, unit=""):
@@ -280,9 +325,12 @@ def main():
         "device": args.device,
         "prompt": args.prompt,
         "tokens": args.tokens,
+        "warmup_tokens": args.warmup_tokens,
         "trials": args.trials,
         "hf_baseline": hf_agg,
         "thin_runtime": thin_agg,
+        "execution_backend": "transformers_for_both_paths",
+        "native_thinruntime_benchmark": False,
         "tps_ratio": tps_ratio,
         "speedup_percent": speedup_pct,
         "is_meaningful": is_meaningful,
@@ -311,7 +359,9 @@ def main():
     
     md_entry = f"""
 
-## ThinRuntime v0 vs HF Baseline (Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+## ThinTensor hydration vs HF safetensors (Run: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+
+Both rows execute Transformers; this does not measure the native ThinTensor runtime.
 
 | Metric | HF Baseline | ThinRuntime | Delta / Ratio |
 | --- | --- | --- | --- |
@@ -328,6 +378,7 @@ def main():
 * **Zero-copy CPU views used**: YES
 * **PyTorch assign=True supported**: YES
 * **Device transfer copied**: YES (model.to(device))
+* **Warmup tokens**: {args.warmup_tokens}
 * **Trials run**: {args.trials} (isolated subprocesses)
 """
     with bench_md.open("a") as f:

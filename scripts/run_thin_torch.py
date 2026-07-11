@@ -140,6 +140,8 @@ def main():
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda", help="Execution device")
     parser.add_argument("--hf-dir", type=Path, default=None, help="Path to HuggingFace directory containing config/tokenizer")
     args = parser.parse_args()
+    if args.tokens < 1:
+        parser.error("--tokens must be positive")
 
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
@@ -255,7 +257,8 @@ def main():
     print(f"Generated text: {decoded_text}")
 
     # Metrics Calculations
-    decode_tok_s = len(generated_tokens) / t_decode if t_decode > 0 else 0.0
+    measured_decode_tokens = max(0, len(generated_tokens) - 1)
+    decode_tok_s = measured_decode_tokens / t_decode if t_decode > 0 else 0.0
     rss_delta = (rss1 - rss0) if (rss1 is not None and rss0 is not None) else 0
     gpu_peak_alloc = gpu_peak_allocated(device)
     gpu_peak_res = gpu_peak_reserved(device)

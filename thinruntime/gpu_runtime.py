@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import resource
+import shutil
 import subprocess
 import threading
 import time
@@ -17,7 +18,10 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 from .archive import ThinArchive
+from .execution_plan import compile_execution_plan
+from .operator_registry import select_runtime_executor
 from .model_arch import descriptor_from_manifest
+from .page_policy import is_body_weight, is_expert_weight, page_role
 from .torch_loader import load_tensor_view, map_dtype
 
 
@@ -38,7 +42,6 @@ def quantize_to_fp8_via_gpu(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     source_gpu = source_cpu.to(device=device, dtype=torch.bfloat16)
     rows, cols = source_gpu.shape
-    quantized_gpu = torch.empty((rows, cols), dtype=torch.float8_e4m3fn, device=device)
     scale_blocks = (
         (cols + scale_block_size - 1) // scale_block_size
         if scale_block_size > 0
@@ -49,6 +52,7 @@ def quantize_to_fp8_via_gpu(
         dtype=torch.float32,
         device=device,
     )
+    quantized_bf16 = torch.empty((rows, cols), dtype=torch.bfloat16, device=device)
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     chunk_rows = 4096
     for start in range(0, rows, chunk_rows):
@@ -67,13 +71,16 @@ def quantize_to_fp8_via_gpu(
                     .div_(fp8_max)
                 )
                 scales_gpu[start:end, block].copy_(scale_chunk)
-                quantized_gpu[start:end, col_start:col_end].copy_(
-                    block_values.float().div_(scale_chunk[:, None])
+                quantized_bf16[start:end, col_start:col_end].copy_(
+                    (block_values.float() / scale_chunk[:, None]).to(dtype=torch.bfloat16)
                 )
         else:
             scale_chunk = chunk.abs().amax(dim=1).float().clamp_min_(1e-12).div_(fp8_max)
             scales_gpu[start:end].copy_(scale_chunk)
-            quantized_gpu[start:end].copy_(chunk.float().div_(scale_chunk[:, None]))
+            quantized_bf16[start:end].copy_(
+                (chunk.float() / scale_chunk[:, None]).to(dtype=torch.bfloat16)
+            )
+    quantized_gpu = quantized_bf16.to(dtype=torch.float8_e4m3fn)
     quantized_cpu = quantized_gpu.to(device="cpu")
     scales_cpu = scales_gpu.to(device="cpu")
     return quantized_cpu, scales_cpu
@@ -127,6 +134,189 @@ def quantize_to_int4_cpu(
             quantized[:, 0::2] | (quantized[:, 1::2] << 4)
         )
     return packed, scales
+
+
+def quantize_mxfp4_to_lowbit_cpu(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    bits: int,
+    chunk_rows: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Requantize packed MXFP4 groups to MSE-selected Q1 or Q2 E8M0 groups."""
+    if bits not in {1, 2}:
+        raise ValueError("packed MXFP4 expert precision must be Q1 or Q2")
+    if blocks.ndim != 4 or scales.ndim != 3:
+        raise ValueError("packed MXFP4 blocks/scales must be rank 4/rank 3")
+    if tuple(blocks.shape[:3]) != tuple(scales.shape) or blocks.shape[3] != 16:
+        raise ValueError(
+            f"packed MXFP4 blocks/scales mismatch: {blocks.shape} vs {scales.shape}"
+        )
+    experts, rows, groups = map(int, scales.shape)
+    bytes_per_group = 4 if bits == 1 else 8
+    output = torch.empty(
+        (experts, rows, groups, bytes_per_group), dtype=torch.uint8
+    )
+    output_scales = torch.empty_like(scales, dtype=torch.uint8)
+    flat_blocks = blocks.reshape(experts * rows, groups, 16)
+    flat_scales = scales.reshape(experts * rows, groups)
+    flat_output = output.reshape(experts * rows, groups, bytes_per_group)
+    flat_output_scales = output_scales.reshape(experts * rows, groups)
+    fp4_values = torch.tensor(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0),
+        dtype=torch.float32,
+    )
+    q2_values = torch.tensor((-1.5, -0.5, 0.5, 1.5), dtype=torch.float32)
+    exponent_candidates = (-2, -1, 0, 1, 2, 3)
+    for start in range(0, experts * rows, chunk_rows):
+        end = min(experts * rows, start + chunk_rows)
+        packed = flat_blocks[start:end]
+        nibbles = torch.empty((end - start, groups, 32), dtype=torch.uint8)
+        nibbles[..., 0::2] = packed & 0x0F
+        nibbles[..., 1::2] = packed >> 4
+        normalized = fp4_values[nibbles.long()]
+        negative = (nibbles & 8) != 0
+        best_error: torch.Tensor | None = None
+        best_codes: torch.Tensor | None = None
+        best_delta: torch.Tensor | None = None
+        for delta in exponent_candidates:
+            factor = float(2.0**delta)
+            if bits == 2:
+                outer = normalized.abs() >= factor
+                codes = torch.where(
+                    negative,
+                    torch.where(outer, 0, 1),
+                    torch.where(outer, 3, 2),
+                ).to(torch.uint8)
+                reconstructed = q2_values[codes.long()] * factor
+            else:
+                codes = (~negative).to(torch.uint8)
+                reconstructed = torch.where(negative, -factor, factor)
+            error = (normalized - reconstructed).square().mean(dim=2)
+            if best_error is None:
+                best_error = error
+                best_codes = codes
+                best_delta = torch.full_like(error, delta, dtype=torch.int16)
+            else:
+                take = error < best_error
+                best_error = torch.where(take, error, best_error)
+                best_codes = torch.where(take[..., None], codes, best_codes)
+                best_delta = torch.where(
+                    take,
+                    torch.full_like(best_delta, delta),
+                    best_delta,
+                )
+        assert best_codes is not None and best_delta is not None
+        adjusted = (
+            flat_scales[start:end].to(torch.int16).sub(127).add(best_delta)
+        ).clamp_(-127, 127).add_(127).to(torch.uint8)
+        flat_output_scales[start:end].copy_(adjusted)
+        if bits == 2:
+            flat_output[start:end].copy_(
+                best_codes[..., 0::4]
+                | (best_codes[..., 1::4] << 2)
+                | (best_codes[..., 2::4] << 4)
+                | (best_codes[..., 3::4] << 6)
+            )
+        else:
+            packed_signs = best_codes[..., 0::8]
+            for bit in range(1, 8):
+                packed_signs = packed_signs | (best_codes[..., bit::8] << bit)
+            flat_output[start:end].copy_(packed_signs)
+    return output, output_scales
+
+
+def quantize_mxfp4_to_ternary_cpu(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    chunk_rows: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack MXFP4 into grouped {-a, 0, +a} weights below two bits/weight.
+
+    Five ternary digits occupy one byte. A three-bit E2M1 magnitude selector is
+    bit-packed per 32-weight group, and the source E8M0 group scale is retained.
+    The resulting GPT-OSS geometry uses about 1.944 bits/weight including both
+    sidecars, without quantizing embeddings, norms, routers, or the LM head.
+    """
+    if blocks.ndim != 4 or scales.ndim != 3:
+        raise ValueError("packed MXFP4 blocks/scales must be rank 4/rank 3")
+    if tuple(blocks.shape[:3]) != tuple(scales.shape) or blocks.shape[3] != 16:
+        raise ValueError(
+            f"packed MXFP4 blocks/scales mismatch: {blocks.shape} vs {scales.shape}"
+        )
+    experts, rows, groups = map(int, scales.shape)
+    cols = groups * 32
+    ternary_bytes = (cols + 4) // 5
+    magnitude_bytes = (groups * 3 + 7) // 8
+    output = torch.zeros(
+        (experts, rows, ternary_bytes + magnitude_bytes),
+        dtype=torch.uint8,
+    )
+    flat_blocks = blocks.reshape(experts * rows, groups, 16)
+    flat_output = output.reshape(experts * rows, ternary_bytes + magnitude_bytes)
+    fp4_values = torch.tensor(
+        (
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ),
+        dtype=torch.float32,
+    )
+    magnitudes = torch.tensor((0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0))
+    powers = (1, 3, 9, 27, 81)
+    for start in range(0, experts * rows, chunk_rows):
+        end = min(experts * rows, start + chunk_rows)
+        packed = flat_blocks[start:end]
+        nibbles = torch.empty((end - start, groups, 32), dtype=torch.uint8)
+        nibbles[..., 0::2] = packed & 0x0F
+        nibbles[..., 1::2] = packed >> 4
+        normalized = fp4_values[nibbles.long()]
+        best_error: torch.Tensor | None = None
+        best_digits: torch.Tensor | None = None
+        best_magnitude: torch.Tensor | None = None
+        for index, magnitude in enumerate(magnitudes):
+            digits = torch.where(
+                normalized.abs() > magnitude / 2,
+                torch.where(normalized < 0, 0, 2),
+                1,
+            ).to(torch.uint8)
+            reconstructed = torch.where(
+                digits == 1,
+                0.0,
+                torch.where(digits == 0, -magnitude, magnitude),
+            )
+            error = (normalized - reconstructed).square().mean(dim=2)
+            if best_error is None:
+                best_error = error
+                best_digits = digits
+                best_magnitude = torch.full_like(error, index, dtype=torch.uint8)
+            else:
+                take = error < best_error
+                best_error = torch.where(take, error, best_error)
+                best_digits = torch.where(take[..., None], digits, best_digits)
+                best_magnitude = torch.where(
+                    take,
+                    torch.full_like(best_magnitude, index),
+                    best_magnitude,
+                )
+        assert best_digits is not None and best_magnitude is not None
+        digits = best_digits.reshape(end - start, cols)
+        ternary = flat_output[start:end, :ternary_bytes]
+        for digit, power in enumerate(powers):
+            values = digits[:, digit::5]
+            ternary[:, : values.shape[1]].add_(values * power)
+
+        magnitude_output = flat_output[start:end, ternary_bytes:]
+        for group in range(groups):
+            bit_offset = group * 3
+            byte = bit_offset // 8
+            shift = bit_offset & 7
+            values = best_magnitude[:, group]
+            magnitude_output[:, byte] |= values << shift
+            if shift > 5:
+                magnitude_output[:, byte + 1] |= values >> (8 - shift)
+    return output, scales
 
 
 @dataclass(frozen=True)
@@ -205,39 +395,66 @@ class CpuPageStore:
         self.archive = archive
         self.pin_cpu_pages = pin_cpu_pages
         self.dtype = dtype
-        self.tensors: Dict[str, torch.Tensor] = {}
+        self.tensors: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        self.max_bytes = max(
+            1,
+            int(
+                os.environ.get(
+                    "THINTENSOR_CPU_PAGE_CACHE_BYTES",
+                    str(2 * 1024**3),
+                )
+            ),
+        )
         self.cpu_pinned_bytes = 0
         self.cpu_resident_bytes = 0
         self.cpu_page_count = 0
-        self.cpu_page_source = "pinned" if pin_cpu_pages else "full_ram"
-        
-        # Load all page bytes from archive into CPU RAM
-        from .torch_loader import load_tensor_view
-        for page_id in archive.pages.keys():
-            source, _ = load_tensor_view(archive, page_id)
-            target_dtype = _target_dtype(source.dtype, dtype)
-            nbytes = source.numel() * torch.empty(
-                (),
-                dtype=target_dtype,
-            ).element_size()
-            
-            if self.pin_cpu_pages:
-                cpu_tensor = torch.empty(
-                    tuple(source.shape),
-                    dtype=target_dtype,
-                    pin_memory=True,
-                )
-                self.cpu_pinned_bytes += nbytes
-            else:
-                cpu_tensor = torch.empty(
-                    tuple(source.shape),
-                    dtype=target_dtype,
-                )
-            
-            cpu_tensor.copy_(source, non_blocking=False)
-            self.tensors[page_id] = cpu_tensor
-            self.cpu_resident_bytes += nbytes
-            self.cpu_page_count += 1
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.cache_evictions = 0
+        self.cpu_page_source = "bounded_pinned_lru" if pin_cpu_pages else "bounded_lru"
+
+    def get(self, page_id: str) -> torch.Tensor:
+        cached = self.tensors.get(page_id)
+        if cached is not None:
+            self.cache_hits += 1
+            self.tensors.move_to_end(page_id)
+            return cached
+        self.cache_misses += 1
+        source, _ = load_tensor_view(self.archive, page_id)
+        target_dtype = _target_dtype(source.dtype, self.dtype)
+        tensor = torch.empty(
+            tuple(source.shape),
+            dtype=target_dtype,
+            pin_memory=self.pin_cpu_pages,
+        )
+        tensor.copy_(source, non_blocking=False)
+        self.put(page_id, tensor)
+        return tensor
+
+    def put(self, page_id: str, tensor: torch.Tensor) -> None:
+        previous = self.tensors.pop(page_id, None)
+        if previous is not None:
+            previous_bytes = _tensor_nbytes(previous)
+            self.cpu_resident_bytes -= previous_bytes
+            if previous.is_pinned():
+                self.cpu_pinned_bytes -= previous_bytes
+        incoming = _tensor_nbytes(tensor)
+        self._trim(max(0, self.max_bytes - incoming))
+        self.tensors[page_id] = tensor
+        self.cpu_resident_bytes += incoming
+        if tensor.is_pinned():
+            self.cpu_pinned_bytes += incoming
+        self.cpu_page_count = len(self.tensors)
+
+    def _trim(self, target_bytes: int) -> None:
+        while self.tensors and self.cpu_resident_bytes > target_bytes:
+            _, tensor = self.tensors.popitem(last=False)
+            self.cache_evictions += 1
+            size = _tensor_nbytes(tensor)
+            self.cpu_resident_bytes -= size
+            if tensor.is_pinned():
+                self.cpu_pinned_bytes -= size
+        self.cpu_page_count = len(self.tensors)
 
 
 class DirectGpuPageLoader:
@@ -276,8 +493,14 @@ class DirectGpuPageLoader:
         self.pending_staging_bytes = 0
 
     def _reap_completed_staging(self) -> None:
-        while self._pending_staging and self._pending_staging[0][0].query():
-            _, staged = self._pending_staging.popleft()
+        while self._pending_staging:
+            event, staged = self._pending_staging[0]
+            try:
+                if not event.query():
+                    break
+            except Exception:
+                break
+            self._pending_staging.popleft()
             self.pending_staging_bytes -= _tensor_nbytes(staged)
 
     def load_tensor(self, page: dict[str, Any], stream: Optional[torch.cuda.Stream] = None) -> torch.Tensor:
@@ -293,8 +516,8 @@ class DirectGpuPageLoader:
                 )
                 self.metrics.append(metrics)
                 return tensor
-        if self.cpu_store is not None and page_id in self.cpu_store.tensors:
-            source = self.cpu_store.tensors[page_id]
+        if self.cpu_store is not None:
+            source = self.cpu_store.get(page_id)
             target_dtype = source.dtype
             tensor, metrics = self._copy_cpu_tensor(page_id, source, target_dtype, stream=stream)
             self.metrics.append(metrics)
@@ -307,8 +530,8 @@ class DirectGpuPageLoader:
         return tensor
 
     def load_raw_page(self, page_id: str, byte_size: int, stream: Optional[torch.cuda.Stream] = None) -> torch.Tensor:
-        if self.cpu_store is not None and page_id in self.cpu_store.tensors:
-            source = self.cpu_store.tensors[page_id]
+        if self.cpu_store is not None:
+            source = self.cpu_store.get(page_id)
             tensor, metrics = self._copy_cpu_tensor(page_id, source, torch.uint8, stream=stream)
             self.metrics.append(metrics)
             return tensor
@@ -514,13 +737,7 @@ class ThinGpuWeights:
             if page.get("fused_to") is not None and page["fused_to"] in fused_raw:
                 gpu_tensor = self._logical_view_from_fused(page, fused_raw[page["fused_to"]])
                 fused_logical_pages += 1
-            elif (
-                str(
-                    self.manifest.get("model", {}).get("model_type")
-                    or ""
-                ).startswith("gemma4")
-                and page_id == "model.embed_tokens_per_layer.weight"
-            ):
+            elif str(page.get("op") or "") == "per_layer_token_embeddings":
                 gpu_tensor = self._load_rowwise_int8_page(page)
                 pages_loaded += 1
                 unique_gpu_weight_bytes += _tensor_nbytes(gpu_tensor)
@@ -662,18 +879,23 @@ class ThinGpuPagePool:
         gate_up_fp8: bool = False,
         qkv_fp8: bool = False,
         o_proj_fp8: bool = False,
+        embed_fp8: bool = False,
         fp8_layer_spec: Optional[str] = None,
         down_fp8_layer_spec: Optional[str] = None,
         qkv_fp8_layer_spec: Optional[str] = None,
         o_fp8_layer_spec: Optional[str] = None,
         fp8_scale_block: int = 0,
+        lm_head_fp8: bool = False,
         lm_head_fp8_scale_block: int = 0,
+        lm_head_int4_group_size: int = 0,
         expert_int4: bool = False,
         expert_int4_layer_spec: Optional[str] = None,
         expert_int4_group_size: int = 32,
         dense_int4: bool = False,
         dense_int4_layer_spec: Optional[str] = None,
         dense_int4_group_size: int = 32,
+        packed_expert_q2_layer_spec: Optional[str] = None,
+        packed_expert_q1_layer_spec: Optional[str] = None,
     ) -> None:
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
@@ -689,9 +911,12 @@ class ThinGpuPagePool:
         self.gate_up_fp8 = gate_up_fp8
         self.qkv_fp8 = qkv_fp8
         self.o_proj_fp8 = o_proj_fp8
+        self.embed_fp8 = embed_fp8
         self.fp8_layer_spec = fp8_layer_spec
         self.fp8_scale_block = fp8_scale_block
+        self.lm_head_fp8 = bool(lm_head_fp8)
         self.lm_head_fp8_scale_block = lm_head_fp8_scale_block
+        self.lm_head_int4_group_size = int(lm_head_int4_group_size)
         self.expert_int4 = bool(expert_int4)
         self.expert_int4_group_size = int(expert_int4_group_size)
         self.dense_int4 = bool(dense_int4)
@@ -738,6 +963,14 @@ class ThinGpuPagePool:
             int(self.manifest["model"]["layers"]),
         )
         self.selected_dense_int4_layers = selected_dense_int4_layers
+        self.selected_packed_expert_q2_layers = _parse_layer_selection(
+            packed_expert_q2_layer_spec,
+            int(self.manifest["model"]["layers"]),
+        )
+        self.selected_packed_expert_q1_layers = _parse_layer_selection(
+            packed_expert_q1_layer_spec,
+            int(self.manifest["model"]["layers"]),
+        )
         self.page_specs: Dict[str, dict[str, Any]] = {
             page["id"]: {
                 **page,
@@ -755,14 +988,75 @@ class ThinGpuPagePool:
         ] = {}
         self._int4_metadata_by_page: Dict[str, tuple[int, int, int]] = {}
         self._weight_scales: Dict[str, torch.Tensor] = {}
+        self._packed_lowbit_by_page: Dict[str, tuple[str, str, int]] = {}
+        self._packed_lowbit_cache: Dict[
+            str, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._packed_lowbit_cache_paths: Dict[str, Path] = {}
+        self.derived_cache_hits = 0
+        self.derived_cache_misses = 0
+        self.derived_cache_writes = 0
+        self.derived_cache_bytes = 0
+        self._derived_cache_enabled = (
+            os.environ.get("THINTENSOR_DERIVED_CACHE", "1") != "0"
+        )
+        self._derived_cache_dir = self.archive_path.parent / ".derived"
         self._quantization_lock = threading.Lock()
         self._tensor_id_to_page_id: Dict[int, str] = {}
+        self._compact_expert_index_cache: Dict[int, torch.Tensor] = {}
+
+        for page_id, page in list(self.page_specs.items()):
+            layer = page.get("layer")
+            if layer is None or not is_expert_weight(page):
+                continue
+            layer = int(layer)
+            bits = (
+                1 if layer in self.selected_packed_expert_q1_layers
+                else 2 if layer in self.selected_packed_expert_q2_layers
+                else 0
+            )
+            if bits == 0 or int(page.get("bits_per_weight") or 0) != 4:
+                continue
+            scale_id = str(page.get("scale_page") or "")
+            if not scale_id or scale_id not in self.page_specs:
+                raise RuntimeError(
+                    f"packed expert page {page_id} has no E8M0 scale page"
+                )
+            if len(page["shape"]) != 4 or int(page["shape"][-1]) != 16:
+                raise RuntimeError(
+                    f"packed expert page {page_id} has unsupported shape {page['shape']}"
+                )
+            source_checksum = str(page.get("checksum") or "")
+            scale_checksum = str(
+                self.page_specs[scale_id].get("checksum") or ""
+            )
+            cache_key = hashlib.sha256(
+                (
+                    "runtime-mxfp-lowbit-v2\0"
+                    + source_checksum
+                    + "\0"
+                    + scale_checksum
+                    + f"\0q{bits}"
+                ).encode("utf-8")
+            ).hexdigest()
+            self._packed_lowbit_cache_paths[page_id] = (
+                self._derived_cache_dir / f"{cache_key}.pt"
+            )
+            page["shape"][-1] = 4 if bits == 1 else 8
+            page["size"] = math.prod(page["shape"])
+            page["bits_per_weight"] = bits
+            page["quant_scheme"] = f"runtime_mxfp_q{bits}"
+            page["checksum"] = f"runtime-mxfp-q{bits}:{page_id}"
+            binding = (page_id, scale_id, bits)
+            self._packed_lowbit_by_page[page_id] = binding
+            self._packed_lowbit_by_page[scale_id] = binding
 
         if (
             self.down_proj_fp8
             or self.gate_up_fp8
             or self.qkv_fp8
             or self.o_proj_fp8
+            or self.embed_fp8
         ):
             import sys
             print("Pre-quantizing selected weights to scaled FP8...", file=sys.stderr)
@@ -772,33 +1066,38 @@ class ThinGpuPagePool:
                     page_layer is not None
                     and int(page_layer) in selected_fp8_layers
                 )
+                role = page_role(page)
+                op = str(page.get("op") or "")
                 is_down = (
-                    "mlp.down_proj.weight" in page_id
+                    op == "mlp_down_proj"
                     and self.down_proj_fp8
                     and page_layer is not None
                     and int(page_layer) in selected_down_fp8_layers
                 )
-                is_gate_up = ("mlp.gate_proj.weight" in page_id or "mlp.up_proj.weight" in page_id) and self.gate_up_fp8
+                is_gate_up = (
+                    op in {"mlp_gate_proj", "mlp_up_proj", "mlp_gate_up_proj"}
+                    and self.gate_up_fp8
+                )
                 is_qkv = (
-                    any(
-                        suffix in page_id
-                        for suffix in (
-                            "self_attn.q_proj.weight",
-                            "self_attn.k_proj.weight",
-                            "self_attn.v_proj.weight",
-                        )
-                    )
+                    op in {
+                        "attn_q_proj", "attn_k_proj", "attn_v_proj",
+                        "attn_qkv_proj", "linear_attn_input_projection",
+                    }
                     and self.qkv_fp8
                     and page_layer is not None
                     and int(page_layer) in selected_qkv_fp8_layers
                 )
                 is_o = (
-                    "self_attn.o_proj.weight" in page_id
+                    op in {"attn_o_proj", "linear_attn_output_projection"}
                     and self.o_proj_fp8
                     and page_layer is not None
                     and int(page_layer) in selected_o_fp8_layers
                 )
-                if is_down or is_qkv or is_o or (
+                is_embed = (
+                    self.embed_fp8
+                    and page_id == "model.embed_tokens.weight"
+                )
+                if is_embed or is_down or is_qkv or is_o or (
                     layer_selected and is_gate_up
                 ):
                     source, _ = load_tensor_view(self.archive, page_id)
@@ -812,8 +1111,10 @@ class ThinGpuPagePool:
                     
                     page["dtype"] = "torch.float8_e4m3fn"
                     page["size"] = q_w.numel()
+                    page["quant_scheme"] = "runtime_row_fp8"
                     
                     scale_id = page_id + ".scale"
+                    page["scale_page"] = scale_id
                     self.page_specs[scale_id] = {
                         "id": scale_id,
                         "shape": list(q_s.shape),
@@ -835,7 +1136,7 @@ class ThinGpuPagePool:
                 if (
                     page_layer is None
                     or int(page_layer) not in selected_expert_int4_layers
-                    or not _is_separate_expert_weight(page_id)
+                    or not is_expert_weight(page)
                 ):
                     continue
                 rows, cols = int(page["shape"][0]), int(page["shape"][1])
@@ -924,7 +1225,7 @@ class ThinGpuPagePool:
                 if (
                     page_layer is None
                     or int(page_layer) not in self.selected_dense_int4_layers
-                    or not _is_dense_projection(page_id)
+                    or not (is_body_weight(page) and not is_expert_weight(page))
                 ):
                     continue
                 rows, cols = int(page["shape"][0]), int(page["shape"][1])
@@ -961,18 +1262,19 @@ class ThinGpuPagePool:
                 self.archive, pin_cpu_pages=self.pin_cpu_pages, dtype=self.dtype
             )
             for page_id, (q_w, q_s) in self._fp8_cpu_cache.items():
-                self.cpu_store.tensors[page_id] = q_w
-                self.cpu_store.tensors[page_id + ".scale"] = q_s
+                self.cpu_store.put(page_id, q_w)
+                self.cpu_store.put(page_id + ".scale", q_s)
             for page_id, (q_w, q_s) in self._int4_cpu_cache.items():
-                self.cpu_store.tensors[page_id] = q_w
-                self.cpu_store.tensors[page_id + ".scale"] = q_s
-            self.cpu_store.cpu_resident_bytes = sum(t.numel() * t.element_size() for t in self.cpu_store.tensors.values())
-            self.cpu_store.cpu_page_count = len(self.cpu_store.tensors)
+                self.cpu_store.put(page_id, q_w)
+                self.cpu_store.put(page_id + ".scale", q_s)
 
         self.loader = DirectGpuPageLoader(
             self.archive,
             self.device,
             self.dtype,
+            use_pinned_staging=(
+                os.environ.get("THINTENSOR_PINNED_STAGING", "1") != "0"
+            ),
             cpu_store=self.cpu_store,
             parent_pool=self,
         )
@@ -980,18 +1282,48 @@ class ThinGpuPagePool:
         self.owned_bytes: dict[str, int] = {}
         self._active_pages: set[str] = set()
         self._page_use_events: dict[str, torch.cuda.Event] = {}
+        self._retired_tensors: deque[
+            tuple[torch.cuda.Event, torch.Tensor, int]
+        ] = deque()
+        self._retired_tensor_bytes = 0
         self.alias_keys: dict[tuple[str, tuple[int, ...], str], str] = {}
         self.resident_bytes = 0
         self.external_resident_bytes = 0
         self.loader.resident_bytes_provider = lambda: self.resident_bytes
         
+        self.streamed_packed_expert_pages: set[str] = set()
+        self.streamed_packed_expert_bytes = 0
+        self.promoted_packed_expert_layers: list[int] = []
+        self.packed_expert_promotion_ooms = 0
+        self.mxfp4_expert_slice_cache_limit_bytes = int(
+            os.environ.get(
+                "THINTENSOR_MXFP4_EXPERT_CACHE_BYTES",
+                "0",
+            )
+        )
+        self._mxfp4_expert_slice_cache: "OrderedDict[tuple[str, int], torch.Tensor]" = OrderedDict()
+        self._mxfp4_expert_slice_cache_bytes = 0
+        self._mxfp4_expert_materialize_buffers: dict[
+            tuple[tuple[int, ...], torch.dtype], torch.Tensor
+        ] = {}
+        self._mxfp4_expert_materialize_bytes = 0
+        self.residency_headroom_bytes = int(
+            os.environ.get(
+                "THINTENSOR_GPU_RESIDENCY_HEADROOM_BYTES",
+                "0",
+            )
+        )
+        self.lm_head_quantization_reserve_bytes = (
+            self._lm_head_quantization_reserve_bytes()
+        )
         self.persistent_pages = {
-            page["id"]
-            for page in self.manifest.get("pages", [])
+            page_id
+            for page_id, page in self.page_specs.items()
             if page.get("kind") in {"embedding", "lm_head"}
             or page.get("layer") is None
         }
         self.budget_resident_layers: list[int] = []
+        self.budget_resident_expert_layers: list[int] = []
         self._select_budget_resident_layers()
 
         # Prefetch tracking
@@ -1012,12 +1344,30 @@ class ThinGpuPagePool:
             "prefetch_waits": 0,
             "h2d_transfer_bytes": 0,
             "h2d_transfer_time_ms": 0.0,
+            "selected_expert_h2d_transfer_bytes": 0,
+            "selected_expert_h2d_transfer_time_ms": 0.0,
+            "mxfp4_expert_slice_cache_hits": 0,
+            "mxfp4_expert_slice_cache_misses": 0,
+            "mxfp4_expert_slice_cache_evictions": 0,
+            "mxfp4_expert_slice_cache_ooms": 0,
             "leaked_evicted_pages": 0,
         }
 
     def _page_resident_size(self, page: dict[str, Any]) -> int:
         source_dtype = map_dtype(page["dtype"])
-        target_dtype = _target_dtype(source_dtype, self.dtype)
+        # Runtime-generated quantized pages are already in their execution
+        # storage dtype. Do not estimate them as BF16 just because FP8 reports
+        # as a floating-point dtype; doing so underfills the streaming cache by
+        # several GiB on mixed-precision profiles.
+        if (
+            source_dtype in {torch.float8_e4m3fn, torch.int8, torch.uint8}
+            or page.get("kind") == "scale"
+            or page.get("quant_scheme") is not None
+            or str(page.get("id", "")).endswith(".scale")
+        ):
+            target_dtype = source_dtype
+        else:
+            target_dtype = _target_dtype(source_dtype, self.dtype)
         elements = math.prod(int(dim) for dim in page["shape"])
         return elements * torch.empty((), dtype=target_dtype).element_size()
 
@@ -1030,8 +1380,12 @@ class ThinGpuPagePool:
         model every token. Keep a deterministic prefix resident and reserve
         enough space for the current layer plus prefetched layers.
         """
-        # Identify active pages
+        # Identify active pages. Packed MXFP4 MoE tensors store every expert
+        # for a layer in a few giant pages; under a tight budget the runtime
+        # can stream only the routed expert slices instead of pinning or
+        # prefetching those full pages.
         active_pages = set()
+        packed_expert_pages = set()
         for page_id, page in self.page_specs.items():
             if page.get("kind") == "fused_physical":
                 continue
@@ -1046,21 +1400,127 @@ class ThinGpuPagePool:
                 ):
                     if not page_id.startswith("__runtime__"):
                         continue
+            if _is_packed_expert_stream_page(page_id):
+                packed_expert_pages.add(page_id)
             active_pages.add(page_id)
+
+        full_active_pages = set(active_pages)
+        full_active_bytes = sum(
+            self._page_resident_size(self.page_specs[pid])
+            for pid in full_active_pages
+            if pid in self.page_specs
+        )
+        budget = self.vram_budget_bytes
+        selection_budget = (
+            max(
+                0,
+                budget
+                - max(0, self.residency_headroom_bytes)
+                - max(0, self.lm_head_quantization_reserve_bytes)
+                - max(0, self.mxfp4_expert_slice_cache_limit_bytes),
+            )
+            if budget is not None
+            else None
+        )
+        if (
+            selection_budget is not None
+            and full_active_bytes > selection_budget
+            and packed_expert_pages
+        ):
+            base_active_pages = active_pages - packed_expert_pages
+            base_active_bytes = sum(
+                self._page_resident_size(self.page_specs[pid])
+                for pid in base_active_pages
+                if pid in self.page_specs
+            )
+            self.streamed_packed_expert_pages = set(packed_expert_pages)
+            selected_expert_working_set = self._packed_expert_selected_working_set_bytes()
+            packed_by_layer: dict[int, list[str]] = {}
+            for page_id in packed_expert_pages:
+                page = self.page_specs.get(page_id)
+                if page is None or page.get("layer") is None:
+                    continue
+                packed_by_layer.setdefault(int(page["layer"]), []).append(page_id)
+
+            pinned_packed_pages: set[str] = set()
+            remaining_for_packed = max(
+                0,
+                selection_budget - base_active_bytes - selected_expert_working_set,
+            )
+            pinned_packed_bytes = 0
+            for layer in sorted(packed_by_layer):
+                layer_pages = packed_by_layer[layer]
+                layer_bytes = sum(
+                    self._page_resident_size(self.page_specs[pid])
+                    for pid in layer_pages
+                    if pid in self.page_specs
+                )
+                if pinned_packed_bytes + layer_bytes > remaining_for_packed:
+                    break
+                pinned_packed_pages.update(layer_pages)
+                pinned_packed_bytes += layer_bytes
+                self.budget_resident_expert_layers.append(layer)
+
+            active_pages = base_active_pages | pinned_packed_pages
+            self.streamed_packed_expert_pages = (
+                packed_expert_pages - pinned_packed_pages
+            )
+            self.streamed_packed_expert_bytes = sum(
+                self._page_resident_size(self.page_specs[pid])
+                for pid in self.streamed_packed_expert_pages
+                if pid in self.page_specs
+            )
+        else:
+            self.streamed_packed_expert_pages = set()
+            self.streamed_packed_expert_bytes = 0
 
         total_active_bytes = sum(
             self._page_resident_size(self.page_specs[pid])
             for pid in active_pages
             if pid in self.page_specs
         )
-        budget = self.vram_budget_bytes
-        if budget is None or total_active_bytes <= budget:
+        selected_expert_working_set = (
+            self._packed_expert_selected_working_set_bytes()
+            if self.streamed_packed_expert_pages
+            else 0
+        )
+        if selection_budget is None or full_active_bytes <= selection_budget:
+            self.persistent_pages = active_pages
+            self.budget_resident_layers = list(range(int(self.manifest["model"]["layers"])))
+            if packed_expert_pages:
+                self.budget_resident_expert_layers = list(
+                    range(int(self.manifest["model"]["layers"]))
+                )
+            import sys
+            budget_str = (
+                f"{selection_budget / 1024**3:.2f} GiB"
+                if selection_budget is not None
+                else "Unlimited"
+            )
+            print(
+                f"All weights fit within VRAM budget ({full_active_bytes / 1024**3:.2f} GiB <= {budget_str}); pinning all weights to VRAM.",
+                file=sys.stderr,
+            )
+            return
+        if (
+            self.streamed_packed_expert_pages
+            and selection_budget is not None
+            and total_active_bytes + selected_expert_working_set <= selection_budget
+        ):
             self.persistent_pages = active_pages
             self.budget_resident_layers = list(range(int(self.manifest["model"]["layers"])))
             import sys
-            budget_str = f"{budget / 1024**3:.2f} GiB" if budget is not None else "Unlimited"
             print(
-                f"All weights fit within VRAM budget ({total_active_bytes / 1024**3:.2f} GiB <= {budget_str}); pinning all weights to VRAM.",
+                "Reusable weights and selected packed experts fit within VRAM budget "
+                f"({total_active_bytes / 1024**3:.2f} GiB resident + "
+                f"{selected_expert_working_set / 1024**3:.2f} GiB routed-expert "
+                f"working set <= {selection_budget / 1024**3:.2f} GiB selection "
+                f"budget, {self.residency_headroom_bytes / 1024**2:.0f} MiB "
+                "headroom, "
+                f"{self.lm_head_quantization_reserve_bytes / 1024**2:.0f} MiB "
+                "head reserve); streaming "
+                f"{self.streamed_packed_expert_bytes / 1024**3:.2f} GiB of "
+                "packed MoE experts by selected slices.",
                 file=sys.stderr,
             )
             return
@@ -1072,6 +1532,7 @@ class ThinGpuPagePool:
                 layer is None
                 or page.get("kind") == "fused_physical"
                 or _is_separate_expert_page(str(page["id"]))
+                or str(page["id"]) in self.streamed_packed_expert_pages
             ):
                 continue
             pages_by_layer.setdefault(int(layer), []).append(page)
@@ -1105,8 +1566,9 @@ class ThinGpuPagePool:
         working_set_bytes = (
             max(layer_bytes.values()) * (1 + self.prefetch_distance)
             + expert_working_set
+            + selected_expert_working_set
         )
-        pin_budget = max(0, budget - global_bytes - working_set_bytes)
+        pin_budget = max(0, (selection_budget or 0) - global_bytes - working_set_bytes)
 
         pinned_bytes = 0
         for layer in sorted(pages_by_layer):
@@ -1118,6 +1580,23 @@ class ThinGpuPagePool:
             self.persistent_pages.update(page["id"] for page in pages_by_layer[layer])
 
     def _cached_tensor(self, page_id: str) -> Optional[torch.Tensor]:
+        lowbit = self._packed_lowbit_by_page.get(page_id)
+        if lowbit is not None:
+            blocks_id, scales_id, bits = lowbit
+            if blocks_id not in self._packed_lowbit_cache:
+                with self._quantization_lock:
+                    if blocks_id not in self._packed_lowbit_cache:
+                        cached = self._load_derived_lowbit(blocks_id, scales_id)
+                        if cached is None:
+                            blocks, _ = load_tensor_view(self.archive, blocks_id)
+                            scales, _ = load_tensor_view(self.archive, scales_id)
+                            cached = quantize_mxfp4_to_lowbit_cpu(
+                                blocks, scales, bits=bits
+                            )
+                            self._write_derived_lowbit(blocks_id, cached)
+                        self._packed_lowbit_cache[blocks_id] = cached
+            packed, scales = self._packed_lowbit_cache[blocks_id]
+            return scales if page_id == scales_id else packed
         for layer, pack_ids in self._expert_int4_pack_page_ids.items():
             if page_id in pack_ids:
                 self._build_expert_int4_pack(layer)
@@ -1150,8 +1629,8 @@ class ThinGpuPagePool:
                         self._int4_cpu_cache[int4_base] = (q_w, q_s)
                         self._weight_scales[int4_base] = q_s
                         if self.cpu_store is not None:
-                            self.cpu_store.tensors[int4_base] = q_w
-                            self.cpu_store.tensors[int4_base + ".scale"] = q_s
+                            self.cpu_store.put(int4_base, q_w)
+                            self.cpu_store.put(int4_base + ".scale", q_s)
             cached_int4 = self._int4_cpu_cache[int4_base]
             return cached_int4[1] if page_id.endswith(".scale") else cached_int4[0]
         if page_id.endswith(".scale"):
@@ -1166,6 +1645,72 @@ class ThinGpuPagePool:
             return cached[1] if cached is not None else None
         cached = self._fp8_cpu_cache.get(page_id)
         return cached[0] if cached is not None else None
+
+    def _load_derived_lowbit(
+        self,
+        blocks_id: str,
+        scales_id: str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        path = self._packed_lowbit_cache_paths.get(blocks_id)
+        if not self._derived_cache_enabled or path is None or not path.is_file():
+            self.derived_cache_misses += 1
+            return None
+        try:
+            payload = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+            packed = payload["packed"]
+            scales = payload["scales"]
+            expected_packed = tuple(self.page_specs[blocks_id]["shape"])
+            expected_scales = tuple(self.page_specs[scales_id]["shape"])
+            if (
+                not isinstance(packed, torch.Tensor)
+                or not isinstance(scales, torch.Tensor)
+                or tuple(packed.shape) != expected_packed
+                or tuple(scales.shape) != expected_scales
+                or packed.dtype != torch.uint8
+                or scales.dtype != torch.uint8
+            ):
+                raise ValueError("derived low-bit tensor metadata mismatch")
+        except (OSError, RuntimeError, KeyError, ValueError, TypeError):
+            self.derived_cache_misses += 1
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        self.derived_cache_hits += 1
+        self.derived_cache_bytes += path.stat().st_size
+        return packed, scales
+
+    def _write_derived_lowbit(
+        self,
+        blocks_id: str,
+        tensors: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        path = self._packed_lowbit_cache_paths.get(blocks_id)
+        if not self._derived_cache_enabled or path is None or path.exists():
+            return
+        packed, scales = tensors
+        required = _tensor_nbytes(packed) + _tensor_nbytes(scales)
+        usage = shutil.disk_usage(path.parent.parent)
+        if usage.used / max(1, usage.total) >= 0.88 or usage.free < required + 1024**3:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            torch.save({"packed": packed, "scales": scales}, temporary)
+            os.replace(temporary, path)
+            self.derived_cache_writes += 1
+            self.derived_cache_bytes += path.stat().st_size
+        except OSError:
+            try:
+                temporary.unlink()
+            except (OSError, UnboundLocalError):
+                pass
 
     def _build_expert_int4_pack(self, layer: int) -> None:
         ids = self._expert_int4_pack_page_ids[layer]
@@ -1234,11 +1779,381 @@ class ThinGpuPagePool:
             active_pages.add(page_id)
         return active_pages.issubset(self.persistent_pages)
 
+    def _mxfp4_selected_slice_bytes(self, page_id: str, selected: int) -> int:
+        page = self.page_specs[page_id]
+        shape = page.get("shape") or []
+        experts = int(shape[0]) if shape else int(
+            self.manifest.get("model", {}).get("num_local_experts") or 1
+        )
+        experts = max(1, experts)
+        per_expert = math.ceil(self._page_resident_size(page) / experts)
+        return per_expert * max(1, int(selected))
+
+    def _lm_head_quantization_reserve_bytes(self) -> int:
+        if not (self.lm_head_fp8 or self.lm_head_int4_group_size > 0):
+            return 0
+        head_page = self.page_specs.get("lm_head.weight")
+        if head_page is None:
+            head_page = self.page_specs.get("model.embed_tokens.weight")
+        if head_page is None:
+            return 0
+        shape = head_page.get("shape") or []
+        if len(shape) != 2:
+            return 0
+        rows = int(shape[0])
+        cols = int(shape[1])
+        if rows <= 0 or cols <= 0:
+            return 0
+        if self.lm_head_int4_group_size > 0:
+            group_size = max(1, self.lm_head_int4_group_size)
+            groups = (cols + group_size - 1) // group_size
+            output_bytes = math.ceil(rows * cols / 2) + rows * groups * 4
+        else:
+            scale_blocks = (
+                (cols + self.lm_head_fp8_scale_block - 1)
+                // self.lm_head_fp8_scale_block
+                if self.lm_head_fp8_scale_block > 0
+                else 1
+            )
+            output_bytes = rows * cols + rows * scale_blocks * 4
+        return int(output_bytes + 64 * 1024 * 1024)
+
+    def _packed_expert_selected_working_set_bytes(self) -> int:
+        if not self.streamed_packed_expert_pages:
+            return 0
+        top_k = int(
+            self.manifest.get("model", {}).get("num_experts_per_token") or 1
+        )
+        top_k = max(1, top_k)
+        by_layer: dict[int, dict[str, int]] = {}
+        for page_id in self.streamed_packed_expert_pages:
+            page = self.page_specs.get(page_id)
+            if page is None:
+                continue
+            layer = page.get("layer")
+            if layer is None:
+                continue
+            phase = "down" if "down_proj" in page_id else "gate_up"
+            phases = by_layer.setdefault(int(layer), {})
+            phases[phase] = phases.get(phase, 0) + self._mxfp4_selected_slice_bytes(
+                page_id,
+                top_k,
+            )
+        if not by_layer:
+            return 0
+        # Gate/up and down selected tensors can overlap briefly on the CUDA
+        # stream. Reserve two phases so residency does not depend on allocator
+        # timing.
+        return max(max(phases.values()) for phases in by_layer.values()) * 2
+
     def expert_int4_pack(
         self, layer: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ids = self._expert_int4_pack_page_ids[layer]
         return tuple(self.tensor(page_id) for page_id in ids)  # type: ignore[return-value]
+
+    def mxfp4_selected_expert_tensors(
+        self,
+        blocks_page_id: str,
+        scales_page_id: str,
+        expert_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return MXFP4 expert tensors for routed experts only.
+
+        Packed MoE checkpoints store all experts for a layer in one large page.
+        The compute kernel already supports selected experts, but loading the
+        whole page in streaming mode makes decode PCIe-bound. If both pages are
+        already resident, reuse them directly; otherwise copy just the routed
+        expert slices and remap indices to the compact temporary tensors.
+        """
+        if blocks_page_id in self.tensors and scales_page_id in self.tensors:
+            return (
+                self.tensor(blocks_page_id),
+                self.tensor(scales_page_id),
+                expert_indices,
+            )
+        cpu_indices = expert_indices.detach().to(device="cpu", dtype=torch.long)
+        unique_cpu, inverse_cpu = torch.unique(
+            cpu_indices,
+            sorted=True,
+            return_inverse=True,
+        )
+        selected = int(unique_cpu.numel())
+        incoming_bytes = self._mxfp4_selected_slice_bytes(
+            blocks_page_id,
+            selected,
+        ) + self._mxfp4_selected_slice_bytes(scales_page_id, selected)
+        self._evict_to_budget(
+            f"{blocks_page_id}#selected_pair",
+            incoming_bytes=incoming_bytes,
+        )
+        blocks = self._load_mxfp4_selected_slice(
+            blocks_page_id,
+            unique_cpu,
+        )
+        scales = self._load_mxfp4_selected_slice(
+            scales_page_id,
+            unique_cpu,
+        )
+        remapped = inverse_cpu.to(
+            device=expert_indices.device,
+            dtype=expert_indices.dtype,
+            non_blocking=True,
+        )
+        return blocks, scales, remapped
+
+    def packed_expert_bits(self, blocks_page_id: str) -> int:
+        binding = self._packed_lowbit_by_page.get(blocks_page_id)
+        return binding[2] if binding is not None else 4
+
+    def _load_mxfp4_selected_slice(
+        self,
+        page_id: str,
+        expert_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if page_id not in self.page_specs:
+            raise KeyError(f"ThinTensor GPU page {page_id} is not present in manifest")
+        # Router indices are computed on GPU. Streaming only selected experts
+        # necessarily needs the tiny index vector on CPU to address host pages.
+        cpu_indices = expert_indices.detach().to(device="cpu", dtype=torch.long)
+        if (
+            self.mxfp4_expert_slice_cache_limit_bytes > 0
+            and page_id in self.streamed_packed_expert_pages
+        ):
+            cached = self._load_mxfp4_selected_slice_cached(page_id, cpu_indices)
+            if cached is not None:
+                return cached
+        if self.cpu_store is not None and page_id in self.cpu_store.tensors:
+            source = self.cpu_store.tensors[page_id]
+        else:
+            source, _ = load_tensor_view(self.archive, page_id)
+        selected = source.index_select(0, cpu_indices).contiguous()
+        target_dtype = _target_dtype(selected.dtype, self.dtype)
+        incoming_bytes = selected.numel() * torch.empty(
+            (),
+            dtype=target_dtype,
+        ).element_size()
+        self._evict_to_budget(
+            f"{page_id}#selected",
+            incoming_bytes=incoming_bytes,
+        )
+        gpu, metric = self._copy_mxfp4_selected_to_gpu(
+            page_id,
+            selected,
+            target_dtype,
+        )
+        self._record_mxfp4_selected_metric(metric)
+        if gpu.is_cuda:
+            gpu.record_stream(torch.cuda.current_stream(gpu.device))
+        return gpu
+
+    def _load_mxfp4_selected_slice_cached(
+        self,
+        page_id: str,
+        cpu_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        requested = [int(value) for value in cpu_indices.tolist()]
+        rows: list[Optional[torch.Tensor]] = []
+        missing: list[int] = []
+        for expert in requested:
+            key = (page_id, expert)
+            cached = self._mxfp4_expert_slice_cache.get(key)
+            if cached is None:
+                rows.append(None)
+                missing.append(expert)
+                self.stats["mxfp4_expert_slice_cache_misses"] = int(
+                    self.stats.get("mxfp4_expert_slice_cache_misses", 0)
+                ) + 1
+                continue
+            self._mxfp4_expert_slice_cache.move_to_end(key)
+            cached.record_stream(torch.cuda.current_stream(cached.device))
+            rows.append(cached)
+            self.stats["mxfp4_expert_slice_cache_hits"] = int(
+                self.stats.get("mxfp4_expert_slice_cache_hits", 0)
+            ) + 1
+
+        if missing:
+            if self.cpu_store is not None and page_id in self.cpu_store.tensors:
+                source = self.cpu_store.tensors[page_id]
+            else:
+                source, _ = load_tensor_view(self.archive, page_id)
+            missing_cpu = torch.tensor(missing, dtype=torch.long)
+            selected = source.index_select(0, missing_cpu).contiguous()
+            target_dtype = _target_dtype(selected.dtype, self.dtype)
+            incoming_bytes = selected.numel() * torch.empty(
+                (),
+                dtype=target_dtype,
+            ).element_size()
+            self._trim_mxfp4_expert_slice_cache(
+                max(
+                    0,
+                    self.mxfp4_expert_slice_cache_limit_bytes - incoming_bytes,
+                )
+            )
+            self._evict_to_budget(
+                f"{page_id}#selected",
+                incoming_bytes=incoming_bytes,
+            )
+            gpu, metric = self._copy_mxfp4_selected_to_gpu(
+                page_id,
+                selected,
+                target_dtype,
+            )
+            self._record_mxfp4_selected_metric(metric)
+            if gpu.is_cuda:
+                gpu.record_stream(torch.cuda.current_stream(gpu.device))
+            for offset, expert in enumerate(missing):
+                row = gpu.narrow(0, offset, 1)
+                cacheable = True
+                try:
+                    # A contiguous narrow can still retain the full selected
+                    # batch allocation. Clone so cache accounting matches the
+                    # storage that remains live after this call returns.
+                    cached_row = row.clone()
+                except torch.OutOfMemoryError:
+                    self.stats["mxfp4_expert_slice_cache_ooms"] = int(
+                        self.stats.get("mxfp4_expert_slice_cache_ooms", 0)
+                    ) + 1
+                    self._trim_mxfp4_expert_slice_cache(0)
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    cached_row = row
+                    cacheable = False
+                if cacheable:
+                    self._insert_mxfp4_expert_slice_cache(
+                        (page_id, expert),
+                        cached_row,
+                    )
+                for idx, requested_expert in enumerate(requested):
+                    if requested_expert == expert and rows[idx] is None:
+                        rows[idx] = cached_row
+                        break
+
+        if not rows or any(row is None for row in rows):
+            return None
+        materialized = [row for row in rows if row is not None]
+        if len(materialized) == 1:
+            return materialized[0]
+        try:
+            return self._materialize_mxfp4_cached_rows(materialized)
+        except torch.OutOfMemoryError:
+            self.stats["mxfp4_expert_slice_cache_ooms"] = int(
+                self.stats.get("mxfp4_expert_slice_cache_ooms", 0)
+            ) + 1
+            self._trim_mxfp4_expert_slice_cache(0)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            return None
+
+    def _materialize_mxfp4_cached_rows(
+        self,
+        rows: list[torch.Tensor],
+    ) -> torch.Tensor:
+        shape = (len(rows), *tuple(int(dim) for dim in rows[0].shape[1:]))
+        key = (shape, rows[0].dtype)
+        output = self._mxfp4_expert_materialize_buffers.get(key)
+        if output is None:
+            output_bytes = math.prod(shape) * rows[0].element_size()
+            self._evict_to_budget(
+                "__runtime__.mxfp4_expert_materialize",
+                incoming_bytes=output_bytes,
+            )
+            output = torch.empty(shape, device=self.device, dtype=rows[0].dtype)
+            self._mxfp4_expert_materialize_buffers[key] = output
+            self._mxfp4_expert_materialize_bytes += output_bytes
+            self.external_resident_bytes += output_bytes
+            self.resident_bytes += output_bytes
+            self.stats["peak_resident_bytes"] = max(
+                int(self.stats["peak_resident_bytes"]), self.resident_bytes
+            )
+        torch.cat(rows, dim=0, out=output)
+        return output
+
+    def _copy_mxfp4_selected_to_gpu(
+        self,
+        page_id: str,
+        selected: torch.Tensor,
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, PageLoadMetrics]:
+        try:
+            return self.loader._copy_cpu_tensor(
+                f"{page_id}#selected",
+                selected,
+                target_dtype,
+            )
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "out of memory" not in message and "cuda oom" not in message:
+                raise
+            if not self._mxfp4_expert_slice_cache:
+                raise
+            self.stats["mxfp4_expert_slice_cache_ooms"] = int(
+                self.stats.get("mxfp4_expert_slice_cache_ooms", 0)
+            ) + 1
+            self._trim_mxfp4_expert_slice_cache(0)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            return self.loader._copy_cpu_tensor(
+                f"{page_id}#selected",
+                selected,
+                target_dtype,
+            )
+
+    def _record_mxfp4_selected_metric(self, metric: PageLoadMetrics) -> None:
+        self.loader.metrics.append(metric)
+        self.stats["h2d_transfer_bytes"] = int(
+            self.stats.get("h2d_transfer_bytes", 0)
+        ) + metric.gpu_transfer_bytes
+        self.stats["h2d_transfer_time_ms"] = float(
+            self.stats.get("h2d_transfer_time_ms", 0.0)
+        ) + metric.gpu_transfer_s * 1000.0
+        self.stats["selected_expert_h2d_transfer_bytes"] = int(
+            self.stats.get("selected_expert_h2d_transfer_bytes", 0)
+        ) + metric.gpu_transfer_bytes
+        self.stats["selected_expert_h2d_transfer_time_ms"] = float(
+            self.stats.get("selected_expert_h2d_transfer_time_ms", 0.0)
+        ) + metric.gpu_transfer_s * 1000.0
+
+    def _insert_mxfp4_expert_slice_cache(
+        self,
+        key: tuple[str, int],
+        tensor: torch.Tensor,
+    ) -> None:
+        if self.mxfp4_expert_slice_cache_limit_bytes <= 0:
+            return
+        tensor_bytes = _tensor_nbytes(tensor)
+        if tensor_bytes > self.mxfp4_expert_slice_cache_limit_bytes:
+            return
+        previous = self._mxfp4_expert_slice_cache.pop(key, None)
+        if previous is not None:
+            self._mxfp4_expert_slice_cache_bytes = max(
+                0,
+                self._mxfp4_expert_slice_cache_bytes - _tensor_nbytes(previous),
+            )
+        self._trim_mxfp4_expert_slice_cache(
+            self.mxfp4_expert_slice_cache_limit_bytes - tensor_bytes
+        )
+        self._mxfp4_expert_slice_cache[key] = tensor
+        self._mxfp4_expert_slice_cache_bytes += tensor_bytes
+
+    def _trim_mxfp4_expert_slice_cache(self, max_bytes: int) -> None:
+        while (
+            self._mxfp4_expert_slice_cache
+            and self._mxfp4_expert_slice_cache_bytes > max(0, int(max_bytes))
+        ):
+            _, victim = self._mxfp4_expert_slice_cache.popitem(last=False)
+            # Cache hits record the consuming stream on each tensor. Deleting
+            # the last Python reference is therefore sufficient: the CUDA
+            # caching allocator defers storage reuse until queued consumers
+            # finish. A stream-wide synchronize here serialized dozens of LRU
+            # evictions per decoded token on routed MoE workloads.
+            self._mxfp4_expert_slice_cache_bytes = max(
+                0,
+                self._mxfp4_expert_slice_cache_bytes - _tensor_nbytes(victim),
+            )
+            self.stats["mxfp4_expert_slice_cache_evictions"] = int(
+                self.stats.get("mxfp4_expert_slice_cache_evictions", 0)
+            ) + 1
 
     # Retained for downstream integrations that used the old private helper.
     def _fp8_cached_tensor(self, page_id: str) -> Optional[torch.Tensor]:
@@ -1249,6 +2164,13 @@ class ThinGpuPagePool:
             if page_id in self.page_specs and self.page_specs[page_id].get("kind") != "fused_physical":
                 self.ensure(page_id, reason="warm")
         self.loader.finish()
+        # Repacked pages that are now pinned on GPU can always be regenerated
+        # from the mmap archive. Do not retain a second model-sized host copy.
+        for blocks_id in list(self._packed_lowbit_cache):
+            _, scales_id, _ = self._packed_lowbit_by_page[blocks_id]
+            if blocks_id in self.tensors and scales_id in self.tensors:
+                self._packed_lowbit_cache.pop(blocks_id, None)
+        malloc_trim()
 
     def close(self) -> None:
         self.archive.close()
@@ -1268,6 +2190,7 @@ class ThinGpuPagePool:
         return page_id in self.page_specs
 
     def ensure(self, page_id: str, reason: str = "demand") -> torch.Tensor:
+        self._reap_retired_tensors()
         if page_id in self.tensors:
             self.tensors.move_to_end(page_id)
             if reason == "demand" and page_id in self._prefetch_in_progress:
@@ -1323,6 +2246,7 @@ class ThinGpuPagePool:
                 tensor = self.tensors[page_id]
             else:
                 stream = self.loader.prefetch_stream if reason == "prefetch" else None
+                self._evict_to_budget(page_id, incoming_bytes=self._page_resident_size(page))
                 tensor = self.loader.load_tensor(page, stream=stream)
                 self._insert_tensor(page_id, tensor, _tensor_nbytes(tensor))
                 self.alias_keys[key] = page_id
@@ -1355,6 +2279,8 @@ class ThinGpuPagePool:
             # bounded LRU retain hot experts across tokens.
             if _is_separate_expert_page(page_id):
                 continue
+            if page_id in self.streamed_packed_expert_pages:
+                continue
             if page_id not in self.persistent_pages:
                 self.evict(page_id)
 
@@ -1370,12 +2296,17 @@ class ThinGpuPagePool:
             
         t = self.tensors.get(page_id)
         if t is not None and t.is_cuda:
-            # A page can be selected for eviction between returning it to a
-            # caller and that caller enqueueing every dependent kernel. CUDA's
-            # allocator stream tracking cannot represent that host-side
-            # lifetime gap. Synchronize only on actual eviction; normal cache
-            # hits and resident execution remain fully asynchronous.
-            torch.cuda.current_stream(t.device).synchronize()
+            current = torch.cuda.current_stream(t.device)
+            if (
+                page_id in self._prefetch_in_progress
+                and self.loader.prefetch_stream is not None
+            ):
+                current.wait_stream(self.loader.prefetch_stream)
+            retired_bytes = self.owned_bytes.get(page_id, 0)
+            event = torch.cuda.Event()
+            event.record(current)
+            self._retired_tensors.append((event, t, retired_bytes))
+            self._retired_tensor_bytes += retired_bytes
 
         if page.get("kind") == "fused_physical":
             for logical_id, logical in list(self.page_specs.items()):
@@ -1391,7 +2322,10 @@ class ThinGpuPagePool:
                 if logical.get("fused_to") == parent and logical_id in self.tensors
             ]
             if not live_children:
-                self._remove_tensor(parent)
+                # The logical view owns no bytes but retains the parent's CUDA
+                # storage. Retire the physical page with an event so its real
+                # allocation remains budgeted until all queued consumers finish.
+                self.evict(parent)
 
         if self.debug_stream_refs and t is not None:
             import sys
@@ -1420,6 +2354,77 @@ class ThinGpuPagePool:
         self.persistent_pages.discard(page_id)
         self.evict(page_id)
 
+    def promote_streamed_packed_expert_layers(
+        self,
+        reserve_bytes: int = 64 * 1024 * 1024,
+    ) -> list[int]:
+        if self.vram_budget_bytes is None or not self.streamed_packed_expert_pages:
+            return []
+        by_layer: dict[int, list[str]] = {}
+        for page_id in self.streamed_packed_expert_pages:
+            page = self.page_specs.get(page_id)
+            if page is None or page.get("layer") is None:
+                continue
+            by_layer.setdefault(int(page["layer"]), []).append(page_id)
+
+        promoted: list[int] = []
+        budget = max(
+            0,
+            self.vram_budget_bytes
+            - max(
+                0,
+                int(reserve_bytes),
+                self.residency_headroom_bytes,
+            )
+            - max(0, self.mxfp4_expert_slice_cache_limit_bytes),
+        )
+        for layer in sorted(by_layer):
+            page_ids = sorted(by_layer[layer])
+            layer_bytes = sum(
+                self._page_resident_size(self.page_specs[pid])
+                for pid in page_ids
+                if pid in self.page_specs
+            )
+            if (
+                self.resident_bytes
+                + self._retired_tensor_bytes
+                + layer_bytes
+                > budget
+            ):
+                break
+            loaded_page_ids: list[str] = []
+            try:
+                for page_id in page_ids:
+                    self.persistent_pages.add(page_id)
+                    self.ensure(page_id, reason="warm")
+                    loaded_page_ids.append(page_id)
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                if "out of memory" not in message and "cuda oom" not in message:
+                    raise
+                self.packed_expert_promotion_ooms += 1
+                for page_id in page_ids:
+                    self.persistent_pages.discard(page_id)
+                for page_id in loaded_page_ids:
+                    self.evict(page_id)
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                break
+            self.streamed_packed_expert_pages.difference_update(page_ids)
+            self.streamed_packed_expert_bytes = max(
+                0,
+                self.streamed_packed_expert_bytes - layer_bytes,
+            )
+            self.budget_resident_expert_layers.append(layer)
+            promoted.append(layer)
+        if promoted:
+            self.budget_resident_expert_layers = sorted(
+                set(self.budget_resident_expert_layers)
+            )
+            self.promoted_packed_expert_layers.extend(promoted)
+            self.loader.finish()
+        return promoted
+
     def register_external_resident_bytes(self, byte_count: int) -> None:
         self.external_resident_bytes += byte_count
         self.resident_bytes += byte_count
@@ -1429,6 +2434,7 @@ class ThinGpuPagePool:
 
     def telemetry(self) -> dict[str, Any]:
         self.loader._reap_completed_staging()
+        self._reap_retired_tensors()
         metrics = self.loader.metrics
         
         p_bytes = 0
@@ -1456,6 +2462,13 @@ class ThinGpuPagePool:
 
         gpu_cache = {
             "resident_bytes": self.resident_bytes,
+            "resident_and_expert_cache_bytes": (
+                self.resident_bytes
+                + self._retired_tensor_bytes
+                + self._mxfp4_expert_slice_cache_bytes
+            ),
+            "retired_tensor_bytes": self._retired_tensor_bytes,
+            "retired_tensor_count": len(self._retired_tensors),
             "peak_resident_bytes": int(self.stats["peak_resident_bytes"]),
             "resident_pages": len(self.tensors),
             "cache_hits": cache_hits,
@@ -1465,6 +2478,32 @@ class ThinGpuPagePool:
             "h2d_transfer_bytes": h2d_transfer_bytes,
             "h2d_transfer_bytes_per_token": h2d_transfer_bytes / max(1, self.decode_steps_run),
             "h2d_transfer_time_ms": float(self.stats.get("h2d_transfer_time_ms", 0.0)),
+            "selected_expert_h2d_transfer_bytes": int(
+                self.stats.get("selected_expert_h2d_transfer_bytes", 0)
+            ),
+            "selected_expert_h2d_transfer_time_ms": float(
+                self.stats.get("selected_expert_h2d_transfer_time_ms", 0.0)
+            ),
+            "mxfp4_expert_slice_cache_bytes": self._mxfp4_expert_slice_cache_bytes,
+            "mxfp4_expert_slice_cache_limit_bytes": (
+                self.mxfp4_expert_slice_cache_limit_bytes
+            ),
+            "mxfp4_expert_materialize_bytes": (
+                self._mxfp4_expert_materialize_bytes
+            ),
+            "mxfp4_expert_slice_cache_entries": len(self._mxfp4_expert_slice_cache),
+            "mxfp4_expert_slice_cache_hits": int(
+                self.stats.get("mxfp4_expert_slice_cache_hits", 0)
+            ),
+            "mxfp4_expert_slice_cache_misses": int(
+                self.stats.get("mxfp4_expert_slice_cache_misses", 0)
+            ),
+            "mxfp4_expert_slice_cache_evictions": int(
+                self.stats.get("mxfp4_expert_slice_cache_evictions", 0)
+            ),
+            "mxfp4_expert_slice_cache_ooms": int(
+                self.stats.get("mxfp4_expert_slice_cache_ooms", 0)
+            ),
             "prefetch_hits": prefetch_hits,
             "prefetch_waits": prefetch_waits,
             "prefetch_h2d_overlap_estimate": prefetch_h2d_overlap_estimate,
@@ -1483,11 +2522,20 @@ class ThinGpuPagePool:
         return {
             "cpu_offload_enabled": self.cpu_offload,
             "gpu_weight_budget_bytes": self.vram_budget_bytes or 0,
+            "residency_headroom_bytes": self.residency_headroom_bytes,
+            "lm_head_quantization_reserve_bytes": (
+                self.lm_head_quantization_reserve_bytes
+            ),
             "gpu_cache": gpu_cache,
             "cpu_store": cpu_store,
             "persistent_pages": len(self.persistent_pages),
             "persistent_bytes": p_bytes,
             "budget_resident_layers": self.budget_resident_layers,
+            "budget_resident_expert_layers": self.budget_resident_expert_layers,
+            "promoted_packed_expert_layers": self.promoted_packed_expert_layers,
+            "packed_expert_promotion_ooms": self.packed_expert_promotion_ooms,
+            "streamed_packed_expert_pages": len(self.streamed_packed_expert_pages),
+            "streamed_packed_expert_bytes": self.streamed_packed_expert_bytes,
             "persistent_pages_on_gpu": p_on_gpu,
             "persistent_pages_on_cpu": p_on_cpu,
             "cpu_offload_enabled_flag": self.cpu_offload,
@@ -1495,6 +2543,15 @@ class ThinGpuPagePool:
             "cpu_pinned_bytes": self.cpu_store.cpu_pinned_bytes if self.cpu_store is not None else 0,
             "cpu_page_count": self.cpu_store.cpu_page_count if self.cpu_store is not None else 0,
             "cpu_page_source": self.cpu_store.cpu_page_source if self.cpu_store is not None else "mmap",
+            "cpu_cache_max_bytes": self.cpu_store.max_bytes if self.cpu_store is not None else 0,
+            "cpu_cache_hits": self.cpu_store.cache_hits if self.cpu_store is not None else 0,
+            "cpu_cache_misses": self.cpu_store.cache_misses if self.cpu_store is not None else 0,
+            "cpu_cache_evictions": self.cpu_store.cache_evictions if self.cpu_store is not None else 0,
+            "derived_cache_enabled": self._derived_cache_enabled,
+            "derived_cache_hits": self.derived_cache_hits,
+            "derived_cache_misses": self.derived_cache_misses,
+            "derived_cache_writes": self.derived_cache_writes,
+            "derived_cache_bytes": self.derived_cache_bytes,
             
             # Old fields for compatibility
             "resident_pages": len(self.tensors),
@@ -1540,6 +2597,7 @@ class ThinGpuPagePool:
         else:
             page = self.page_specs[page_id]
             stream = self.loader.prefetch_stream if reason == "prefetch" else None
+            self._evict_to_budget(page_id, incoming_bytes=int(page["size"]))
             raw = self.loader.load_raw_page(page_id, int(page["size"]), stream=stream)
             self._insert_tensor(page_id, raw, _tensor_nbytes(raw))
             self.stats["fused_physical_pages"] = int(self.stats["fused_physical_pages"]) + 1
@@ -1574,6 +2632,7 @@ class ThinGpuPagePool:
             if page.get("kind") != "fused_physical"
             and page.get("layer") == layer
             and not _is_separate_expert_page(str(page["id"]))
+            and str(page["id"]) not in self.streamed_packed_expert_pages
         ]
 
     def _insert_tensor(self, page_id: str, tensor: torch.Tensor, owned_bytes: int) -> None:
@@ -1596,9 +2655,36 @@ class ThinGpuPagePool:
         self.resident_bytes = max(0, self.resident_bytes - self.owned_bytes.pop(page_id, 0))
         self.stats["evicted_pages"] = int(self.stats["evicted_pages"]) + 1
 
-    def _evict_to_budget(self, page_id: str) -> None:
+    def _evict_to_budget(self, page_id: str, incoming_bytes: int = 0) -> None:
+        self._reap_retired_tensors()
         if self.vram_budget_bytes is not None and self.vram_budget_bytes > 0:
-            while self.resident_bytes > self.vram_budget_bytes:
+            budget = max(
+                0,
+                self.vram_budget_bytes
+                - max(0, self.residency_headroom_bytes)
+                - max(0, incoming_bytes),
+            )
+            if (
+                self._mxfp4_expert_slice_cache_bytes > 0
+                and self.resident_bytes
+                + self._retired_tensor_bytes
+                + self._mxfp4_expert_slice_cache_bytes
+                > budget
+            ):
+                self._trim_mxfp4_expert_slice_cache(
+                    max(
+                        0,
+                        budget
+                        - self.resident_bytes
+                        - self._retired_tensor_bytes,
+                    )
+                )
+            while (
+                self.resident_bytes
+                + self._retired_tensor_bytes
+                + self._mxfp4_expert_slice_cache_bytes
+                > budget
+            ):
                 victim = None
                 for candidate in self.tensors.keys():
                     use_event = self._page_use_events.get(candidate)
@@ -1623,11 +2709,25 @@ class ThinGpuPagePool:
                                 use_event.synchronize()
                             break
                 if victim is None:
+                    if self._retired_tensors:
+                        self._retired_tensors[0][0].synchronize()
+                        self._reap_retired_tensors()
+                        continue
                     raise RuntimeError(
                         "GPU weight budget is below the protected execution "
                         "working set; increase --gpu-memory-budget"
                     )
                 self.evict(victim)
+
+    def _reap_retired_tensors(self) -> None:
+        while self._retired_tensors:
+            event, _tensor, retired_bytes = self._retired_tensors[0]
+            if not event.query():
+                break
+            self._retired_tensors.popleft()
+            self._retired_tensor_bytes = max(
+                0, self._retired_tensor_bytes - retired_bytes
+            )
 
 
 @dataclass
@@ -1848,6 +2948,14 @@ class PagedKVCache:
         "head_token_separate",
         "token_head_separate",
     }
+    EXACT_CODECS = {
+        "none",
+        "bf16",
+        "bfloat16",
+        "fp16",
+        "float16",
+        "high_precision",
+    }
 
     def __init__(
         self,
@@ -1868,6 +2976,13 @@ class PagedKVCache:
         gpu_recent_tokens: int = 256,
         prefetch_pages: int = 0,
     ) -> None:
+        normalized_codec = str(old_codec).lower()
+        if normalized_codec not in self.EXACT_CODECS:
+            raise ValueError(
+                f"KV codec {old_codec!r} is not executable: lossy KV "
+                "payload encoding/decoding is not implemented. Use BF16/FP16 "
+                "or an exact CPU residency mode."
+            )
         if layout not in self.LAYOUTS:
             raise ValueError(
                 f"unsupported KV layout {layout!r}; expected one of "
@@ -1886,7 +3001,7 @@ class PagedKVCache:
         self.dtype = dtype
         self.block_size = max(1, block_size)
         self.recent_window = max(0, recent_window)
-        self.old_codec = old_codec
+        self.old_codec = normalized_codec
         self.budget_bytes = budget_bytes
         self.policy = policy
         self.sink_tokens = max(0, sink_tokens)
@@ -2546,6 +3661,8 @@ class ThinGpuCausalLMRuntime:
         mxfp4_binary_residual: bool = False,
         mxfp4_int8_row_fraction: float = 0.0,
         mxfp4_row_postscale: bool = False,
+        moe_top_k_limit: int = 0,
+        moe_top_k_renorm: bool = True,
     ) -> None:
         self.weights = weights
         self._use_tensor_cache = (
@@ -2776,9 +3893,83 @@ class ThinGpuCausalLMRuntime:
         self._profile_steps = []
         self.model = weights.manifest["model"]
         self.descriptor = descriptor_from_manifest(weights.manifest)
+        self.execution_plan = compile_execution_plan(
+            self.descriptor,
+            (page["id"] for page in weights.manifest.get("pages", ())),
+        )
+        if not self.execution_plan.supported:
+            raise RuntimeError(
+                "native operator plan is not executable: "
+                + "; ".join(self.execution_plan.unsupported_reasons)
+            )
+        self.layer_operator_contracts = tuple(
+            layer.operators for layer in self.execution_plan.layers
+        )
+        self.operator_contract = frozenset(
+            self.descriptor.required_operators
+        ).union(
+            operator
+            for operators in self.layer_operator_contracts
+            for operator in operators
+        )
+        try:
+            self.runtime_executor = select_runtime_executor(
+                (layer.schema for layer in self.execution_plan.layers),
+                self.operator_contract,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"native operator plan has no executable graph: {exc}"
+            ) from exc
+        bind_resident_plan = not isinstance(weights, ThinGpuPagePool) or (
+            weights.is_fully_pinned
+        )
+        self._bound_layer_tensors: tuple[dict[str, torch.Tensor], ...] = ()
+        if bind_resident_plan:
+            bound_layers = []
+            for layer_plan in self.execution_plan.layers:
+                roles = {
+                    **layer_plan.tensors,
+                    **layer_plan.optional_tensors,
+                }
+                bound_layers.append(
+                    {
+                        role: weights.tensor(page_id)
+                        for role, page_id in roles.items()
+                    }
+                )
+            self._bound_layer_tensors = tuple(bound_layers)
         self.is_moe = self.descriptor.is_moe
-        self.is_qwen3_5 = self.descriptor.model_type == "qwen3_5"
-        self.is_gemma4 = self.descriptor.model_type == "gemma4"
+        self.model_moe_top_k = int(self.descriptor.num_experts_per_token)
+        self.moe_top_k_limit = max(0, int(moe_top_k_limit))
+        self.moe_top_k_renorm = bool(moe_top_k_renorm)
+        selected_tensorcore_override = os.environ.get(
+            "THINTENSOR_MXFP4_SELECTED_TENSORCORE"
+        )
+        self.mxfp4_selected_tensorcore = (
+            selected_tensorcore_override == "1"
+            if selected_tensorcore_override is not None
+            else (
+                weights.device.type == "cuda"
+                and torch.cuda.get_device_capability(weights.device) >= (12, 0)
+            )
+        )
+        self.effective_moe_top_k = self.model_moe_top_k
+        if self.is_moe and self.moe_top_k_limit > 0:
+            self.effective_moe_top_k = max(
+                1,
+                min(self.model_moe_top_k, self.moe_top_k_limit),
+            )
+        required_operators = self.operator_contract
+        self.is_qwen3_5 = "gated_delta_net" in required_operators
+        self.is_gemma4 = bool(
+            {"per_layer_embeddings", "shared_kv_attention"}
+            & required_operators
+        )
+        self.uses_dual_post_norm = {
+            "post_attention_norm",
+            "post_feedforward_norm",
+        }.issubset(required_operators)
         self.gemma4_triton_attention = (
             self.is_gemma4
             and os.environ.get(
@@ -2799,11 +3990,6 @@ class ThinGpuCausalLMRuntime:
             and os.environ.get("THINTENSOR_GEMMA4_TRITON_PLE", "0")
             == "1"
         )
-        self.gemma4_mlp_int8 = (
-            self.is_gemma4
-            and os.environ.get("THINTENSOR_GEMMA4_MLP_INT8", "0")
-            == "1"
-        )
         if attention_mode not in {"causal_kv", "current_only_smoke"}:
             raise ValueError(
                 "attention_mode must be causal_kv or current_only_smoke"
@@ -2822,10 +4008,20 @@ class ThinGpuCausalLMRuntime:
         self.attention_backend = (
             "torch" if exact_hf_mode else attention_backend
         )
-        self.not_hf_equivalent = attention_mode != "causal_kv"
+        not_equivalent_reasons: list[str] = []
+        if attention_mode != "causal_kv":
+            not_equivalent_reasons.append(
+                "current_only_smoke attends only to the current value vector"
+            )
+        if self.is_moe and self.effective_moe_top_k != self.model_moe_top_k:
+            not_equivalent_reasons.append(
+                f"MoE router executes top-{self.effective_moe_top_k} of "
+                f"top-{self.model_moe_top_k}"
+            )
+        self.not_hf_equivalent = bool(not_equivalent_reasons)
         self.reason_not_equivalent = (
-            "current_only_smoke attends only to the current value vector"
-            if self.not_hf_equivalent
+            "; ".join(not_equivalent_reasons)
+            if not_equivalent_reasons
             else None
         )
         if self.descriptor.activation not in {
@@ -2841,13 +4037,11 @@ class ThinGpuCausalLMRuntime:
             (
                 self.down_proj_fp8,
                 self.gate_up_fp8,
-                self.qkv_fp8,
-                self.o_proj_fp8,
             )
         ):
             raise RuntimeError(
-                "dense projection FP8 flags cannot be applied to a sparse-MoE "
-                "archive; select a native expert quantization plan instead"
+                "dense MLP FP8 flags cannot be applied to sparse-MoE experts; "
+                "attention QKV/O FP8 remains supported by page role"
             )
         self.layers = int(self.model["layers"])
         self.hidden_size = int(self.model["hidden_size"])
@@ -3191,7 +4385,7 @@ class ThinGpuCausalLMRuntime:
         self._moe_gate_up_buffer: Optional[torch.Tensor] = None
         self._moe_down_buffer: Optional[torch.Tensor] = None
         if self.is_moe:
-            top_k = self.descriptor.num_experts_per_token
+            top_k = self.effective_moe_top_k
             self._moe_gate_up_buffer = torch.empty(
                 (top_k, 2 * self.intermediate_size),
                 device=self.device,
@@ -3202,12 +4396,37 @@ class ThinGpuCausalLMRuntime:
                 device=self.device,
                 dtype=self._final_norm_weight.dtype,
             )
+            self._moe_activation_buffer = torch.empty(
+                (top_k, self.intermediate_size),
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._moe_combined_buffer = torch.empty(
+                (self.hidden_size,),
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._moe_router_logits_buffer = torch.empty(
+                (self.descriptor.num_local_experts,),
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+            self._moe_router_indices_buffer = torch.empty(
+                (top_k,), device=self.device, dtype=torch.int32
+            )
+            self._moe_router_scores_buffer = torch.empty(
+                (top_k,),
+                device=self.device,
+                dtype=self._final_norm_weight.dtype,
+            )
+        lm_head_source_shape: tuple[int, ...] | None = None
         if self.lm_head_fp8_enabled:
             if self.kernel_backend is None or not self.use_triton_matvec:
                 raise RuntimeError("FP8 lm_head requires the Triton matvec backend")
             source_head = _optional_tensor(self.weights, "lm_head.weight")
             if source_head is None:
                 source_head = self._embed_weight
+            lm_head_source_shape = tuple(int(dim) for dim in source_head.shape)
             source_bytes = source_head.numel() * (
                 2
                 if str(self.model.get("dtype", "")).lower()
@@ -3223,7 +4442,22 @@ class ThinGpuCausalLMRuntime:
             resident_scale = getattr(
                 self.weights, f"{cache_prefix}_lm_head_scale", None
             )
-            if resident_head is not None and resident_scale is not None:
+            source_scale = None
+            if source_head.dtype == torch.float8_e4m3fn:
+                source_scale = _optional_tensor(
+                    self.weights,
+                    (
+                        "model.embed_tokens.weight.scale"
+                        if source_head is self._embed_weight
+                        or source_head.data_ptr() == self._embed_weight.data_ptr()
+                        else "lm_head.weight.scale"
+                    ),
+                )
+            if source_scale is not None:
+                self._lm_head_tensor = source_head
+                self._lm_head_scale = source_scale
+                self._fp8_head_weight_page_owned = True
+            elif resident_head is not None and resident_scale is not None:
                 self._lm_head_tensor = resident_head
                 self._lm_head_scale = resident_scale
             else:
@@ -3254,10 +4488,11 @@ class ThinGpuCausalLMRuntime:
             self.lm_head_fp8_bytes = _tensor_nbytes(
                 self._lm_head_tensor
             ) + _tensor_nbytes(self._lm_head_scale)
-            self.lm_head_external_resident_bytes = _tensor_nbytes(
-                self._lm_head_scale
-            )
+            self.lm_head_external_resident_bytes = 0
             if not self._fp8_head_weight_page_owned:
+                self.lm_head_external_resident_bytes = _tensor_nbytes(
+                    self._lm_head_scale
+                )
                 self.lm_head_external_resident_bytes += _tensor_nbytes(
                     self._lm_head_tensor
                 )
@@ -3268,10 +4503,12 @@ class ThinGpuCausalLMRuntime:
                     self.weights, "fp8_head_external_bytes_registered", False
                 )
             ):
-                external_bytes = _tensor_nbytes(self._lm_head_scale)
+                external_bytes = 0
                 if not self._fp8_head_weight_page_owned:
+                    external_bytes = _tensor_nbytes(self._lm_head_scale)
                     external_bytes += _tensor_nbytes(self._lm_head_tensor)
-                self.weights.register_external_resident_bytes(external_bytes)
+                if external_bytes:
+                    self.weights.register_external_resident_bytes(external_bytes)
                 self.weights.fp8_head_external_bytes_registered = True
             if self.lm_head_fp8_separate_execution_head:
                 self.lm_head_memory_saved_bytes = 0
@@ -3287,6 +4524,56 @@ class ThinGpuCausalLMRuntime:
                 )
             self.lm_head_fp8_extra_bytes = max(0, self.lm_head_net_extra_bytes)
 
+        if self._embed_weight.dtype == torch.float8_e4m3fn:
+            embed_scale = _optional_tensor(
+                self.weights,
+                "model.embed_tokens.weight.scale",
+            )
+            if embed_scale is None:
+                raise RuntimeError(
+                    "FP8 embedding page is missing model.embed_tokens.weight.scale"
+                )
+            self._embed_scale = embed_scale
+            if not _has_page(self.weights, "lm_head.weight"):
+                self._lm_head_tensor = self._embed_weight
+                self._lm_head_scale = embed_scale
+                self._fp8_head_weight_page_owned = True
+                self.lm_head_fp8_enabled = True
+                self.lm_head_tied_to_embeddings = True
+                self.lm_head_fp8_bytes = (
+                    _tensor_nbytes(self._lm_head_tensor)
+                    + _tensor_nbytes(self._lm_head_scale)
+                )
+                source_bytes = self._embed_weight.numel() * 2
+                self.lm_head_memory_saved_bytes = max(
+                    0,
+                    source_bytes - self.lm_head_fp8_bytes,
+                )
+
+        if (
+            "source_head" in locals()
+            and not self.lm_head_bf16_resident
+            and source_head is not self._embed_weight
+        ):
+            del source_head
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        if (
+            isinstance(self.weights, ThinGpuPagePool)
+            and self.weights.streamed_packed_expert_pages
+            and os.environ.get("THINTENSOR_PROMOTE_PACKED_EXPERTS", "1") != "0"
+        ):
+            reserve_bytes = int(
+                os.environ.get(
+                    "THINTENSOR_PROMOTED_PACKED_EXPERT_RESERVE_BYTES",
+                    str(64 * 1024 * 1024),
+                )
+            )
+            self.weights.promote_streamed_packed_expert_layers(
+                reserve_bytes=reserve_bytes,
+            )
+
         self._weight_scales: Dict[int, torch.Tensor] = {}
         self._int4_metadata: Dict[int, tuple[int, int, int]] = {}
         self._mxfp4_metadata: Dict[int, tuple[int, int, int]] = {}
@@ -3301,9 +4588,13 @@ class ThinGpuCausalLMRuntime:
         self._mxfp4_row_postscales: Dict[int, torch.Tensor] = {}
         if self.lm_head_int4_enabled:
             assert self._lm_head_tensor is not None
+            if lm_head_source_shape is None:
+                lm_head_source_shape = tuple(
+                    int(dim) for dim in self._lm_head_tensor.shape
+                )
             self._int4_metadata[id(self._lm_head_tensor)] = (
-                int(source_head.shape[0]),
-                int(source_head.shape[1]),
+                int(lm_head_source_shape[0]),
+                int(lm_head_source_shape[1]),
                 self.lm_head_int4_group_size,
             )
         self._adaptive_exact_weights: Dict[int, torch.Tensor] = {}
@@ -3513,11 +4804,6 @@ class ThinGpuCausalLMRuntime:
         ):
             self._layer_plan = [self._make_layer_plan(layer) for layer in range(self.layers)]
             self._initialize_runtime_fusion()
-        elif self.gemma4_mlp_int8 and ".mlp." in page_id:
-            q_w, q_s = self._quantize_int8_rows(
-                source,
-                scale_block_size=scale_block_size,
-            )
         elif (
             isinstance(self.weights, ThinGpuPagePool)
             and not self.is_qwen3_5
@@ -4801,6 +6087,10 @@ class ThinGpuCausalLMRuntime:
             "model_type": self.descriptor.model_type,
             "attention_mode": self.attention_mode,
             "attention_backend": self.attention_backend,
+            "model_moe_top_k": self.model_moe_top_k,
+            "moe_top_k_limit": self.moe_top_k_limit,
+            "moe_top_k_renorm": self.moe_top_k_renorm,
+            "effective_moe_top_k": self.effective_moe_top_k,
             "kv_tokens_attended": self._last_kv_tokens_attended,
             "kv_cache_read_bytes_per_token": (
                 self.kv_cache.read_bytes_per_token
@@ -4809,6 +6099,9 @@ class ThinGpuCausalLMRuntime:
             ),
             "not_hf_equivalent": self.not_hf_equivalent,
             "reason_not_equivalent": self.reason_not_equivalent,
+            "execution_schema": self.execution_plan.schema,
+            "operator_contract": sorted(self.operator_contract),
+            "runtime_executor": self.runtime_executor.name,
         }
 
     @torch.inference_mode()
@@ -4823,6 +6116,15 @@ class ThinGpuCausalLMRuntime:
         self._adaptive_switch_token_index = (
             int(token_index) + self._adaptive_fp8_start_token
         )
+
+    def _bound_layer_tensor(
+        self,
+        layer: int,
+        role: str,
+    ) -> Optional[torch.Tensor]:
+        if layer >= len(self._bound_layer_tensors):
+            return None
+        return self._bound_layer_tensors[layer].get(role)
 
     @torch.inference_mode()
     def forward_token(
@@ -4849,48 +6151,41 @@ class ThinGpuCausalLMRuntime:
             raise ValueError(f"token_id {token_id} outside vocab {embed.shape[0]}")
         layer_count = min(self.layers, layers if layers is not None else self.layers)
         
-        if self.is_gemma4:
+        executor = self.runtime_executor.name
+        if executor == "shared_kv_decoder":
             res = self._forward_token_gemma4(
                 embed,
                 token_id,
                 layer_count,
                 token_index,
             )
-        elif self.is_qwen3_5:
+        elif executor == "recurrent_hybrid_decoder":
             res = self._forward_token_qwen3_5(
                 embed,
                 token_id,
                 layer_count,
                 token_index,
             )
-        elif self.is_moe:
+        elif executor == "sparse_moe_decoder":
             res = self._forward_token_moe(
                 embed,
                 token_id,
                 layer_count,
                 token_index,
             )
-        elif self.descriptor.model_type == "gemma2":
+        elif executor == "generic_dense_decoder":
             res = self._forward_token_pytorch_fallback(
                 embed,
                 token_id,
                 layer_count,
                 token_index,
             )
-        elif (
-            self.has_fused_qkv_projection
-            or self.has_fused_gate_up_projection
-        ):
-            res = self._forward_token_pytorch_fallback(
-                embed,
-                token_id,
-                layer_count,
-                token_index,
-            )
-        elif self.kernel_backend is not None:
+        elif executor == "optimized_dense_decoder" and self.kernel_backend is not None:
             res = self._forward_token_triton(embed, token_id, layer_count, token_index)
-        else:
+        elif executor == "optimized_dense_decoder":
             res = self._forward_token_pytorch_fallback(embed, token_id, layer_count, token_index)
+        else:
+            raise RuntimeError(f"unregistered runtime executor {executor!r}")
 
         if getattr(self, "_profiler_enabled", False):
             self._current_step_profile["forward_end"].record()
@@ -5333,7 +6628,24 @@ class ThinGpuCausalLMRuntime:
             for state in self._qwen35_recurrent_states.values():
                 state.zero_()
 
-        if isinstance(token_id, torch.Tensor):
+        if self._embed_scale is not None:
+            if self.kernel_backend is not None:
+                hidden = self._copy_embed_token(
+                    embed,
+                    token_id,
+                    self.kernel_backend.buffers.hidden_a,
+                )
+            else:
+                hidden = self._copy_embed_token(
+                    embed,
+                    token_id,
+                    torch.empty(
+                        self.hidden_size,
+                        device=self.device,
+                        dtype=self._final_norm_weight.dtype,
+                    ),
+                )
+        elif isinstance(token_id, torch.Tensor):
             token = token_id.reshape(1).to(
                 device=embed.device, dtype=torch.long
             )
@@ -5342,75 +6654,97 @@ class ThinGpuCausalLMRuntime:
             hidden = embed[token_id].clone()
 
         for layer in range(layer_count):
-            self._capture_debug(layer, "layer_input", hidden)
-            for distance in range(1, self.prefetch_distance + 1):
-                if hasattr(self.weights, "prefetch_layer"):
-                    self.weights.prefetch_layer(layer + distance)
+            active_layer_pages = []
+            fused_parents = []
+            if isinstance(self.weights, ThinGpuPagePool):
+                active_layer_pages = [
+                    page_id for page_id in self.weights.page_specs.keys()
+                    if f"model.layers.{layer}." in page_id
+                ]
+                fused_parents = [
+                    self.weights.page_specs[p]["fused_to"]
+                    for p in active_layer_pages
+                    if self.weights.page_specs[p].get("fused_to") is not None
+                ]
+                self.weights._active_pages.update(active_layer_pages)
+                self.weights._active_pages.update(fused_parents)
 
-            normed = self._normalization(
-                hidden,
-                _layer_tensor(layer, "input_layernorm.weight"),
-            )
-            self._capture_debug(layer, "post_input_rmsnorm", normed)
-            layer_type = self.descriptor.layer_types[layer]
-            if layer_type == "linear_attention":
-                mixed = self._qwen35_linear_attention(layer, normed)
-            elif layer_type == "full_attention":
-                mixed = self._qwen35_full_attention(
-                    layer, normed, token_index
-                )
-            else:
-                raise RuntimeError(
-                    f"unsupported Qwen3.5 layer type {layer_type!r}"
-                )
-            hidden = hidden + mixed
-            self._capture_debug(
-                layer, "post_attention_residual", hidden
-            )
+            try:
+                self._capture_debug(layer, "layer_input", hidden)
+                for distance in range(1, self.prefetch_distance + 1):
+                    if hasattr(self.weights, "prefetch_layer"):
+                        self.weights.prefetch_layer(layer + distance)
 
-            mlp_input = self._normalization(
-                hidden,
-                _layer_tensor(
-                    layer, "post_attention_layernorm.weight"
-                ),
-            )
-            gate_weight = self.weights.tensor(
-                _layer_tensor(layer, "mlp.gate_proj.weight")
-            )
-            up_weight = self.weights.tensor(
-                _layer_tensor(layer, "mlp.up_proj.weight")
-            )
-            down_weight = self.weights.tensor(
-                _layer_tensor(layer, "mlp.down_proj.weight")
-            )
-            if self.kernel_backend is not None:
-                buffers = self.kernel_backend.buffers
-                self._qwen35_multi_matvec(
-                    (gate_weight, up_weight),
-                    mlp_input,
-                    buffers.gate_up,
+                normed = self._normalization(
+                    hidden,
+                    _layer_tensor(layer, "input_layernorm.weight"),
                 )
-                gate = buffers.gate_up[: self.intermediate_size]
-                up = buffers.gate_up[self.intermediate_size :]
-                activation = self._runtime_silu_mul(
-                    gate, up, buffers.mlp_act
+                self._capture_debug(layer, "post_input_rmsnorm", normed)
+                layer_type = self.descriptor.layer_types[layer]
+                if layer_type == "linear_attention":
+                    mixed = self._qwen35_linear_attention(layer, normed)
+                elif layer_type == "full_attention":
+                    mixed = self._qwen35_full_attention(
+                        layer, normed, token_index
+                    )
+                else:
+                    raise RuntimeError(
+                        f"unsupported Qwen3.5 layer type {layer_type!r}"
+                    )
+                hidden = hidden + mixed
+                self._capture_debug(
+                    layer, "post_attention_residual", hidden
                 )
-                mlp = self._runtime_matvec(
-                    down_weight, activation, buffers.mlp
+
+                mlp_input = self._normalization(
+                    hidden,
+                    _layer_tensor(
+                        layer, "post_attention_layernorm.weight"
+                    ),
                 )
-            else:
-                gate = torch.mv(gate_weight, mlp_input)
-                up = torch.mv(up_weight, mlp_input)
-                activation = torch.nn.functional.silu(gate) * up
-                mlp = torch.mv(down_weight, activation)
-            hidden = hidden + mlp
-            self._capture_debug(
-                layer, "final_residual_after_mlp", hidden
-            )
-            if self.evict_completed_layers and hasattr(
-                self.weights, "evict_completed_layer"
-            ):
-                self.weights.evict_completed_layer(layer)
+                gate_weight = self.weights.tensor(
+                    _layer_tensor(layer, "mlp.gate_proj.weight")
+                )
+                up_weight = self.weights.tensor(
+                    _layer_tensor(layer, "mlp.up_proj.weight")
+                )
+                down_weight = self.weights.tensor(
+                    _layer_tensor(layer, "mlp.down_proj.weight")
+                )
+                if self.kernel_backend is not None:
+                    buffers = self.kernel_backend.buffers
+                    self._qwen35_multi_matvec(
+                        (gate_weight, up_weight),
+                        mlp_input,
+                        buffers.gate_up,
+                    )
+                    gate = buffers.gate_up[: self.intermediate_size]
+                    up = buffers.gate_up[self.intermediate_size :]
+                    activation = self._runtime_silu_mul(
+                        gate, up, buffers.mlp_act
+                    )
+                    mlp = self._runtime_matvec(
+                        down_weight, activation, buffers.mlp
+                    )
+                else:
+                    gate = torch.mv(gate_weight, mlp_input)
+                    up = torch.mv(up_weight, mlp_input)
+                    activation = torch.nn.functional.silu(gate) * up
+                    mlp = torch.mv(down_weight, activation)
+                hidden = hidden + mlp
+                self._capture_debug(
+                    layer, "final_residual_after_mlp", hidden
+                )
+                if self.evict_completed_layers and hasattr(
+                    self.weights, "evict_completed_layer"
+                ):
+                    self.weights.evict_completed_layer(layer)
+            finally:
+                if isinstance(self.weights, ThinGpuPagePool):
+                    if active_layer_pages:
+                        self.weights._active_pages.difference_update(active_layer_pages)
+                    if fused_parents:
+                        self.weights._active_pages.difference_update(fused_parents)
 
         return self._normalization(hidden, "model.norm.weight")
 
@@ -5422,47 +6756,24 @@ class ThinGpuCausalLMRuntime:
     ) -> torch.Tensor:
         backend = self.kernel_backend
         assert backend is not None
-        if (
-            self._adaptive_switch_token_index >= 0
-            and self._active_token_index
-            < self._adaptive_switch_token_index
-        ):
-            exact = tuple(
-                self._adaptive_exact_weights.get(id(weight))
-                for weight in weights
-            )
-            if all(weight is not None for weight in exact):
-                large_rows = max(int(weight.shape[0]) for weight in exact)
-                return backend.multi_matvec(
-                    exact,
-                    hidden,
-                    out,
-                    block_m=64 if large_rows >= 512 else 8,
-                    num_warps=4,
-                )
         scales = tuple(self._weight_scale(weight) for weight in weights)
-        if all(
-            scale is not None and scale.ndim == 1
-            for scale in scales
-        ) and len({weight.dtype for weight in weights}) == 1 and weights[
-            0
-        ].dtype in {torch.float8_e4m3fn, torch.int8}:
-            return backend.multi_scaled_tensorcore_matvec(
+        if all(scale is None for scale in scales):
+            large_rows = max(int(weight.shape[0]) for weight in weights)
+            result = backend.multi_matvec(
                 weights,
-                scales,
-                tuple(int(weight.shape[0]) for weight in weights),
-                int(weights[0].shape[1]),
                 hidden,
                 out,
+                block_m=64 if large_rows >= 512 else 8,
+                num_warps=4,
             )
-        large_rows = max(int(weight.shape[0]) for weight in weights)
-        return backend.multi_matvec(
-            weights,
-            hidden,
-            out,
-            block_m=64 if large_rows >= 512 else 8,
-            num_warps=4,
-        )
+            self._record_streamed_tensor_use(*weights)
+            return result
+        offset = 0
+        for weight in weights:
+            rows_i = int(weight.shape[0])
+            self._runtime_matvec(weight, hidden, out[offset : offset + rows_i])
+            offset += rows_i
+        return out
 
     def _qwen35_linear_attention(
         self,
@@ -5547,6 +6858,12 @@ class ThinGpuCausalLMRuntime:
                 key_dim=self.descriptor.linear_key_head_dim,
                 value_dim=self.descriptor.linear_value_head_dim,
                 eps=self.norm_eps,
+            )
+            self._record_streamed_tensor_use(
+                conv_weight,
+                dt_bias,
+                a_log,
+                norm_weight,
             )
             out_weight = self.weights.tensor(
                 _layer_tensor(layer, f"{prefix}.out_proj.weight")
@@ -5818,18 +7135,7 @@ class ThinGpuCausalLMRuntime:
                 f"head_dim={self.head_dim}"
             )
         half = rotary_dim // 2
-        cached = self._rope_cos_sin_cache.get(token_index)
-        if cached is None or cached[0].dtype != q.dtype:
-            inv_freq, attention_scaling = self._rope_parameters(
-                token_index + 1
-            )
-            frequencies = inv_freq * float(token_index)
-            cached = (
-                (frequencies.cos() * attention_scaling).to(dtype=q.dtype),
-                (frequencies.sin() * attention_scaling).to(dtype=q.dtype),
-            )
-            self._rope_cos_sin_cache[token_index] = cached
-        cos, sin = cached
+        cos, sin = self._rope_values(token_index, q.dtype)
         if (
             rotary_dim == self.head_dim
             and self.fused_rope_enabled
@@ -5880,6 +7186,24 @@ class ThinGpuCausalLMRuntime:
         q = torch.cat((q_rotated, q_pass), dim=-1).reshape(-1)
         k = torch.cat((k_rotated, k_pass), dim=-1).reshape(-1)
         return q, k
+
+    def _rope_values(
+        self,
+        token_index: int,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = self._rope_cos_sin_cache.get(token_index)
+        if cached is None or cached[0].dtype != dtype:
+            inv_freq, attention_scaling = self._rope_parameters(
+                token_index + 1
+            )
+            frequencies = inv_freq * float(token_index)
+            cached = (
+                (frequencies.cos() * attention_scaling).to(dtype=dtype),
+                (frequencies.sin() * attention_scaling).to(dtype=dtype),
+            )
+            self._rope_cos_sin_cache[token_index] = cached
+        return cached
 
     def _rope_parameters(
         self,
@@ -5974,10 +7298,12 @@ class ThinGpuCausalLMRuntime:
             start_token=start_token,
         )
         self._last_kv_tokens_attended = int(keys.shape[1])
-        sinks = _optional_tensor(
-            self.weights,
-            _layer_tensor(layer, "self_attn.sinks"),
-        )
+        sinks = self._bound_layer_tensor(layer, "attention_sinks")
+        if sinks is None:
+            sinks = _optional_tensor(
+                self.weights,
+                _layer_tensor(layer, "self_attn.sinks"),
+            )
         if (
             self.attention_backend == "sdpa"
             and self.attention_logit_softcap is None
@@ -6006,7 +7332,7 @@ class ThinGpuCausalLMRuntime:
                 self._adaptive_switch_token_index < 0
                 or token_index >= self._adaptive_switch_token_index
             )
-            and sinks is None
+            and (sinks is None or self.attention_backend == "triton_fused")
             and self.head_dim <= 256
             and self._debug_layer is None
             and not self._debug_all_layers
@@ -6034,6 +7360,7 @@ class ThinGpuCausalLMRuntime:
                     self.heads,
                     self.kv_heads,
                     self.head_dim,
+                    sinks=sinks,
                 )
             if lev is not None:
                 lev.qk_end.record()
@@ -6105,7 +7432,21 @@ class ThinGpuCausalLMRuntime:
                 device=self.device,
                 dtype=embed.dtype,
             )
-        hidden = embed[token_id].clone()
+            self._moe_attention_output_buffer = torch.empty(
+                (self.hidden_size,), device=self.device, dtype=embed.dtype
+            )
+        if self._embed_scale is not None:
+            hidden = self._copy_embed_token(
+                embed,
+                token_id,
+                torch.empty(
+                    self.hidden_size,
+                    device=self.device,
+                    dtype=self._final_norm_weight.dtype,
+                ),
+            )
+        else:
+            hidden = embed[token_id].clone()
         if self.embedding_scale != 1.0:
             hidden.mul_(
                 torch.tensor(
@@ -6124,39 +7465,96 @@ class ThinGpuCausalLMRuntime:
             _layer_tensor(0, "input_layernorm.weight"),
         )
         for layer in range(layer_count):
+            lev = None
+            if getattr(self, "_profiler_enabled", False):
+                lev = LayerProfileEvents()
+                self._current_step_profile["layers"].append(lev)
+                lev.layer_start.record()
+                lev.attn_start.record()
+                lev.qkv_start.record()
             self._capture_debug(layer, "layer_input", hidden_a)
             for distance in range(1, self.prefetch_distance + 1):
                 if hasattr(self.weights, "prefetch_layer"):
                     self.weights.prefetch_layer(layer + distance)
             self._capture_debug(layer, "post_input_rmsnorm", normed)
-            qkv_weight_id = f"model.layers.{layer}.self_attn.qkv_fused.weight"
-            if getattr(self.weights, "_use_tensor_cache", False):
-                try:
-                    qkv_weight = self.weights._cached_tensors[qkv_weight_id]
-                except KeyError:
-                    q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
-                    k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
-                    v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
-                    qkv_weight = torch.cat((q_proj, k_proj, v_proj), dim=0)
-                    self.weights._cached_tensors[qkv_weight_id] = qkv_weight
+            q_proj_id = _layer_tensor(layer, "self_attn.q_proj.weight")
+            q_proj = self._bound_layer_tensor(layer, "q_weight")
+            if q_proj is not None or q_proj_id in self.weights.page_specs:
+                if q_proj is None:
+                    q_proj = self.weights.tensor(q_proj_id)
+                k_proj = self._bound_layer_tensor(layer, "k_weight")
+                if k_proj is None:
+                    k_proj = self.weights.tensor(
+                        _layer_tensor(layer, "self_attn.k_proj.weight")
+                    )
+                v_proj = self._bound_layer_tensor(layer, "v_weight")
+                if v_proj is None:
+                    v_proj = self.weights.tensor(
+                        _layer_tensor(layer, "self_attn.v_proj.weight")
+                    )
+                if self.kernel_backend is not None:
+                    self.kernel_backend.multi_matvec(
+                        (q_proj, k_proj, v_proj),
+                        normed,
+                        self._moe_qkv_buffer,
+                        block_m=64,
+                    )
+                    q = self._moe_qkv_buffer[: self.q_dim]
+                    k = self._moe_qkv_buffer[
+                        self.q_dim : self.q_dim + self.kv_dim
+                    ]
+                    v = self._moe_qkv_buffer[
+                        self.q_dim + self.kv_dim :
+                    ]
+                else:
+                    q = self._runtime_matvec(
+                        q_proj, normed, self._moe_qkv_buffer[: self.q_dim]
+                    )
+                    k = self._runtime_matvec(
+                        k_proj,
+                        normed,
+                        self._moe_qkv_buffer[
+                            self.q_dim : self.q_dim + self.kv_dim
+                        ],
+                    )
+                    v = self._runtime_matvec(
+                        v_proj,
+                        normed,
+                        self._moe_qkv_buffer[self.q_dim + self.kv_dim :],
+                    )
             else:
-                q_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.q_proj.weight"))
-                k_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
-                v_proj = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
-                qkv_weight = torch.cat((q_proj, k_proj, v_proj), dim=0)
-            qkv_out = torch.mv(qkv_weight, normed)
-            q = qkv_out[:self.q_dim]
-            k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
-            v = qkv_out[self.q_dim + self.kv_dim :]
-            for projected, suffix in (
-                (q, "self_attn.q_proj.bias"),
-                (k, "self_attn.k_proj.bias"),
-                (v, "self_attn.v_proj.bias"),
-            ):
-                bias = _optional_tensor(
+                qkv_weight = _first_optional_tensor(
                     self.weights,
-                    _layer_tensor(layer, suffix),
+                    (
+                        _layer_tensor(layer, "self_attn.qkv_proj.weight"),
+                        _layer_tensor(layer, "attn.c_attn.weight"),
+                    ),
                 )
+                if qkv_weight is None:
+                    raise RuntimeError(f"layer {layer} has no supported QKV weights")
+                qkv_out = (
+                    self._runtime_matvec(
+                        qkv_weight, normed, self._moe_qkv_buffer
+                    )
+                    if self.kernel_backend is not None
+                    else torch.mv(qkv_weight, normed)
+                )
+                q = qkv_out[:self.q_dim]
+                k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
+                v = qkv_out[self.q_dim + self.kv_dim :]
+            if lev is not None:
+                lev.qkv_end.record()
+            for projected, role, suffix in (
+                (q, "q_bias", "self_attn.q_proj.bias"),
+                (k, "k_bias", "self_attn.k_proj.bias"),
+                (v, "v_bias", "self_attn.v_proj.bias"),
+            ):
+                bias = self._bound_layer_tensor(layer, role)
+                if bias is None:
+                    bias = _optional_tensor(
+                        self.weights,
+                        _layer_tensor(layer, suffix),
+                    )
                 if bias is not None:
                     projected.add_(bias)
             fused_qkv_bias = _optional_tensor(
@@ -6174,15 +7572,45 @@ class ThinGpuCausalLMRuntime:
             self._capture_debug(layer, "q_projection", q)
             self._capture_debug(layer, "k_projection", k)
             self._capture_debug(layer, "v_projection", v)
-            q_norm = _optional_tensor(
-                self.weights,
-                _layer_tensor(layer, "self_attn.q_norm.weight"),
+            q_norm = self._bound_layer_tensor(layer, "q_norm")
+            if q_norm is None:
+                q_norm = _optional_tensor(
+                    self.weights,
+                    _layer_tensor(layer, "self_attn.q_norm.weight"),
+                )
+            k_norm = self._bound_layer_tensor(layer, "k_norm")
+            if k_norm is None:
+                k_norm = _optional_tensor(
+                    self.weights,
+                    _layer_tensor(layer, "self_attn.k_norm.weight"),
+                )
+            fused_qk_norm_rope = (
+                q_norm is not None
+                and k_norm is not None
+                and q_norm.numel() == self.head_dim
+                and k_norm.numel() == self.head_dim
+                and self.attention_mode == "causal_kv"
+                and self.descriptor.layer_uses_rope(layer)
+                and int(self.head_dim * self.partial_rotary_factor)
+                == self.head_dim
+                and self.fused_rope_enabled
+                and self.kernel_backend is not None
             )
-            k_norm = _optional_tensor(
-                self.weights,
-                _layer_tensor(layer, "self_attn.k_norm.weight"),
-            )
-            if q_norm is not None:
+            if fused_qk_norm_rope:
+                cos, sin = self._rope_values(token_index, q.dtype)
+                q, k = self.kernel_backend.qk_head_rmsnorm_rope_inplace(
+                    q,
+                    k,
+                    q_norm,
+                    k_norm,
+                    cos,
+                    sin,
+                    self.heads,
+                    self.kv_heads,
+                    self.head_dim,
+                    self.rms_norm_eps,
+                )
+            elif q_norm is not None:
                 q = (
                     _rms_norm(q, q_norm, self.rms_norm_eps)
                     if q_norm.numel() == q.numel()
@@ -6194,7 +7622,7 @@ class ThinGpuCausalLMRuntime:
                         self.rms_norm_eps,
                     )
                 )
-            if k_norm is not None:
+            if k_norm is not None and not fused_qk_norm_rope:
                 k = (
                     _rms_norm(k, k_norm, self.rms_norm_eps)
                     if k_norm.numel() == k.numel()
@@ -6206,7 +7634,7 @@ class ThinGpuCausalLMRuntime:
                         self.rms_norm_eps,
                     )
                 )
-            if self.attention_mode == "causal_kv":
+            if self.attention_mode == "causal_kv" and not fused_qk_norm_rope:
                 q, k = self._apply_rope(q, k, layer, token_index)
             if self.kv_cache is not None and not getattr(
                 self, "_autotuning", False
@@ -6218,26 +7646,52 @@ class ThinGpuCausalLMRuntime:
                 v,
                 layer,
                 token_index,
+                lev,
             )
-            attention_output = torch.mv(
-                self.weights.tensor(
+            if lev is not None:
+                lev.o_proj_start.record()
+            o_weight = self._bound_layer_tensor(layer, "o_weight")
+            if o_weight is None:
+                o_weight = self.weights.tensor(
                     _layer_tensor(layer, "self_attn.o_proj.weight")
-                ),
-                attention,
+                )
+            attention_output = (
+                self._runtime_matvec(
+                    o_weight,
+                    attention,
+                    self._moe_attention_output_buffer,
+                )
+                if self.kernel_backend is not None
+                else torch.mv(o_weight, attention)
             )
-            o_bias = _optional_tensor(
-                self.weights,
-                _layer_tensor(layer, "self_attn.o_proj.bias"),
-            )
+            o_bias = self._bound_layer_tensor(layer, "o_bias")
+            if o_bias is None:
+                o_bias = _optional_tensor(
+                    self.weights,
+                    _layer_tensor(layer, "self_attn.o_proj.bias"),
+                )
             if o_bias is not None:
                 attention_output.add_(o_bias)
-            
+            if lev is not None:
+                lev.o_proj_end.record()
+
             if self.kernel_backend is not None:
+                post_attention_norm = self._bound_layer_tensor(
+                    layer,
+                    "post_attention_norm",
+                )
+                if post_attention_norm is None:
+                    post_attention_norm = self.weights.tensor(
+                        _layer_tensor(
+                            layer,
+                            "post_attention_layernorm.weight",
+                        )
+                    )
                 self.kernel_backend.add_rms_norm(
                     hidden_a,
                     attention_output,
                     hidden_b,
-                    self.weights.tensor(_layer_tensor(layer, "post_attention_layernorm.weight")),
+                    post_attention_norm,
                     self._moe_normed_buffer,
                     self.rms_norm_eps,
                 )
@@ -6253,15 +7707,29 @@ class ThinGpuCausalLMRuntime:
                 )
             self._capture_debug(layer, "post_attention_residual", hidden_b)
             self._capture_debug(layer, "post_attention_rmsnorm", normed)
+            if lev is not None:
+                lev.attn_end.record()
+                lev.mlp_start.record()
             moe = self._packed_moe_forward(layer, normed)
             
             if layer < layer_count - 1:
                 if self.kernel_backend is not None:
+                    next_input_norm = self._bound_layer_tensor(
+                        layer + 1,
+                        "input_norm",
+                    )
+                    if next_input_norm is None:
+                        next_input_norm = self.weights.tensor(
+                            _layer_tensor(
+                                layer + 1,
+                                "input_layernorm.weight",
+                            )
+                        )
                     self.kernel_backend.add_rms_norm(
                         hidden_b,
                         moe,
                         hidden_a,
-                        self.weights.tensor(_layer_tensor(layer + 1, "input_layernorm.weight")),
+                        next_input_norm,
                         self._moe_normed_buffer,
                         self.rms_norm_eps,
                     )
@@ -6275,6 +7743,9 @@ class ThinGpuCausalLMRuntime:
             else:
                 hidden_a.copy_(hidden_b + moe)
             self._capture_debug(layer, "final_residual_after_mlp", hidden_a)
+            if lev is not None:
+                lev.mlp_end.record()
+                lev.layer_end.record()
             if self.evict_completed_layers and hasattr(
                 self.weights, "evict_completed_layer"
             ):
@@ -6286,73 +7757,142 @@ class ThinGpuCausalLMRuntime:
         layer: int,
         hidden: torch.Tensor,
     ) -> torch.Tensor:
-        router_weight = _first_optional_tensor(
-            self.weights,
-            (
-                _layer_tensor(layer, "mlp.router.weight"),
-                _layer_tensor(layer, "block_sparse_moe.gate.weight"),
-                _layer_tensor(layer, "mlp.gate.weight"),
-            ),
-        )
+        router_weight = self._bound_layer_tensor(layer, "router_weight")
+        if router_weight is None:
+            router_weight = _first_optional_tensor(
+                self.weights,
+                (
+                    _layer_tensor(layer, "mlp.router.weight"),
+                    _layer_tensor(layer, "block_sparse_moe.gate.weight"),
+                    _layer_tensor(layer, "mlp.gate.weight"),
+                ),
+            )
         if router_weight is None:
             raise RuntimeError(f"layer {layer} has no supported MoE router")
-        router_logits = torch.mv(router_weight, hidden)
-        router_bias = _first_optional_tensor(
-            self.weights,
-            (
-                _layer_tensor(layer, "mlp.router.bias"),
-                _layer_tensor(layer, "block_sparse_moe.gate.bias"),
-            ),
-        )
-        if router_bias is not None:
-            router_logits.add_(router_bias)
-        top_k = self.descriptor.num_experts_per_token
+        router_bias = self._bound_layer_tensor(layer, "router_bias")
+        if router_bias is None:
+            router_bias = _first_optional_tensor(
+                self.weights,
+                (
+                    _layer_tensor(layer, "mlp.router.bias"),
+                    _layer_tensor(layer, "block_sparse_moe.gate.bias"),
+                ),
+            )
+        top_k = self.effective_moe_top_k
         if top_k <= 0:
             raise RuntimeError("MoE archive has no num_experts_per_token")
-        # Router selection is required model work and remains GPU-only. Avoid
-        # torch.topk so benchmark token-selection rules cannot be violated.
-        router_indices = torch.argsort(
-            router_logits,
-            descending=True,
-        )[:top_k]
-        all_router_scores = torch.softmax(
-            router_logits,
-            dim=0,
-            dtype=torch.float32,
+        # Router selection is model work, not benchmark token sampling. Top-k
+        # avoids sorting all experts on every MoE layer.
+        should_renorm = self.descriptor.norm_topk_prob and (
+            self.effective_moe_top_k == self.model_moe_top_k
+            or self.moe_top_k_renorm
         )
-        router_scores = all_router_scores.index_select(
-            0, router_indices
-        ).to(dtype=hidden.dtype)
-        if self.descriptor.norm_topk_prob:
-            router_scores = router_scores / router_scores.sum().clamp_min(
-                torch.finfo(router_scores.dtype).tiny
+        if self.kernel_backend is not None and int(router_weight.shape[0]) <= 128:
+            router_indices, router_scores = self.kernel_backend.moe_router_matvec_topk(
+                router_weight,
+                hidden,
+                self._moe_router_indices_buffer[:top_k],
+                self._moe_router_scores_buffer[:top_k],
+                bias=router_bias,
+                renormalize=should_renorm,
             )
+        elif self.kernel_backend is not None:
+            router_logits = torch.mv(
+                router_weight,
+                hidden,
+                out=self._moe_router_logits_buffer,
+            )
+            if router_bias is not None:
+                router_logits.add_(router_bias)
+            router_indices, router_scores = self.kernel_backend.moe_router_topk(
+                router_logits,
+                self._moe_router_indices_buffer[:top_k],
+                self._moe_router_scores_buffer[:top_k],
+                renormalize=should_renorm,
+            )
+        else:
+            router_logits = torch.mv(router_weight, hidden)
+            if router_bias is not None:
+                router_logits.add_(router_bias)
+            _, router_indices = torch.topk(
+                router_logits, k=top_k, dim=0, largest=True, sorted=True
+            )
+            all_router_scores = torch.softmax(
+                router_logits, dim=0, dtype=torch.float32
+            )
+            router_scores = all_router_scores.index_select(
+                0, router_indices
+            ).to(dtype=hidden.dtype)
+            if should_renorm:
+                router_scores = router_scores / router_scores.sum().clamp_min(
+                    torch.finfo(router_scores.dtype).tiny
+                )
 
         gate_up = _optional_tensor(
             self.weights,
             _layer_tensor(layer, "mlp.experts.gate_up_proj"),
         )
+        gate_up_output = None
+        activation = None
+        gate_up_bias = self._bound_layer_tensor(
+            layer,
+            "experts_gate_up_bias",
+        )
+        if gate_up_bias is None:
+            gate_up_bias = _optional_tensor(
+                self.weights,
+                _layer_tensor(layer, "mlp.experts.gate_up_proj_bias"),
+            )
         if gate_up is not None:
             if top_k == 1:
                 idx = int(router_indices[0])
                 selected_gate_up = gate_up[idx]
+                gate_up_output = torch.mv(selected_gate_up, hidden)
             else:
-                selected_gate_up = gate_up.index_select(0, router_indices)
+                gate_up_outputs = []
+                for i in range(top_k):
+                    idx = int(router_indices[i])
+                    gate_up_outputs.append(torch.mv(gate_up[idx], hidden))
+                gate_up_output = torch.stack(gate_up_outputs)
         else:
-            gate_blocks = _optional_tensor(
-                self.weights,
-                _layer_tensor(
-                    layer,
-                    "mlp.experts.gate_up_proj_blocks",
-                ),
+            gate_blocks_id = _layer_tensor(
+                layer,
+                "mlp.experts.gate_up_proj_blocks",
             )
-            gate_scales = _optional_tensor(
-                self.weights,
-                _layer_tensor(
-                    layer,
-                    "mlp.experts.gate_up_proj_scales",
-                ),
+            gate_scales_id = _layer_tensor(
+                layer,
+                "mlp.experts.gate_up_proj_scales",
             )
+            bound_gate_blocks = self._bound_layer_tensor(
+                layer,
+                "experts_gate_up",
+            )
+            bound_gate_scales = self._bound_layer_tensor(
+                layer,
+                "experts_gate_up_scales",
+            )
+            if bound_gate_blocks is not None and bound_gate_scales is not None:
+                gate_blocks = bound_gate_blocks
+                gate_scales = bound_gate_scales
+                gate_kernel_indices = router_indices
+            elif (
+                isinstance(self.weights, ThinGpuPagePool)
+                and self.kernel_backend is not None
+                and self._moe_gate_up_buffer is not None
+                and self.weights.has_page(gate_blocks_id)
+                and self.weights.has_page(gate_scales_id)
+            ):
+                gate_blocks, gate_scales, gate_kernel_indices = (
+                    self.weights.mxfp4_selected_expert_tensors(
+                        gate_blocks_id,
+                        gate_scales_id,
+                        router_indices,
+                    )
+                )
+            else:
+                gate_blocks = _optional_tensor(self.weights, gate_blocks_id)
+                gate_scales = _optional_tensor(self.weights, gate_scales_id)
+                gate_kernel_indices = router_indices
             if gate_blocks is None or gate_scales is None:
                 return self._separate_expert_moe_forward(
                     layer,
@@ -6365,13 +7905,62 @@ class ThinGpuCausalLMRuntime:
                 and gate_blocks.device.type == "cuda"
                 and self._moe_gate_up_buffer is not None
             ):
-                selected_gate_up = self.kernel_backend.mxfp4_selected_matvec(
-                    gate_blocks,
-                    gate_scales,
-                    hidden,
-                    router_indices,
-                    self._moe_gate_up_buffer,
+                gate_bits = (
+                    self.weights.packed_expert_bits(gate_blocks_id)
+                    if isinstance(self.weights, ThinGpuPagePool)
+                    else 4
                 )
+                if gate_bits < 4 and self.descriptor.swiglu_limit is not None:
+                    activation = self.kernel_backend.mxfp_lowbit_selected_swiglu(
+                        gate_blocks,
+                        gate_scales,
+                        hidden,
+                        gate_kernel_indices,
+                        self._moe_activation_buffer[:top_k],
+                        bits=gate_bits,
+                        alpha=self.descriptor.swiglu_alpha,
+                        limit=self.descriptor.swiglu_limit,
+                        bias=gate_up_bias,
+                        block_m=8 if gate_bits == 2 else 4,
+                        block_k=1024,
+                        num_warps=4,
+                    )
+                    if top_k == 1:
+                        activation = activation.squeeze(0)
+                    selected_gate_up = None
+                else:
+                    selected_gate_up = (
+                        self.kernel_backend.mxfp_lowbit_selected_matvec(
+                            gate_blocks,
+                            gate_scales,
+                            hidden,
+                            gate_kernel_indices,
+                            self._moe_gate_up_buffer,
+                            bits=gate_bits,
+                        )
+                        if gate_bits < 4
+                        else self.kernel_backend.mxfp4_selected_tensorcore_matvec(
+                            gate_blocks,
+                            gate_scales,
+                            hidden,
+                            gate_kernel_indices,
+                            self._moe_gate_up_buffer,
+                        )
+                        if self.mxfp4_selected_tensorcore
+                        else self.kernel_backend.mxfp4_selected_matvec(
+                            gate_blocks,
+                            gate_scales,
+                            hidden,
+                            gate_kernel_indices,
+                            self._moe_gate_up_buffer,
+                        )
+                    )
+                if selected_gate_up is not None:
+                    gate_up_output = (
+                        selected_gate_up.squeeze(0)
+                        if top_k == 1
+                        else selected_gate_up
+                    )
             else:
                 if top_k == 1:
                     idx = int(router_indices[0])
@@ -6380,57 +7969,64 @@ class ThinGpuCausalLMRuntime:
                         gate_scales[idx],
                         dtype=hidden.dtype,
                     )
+                    gate_up_output = torch.mv(selected_gate_up, hidden)
                 else:
-                    selected_gate_up = _dequantize_mxfp4(
-                        gate_blocks.index_select(0, router_indices),
-                        gate_scales.index_select(0, router_indices),
-                        dtype=hidden.dtype,
-                    )
-        if selected_gate_up.ndim == 2:
-            gate_up_output = torch.mv(selected_gate_up, hidden)
-        elif selected_gate_up.shape[1] == hidden.numel():
-            gate_up_output = torch.matmul(selected_gate_up.transpose(1, 2), hidden)
-        elif selected_gate_up.shape[2] == hidden.numel():
-            gate_up_output = torch.matmul(selected_gate_up, hidden)
-        else:
-            raise RuntimeError(
-                f"unsupported packed gate/up shape {selected_gate_up.shape}"
-            )
-        gate_up_bias = _optional_tensor(
-            self.weights,
-            _layer_tensor(layer, "mlp.experts.gate_up_proj_bias"),
-        )
-        if gate_up_bias is not None:
+                    gate_up_outputs = []
+                    for i in range(top_k):
+                        idx = int(router_indices[i])
+                        expert_weight = _dequantize_mxfp4(
+                            gate_blocks[idx],
+                            gate_scales[idx],
+                            dtype=hidden.dtype,
+                        )
+                        gate_up_outputs.append(torch.mv(expert_weight, hidden))
+                    gate_up_output = torch.stack(gate_up_outputs)
+            del gate_blocks, gate_scales, gate_kernel_indices
+        if (
+            activation is None
+            and gate_up_bias is not None
+            and gate_up_output is not None
+        ):
             if top_k == 1:
                 idx = int(router_indices[0])
                 gate_up_output.add_(gate_up_bias[idx])
             else:
-                gate_up_output.add_(
-                    gate_up_bias.index_select(0, router_indices)
+                for i in range(top_k):
+                    idx = int(router_indices[i])
+                    gate_up_output[i].add_(gate_up_bias[idx])
+        if activation is None and self.descriptor.swiglu_limit is not None:
+            if self.kernel_backend is not None:
+                activation = self.kernel_backend.interleaved_swiglu(
+                    gate_up_output.reshape(top_k, -1),
+                    self._moe_activation_buffer[:top_k],
+                    alpha=self.descriptor.swiglu_alpha,
+                    limit=self.descriptor.swiglu_limit,
                 )
-        if self.descriptor.swiglu_limit is not None:
-            if top_k == 1:
-                gate = gate_up_output[0::2].clamp(
-                    max=self.descriptor.swiglu_limit
-                )
-                up = gate_up_output[1::2].clamp(
-                    min=-self.descriptor.swiglu_limit,
-                    max=self.descriptor.swiglu_limit,
-                )
+                if top_k == 1:
+                    activation = activation.squeeze(0)
             else:
-                gate = gate_up_output[:, 0::2].clamp(
-                    max=self.descriptor.swiglu_limit
+                if top_k == 1:
+                    gate = gate_up_output[0::2].clamp(
+                        max=self.descriptor.swiglu_limit
+                    )
+                    up = gate_up_output[1::2].clamp(
+                        min=-self.descriptor.swiglu_limit,
+                        max=self.descriptor.swiglu_limit,
+                    )
+                else:
+                    gate = gate_up_output[:, 0::2].clamp(
+                        max=self.descriptor.swiglu_limit
+                    )
+                    up = gate_up_output[:, 1::2].clamp(
+                        min=-self.descriptor.swiglu_limit,
+                        max=self.descriptor.swiglu_limit,
+                    )
+                activation = (
+                    (up + 1)
+                    * gate
+                    * torch.sigmoid(gate * self.descriptor.swiglu_alpha)
                 )
-                up = gate_up_output[:, 1::2].clamp(
-                    min=-self.descriptor.swiglu_limit,
-                    max=self.descriptor.swiglu_limit,
-                )
-            activation = (
-                (up + 1)
-                * gate
-                * torch.sigmoid(gate * self.descriptor.swiglu_alpha)
-            )
-        else:
+        elif activation is None:
             gate, up = gate_up_output.chunk(2, dim=-1)
             activation = torch.nn.functional.silu(gate) * up
 
@@ -6438,21 +8034,64 @@ class ThinGpuCausalLMRuntime:
             self.weights,
             _layer_tensor(layer, "mlp.experts.down_proj"),
         )
+        expert_output = None
+        combined_expert_output = None
+        down_bias = self._bound_layer_tensor(layer, "experts_down_bias")
+        if down_bias is None:
+            down_bias = _optional_tensor(
+                self.weights,
+                _layer_tensor(layer, "mlp.experts.down_proj_bias"),
+            )
         if down is not None:
             if top_k == 1:
                 idx = int(router_indices[0])
                 selected_down = down[idx]
+                expert_output = torch.mv(selected_down, activation)
             else:
-                selected_down = down.index_select(0, router_indices)
+                down_outputs = []
+                for i in range(top_k):
+                    idx = int(router_indices[i])
+                    down_outputs.append(torch.mv(down[idx], activation[i]))
+                expert_output = torch.stack(down_outputs)
         else:
-            down_blocks = _optional_tensor(
-                self.weights,
-                _layer_tensor(layer, "mlp.experts.down_proj_blocks"),
+            down_blocks_id = _layer_tensor(
+                layer,
+                "mlp.experts.down_proj_blocks",
             )
-            down_scales = _optional_tensor(
-                self.weights,
-                _layer_tensor(layer, "mlp.experts.down_proj_scales"),
+            down_scales_id = _layer_tensor(
+                layer,
+                "mlp.experts.down_proj_scales",
             )
+            bound_down_blocks = self._bound_layer_tensor(
+                layer,
+                "experts_down",
+            )
+            bound_down_scales = self._bound_layer_tensor(
+                layer,
+                "experts_down_scales",
+            )
+            if bound_down_blocks is not None and bound_down_scales is not None:
+                down_blocks = bound_down_blocks
+                down_scales = bound_down_scales
+                down_kernel_indices = router_indices
+            elif (
+                isinstance(self.weights, ThinGpuPagePool)
+                and self.kernel_backend is not None
+                and self._moe_down_buffer is not None
+                and self.weights.has_page(down_blocks_id)
+                and self.weights.has_page(down_scales_id)
+            ):
+                down_blocks, down_scales, down_kernel_indices = (
+                    self.weights.mxfp4_selected_expert_tensors(
+                        down_blocks_id,
+                        down_scales_id,
+                        router_indices,
+                    )
+                )
+            else:
+                down_blocks = _optional_tensor(self.weights, down_blocks_id)
+                down_scales = _optional_tensor(self.weights, down_scales_id)
+                down_kernel_indices = router_indices
             if down_blocks is None or down_scales is None:
                 raise RuntimeError(
                     f"layer {layer} has no supported packed expert down tensor"
@@ -6462,14 +8101,57 @@ class ThinGpuCausalLMRuntime:
                 and down_blocks.device.type == "cuda"
                 and self._moe_down_buffer is not None
             ):
-                expert_output = self.kernel_backend.mxfp4_selected_matvec(
-                    down_blocks,
-                    down_scales,
-                    activation,
-                    router_indices,
-                    self._moe_down_buffer,
+                down_bits = (
+                    self.weights.packed_expert_bits(down_blocks_id)
+                    if isinstance(self.weights, ThinGpuPagePool)
+                    else 4
                 )
-                selected_down = None
+                if down_bits < 4 and top_k > 1:
+                    combined_expert_output = (
+                        self.kernel_backend.mxfp_lowbit_weighted_down(
+                            down_blocks,
+                            down_scales,
+                            activation,
+                            down_kernel_indices,
+                            router_scores,
+                            self._moe_combined_buffer,
+                            bits=down_bits,
+                            bias=down_bias,
+                            block_m=8,
+                            block_k=1024 if down_bits == 2 else 512,
+                            num_warps=4,
+                        )
+                    )
+                    expert_output = None
+                else:
+                    expert_output = (
+                        self.kernel_backend.mxfp_lowbit_selected_matvec(
+                            down_blocks,
+                            down_scales,
+                            activation,
+                            down_kernel_indices,
+                            self._moe_down_buffer,
+                            bits=down_bits,
+                        )
+                        if down_bits < 4
+                        else self.kernel_backend.mxfp4_selected_tensorcore_matvec(
+                            down_blocks,
+                            down_scales,
+                            activation,
+                            down_kernel_indices,
+                            self._moe_down_buffer,
+                        )
+                        if self.mxfp4_selected_tensorcore
+                        else self.kernel_backend.mxfp4_selected_matvec(
+                            down_blocks,
+                            down_scales,
+                            activation,
+                            down_kernel_indices,
+                            self._moe_down_buffer,
+                        )
+                    )
+                if top_k == 1 and expert_output is not None:
+                    expert_output = expert_output.squeeze(0)
             else:
                 if top_k == 1:
                     idx = int(router_indices[0])
@@ -6478,37 +8160,37 @@ class ThinGpuCausalLMRuntime:
                         down_scales[idx],
                         dtype=hidden.dtype,
                     )
+                    expert_output = torch.mv(selected_down, activation)
                 else:
-                    selected_down = _dequantize_mxfp4(
-                        down_blocks.index_select(0, router_indices),
-                        down_scales.index_select(0, router_indices),
-                        dtype=hidden.dtype,
-                    )
-        if selected_down is not None:
-            if selected_down.ndim == 2:
-                expert_output = torch.mv(selected_down, activation)
-            elif selected_down.shape[1] == activation.shape[1]:
-                expert_output = torch.matmul(selected_down.transpose(1, 2), activation.unsqueeze(-1)).squeeze(-1)
-            elif selected_down.shape[2] == activation.shape[1]:
-                expert_output = torch.matmul(selected_down, activation.unsqueeze(-1)).squeeze(-1)
-            else:
-                raise RuntimeError(
-                    f"unsupported packed down shape {selected_down.shape}"
-                )
-        down_bias = _optional_tensor(
-            self.weights,
-            _layer_tensor(layer, "mlp.experts.down_proj_bias"),
-        )
-        if down_bias is not None:
+                    down_outputs = []
+                    for i in range(top_k):
+                        idx = int(router_indices[i])
+                        expert_weight = _dequantize_mxfp4(
+                            down_blocks[idx],
+                            down_scales[idx],
+                            dtype=hidden.dtype,
+                        )
+                        down_outputs.append(torch.mv(expert_weight, activation[i]))
+                    expert_output = torch.stack(down_outputs)
+            del down_blocks, down_scales, down_kernel_indices
+        if combined_expert_output is not None:
+            return combined_expert_output
+        if down_bias is not None and expert_output is not None:
             if top_k == 1:
                 idx = int(router_indices[0])
                 expert_output.add_(down_bias[idx])
             else:
-                expert_output.add_(
-                    down_bias.index_select(0, router_indices)
-                )
+                for i in range(top_k):
+                    idx = int(router_indices[i])
+                    expert_output[i].add_(down_bias[idx])
         if top_k == 1:
             return (expert_output * router_scores[0]).to(dtype=hidden.dtype)
+        elif self.kernel_backend is not None:
+            return self.kernel_backend.weighted_expert_sum(
+                expert_output,
+                router_scores,
+                self._moe_combined_buffer,
+            )
         else:
             return torch.sum(
                 expert_output * router_scores[:, None],
@@ -6828,7 +8510,7 @@ class ThinGpuCausalLMRuntime:
             self._capture_debug(layer, "o_proj_output", attn_out)
             if getattr(self, "_profiler_enabled", False):
                 lev.o_proj_end.record()
-            if self.descriptor.model_type == "gemma2":
+            if self.uses_dual_post_norm:
                 attn_out = self._normalization(
                     attn_out,
                     _layer_tensor(
@@ -6850,7 +8532,7 @@ class ThinGpuCausalLMRuntime:
 
             mlp_norm_suffix = (
                 "pre_feedforward_layernorm.weight"
-                if self.descriptor.model_type == "gemma2"
+                if self.uses_dual_post_norm
                 else "post_attention_layernorm.weight"
             )
             normed = self._normalization(
@@ -6858,7 +8540,7 @@ class ThinGpuCausalLMRuntime:
                 _layer_tensor(layer, mlp_norm_suffix),
                 out=buffers.normed if buffers is not None else None,
             )
-            if self.descriptor.model_type == "gemma2":
+            if self.uses_dual_post_norm:
                 self._capture_debug(
                     layer,
                     "pre_feedforward_rmsnorm",
@@ -6961,7 +8643,7 @@ class ThinGpuCausalLMRuntime:
             if down_bias is not None:
                 mlp.add_(down_bias)
             self._capture_debug(layer, "down_projection", mlp)
-            if self.descriptor.model_type == "gemma2":
+            if self.uses_dual_post_norm:
                 mlp = self._normalization(
                     mlp,
                     _layer_tensor(
@@ -7627,15 +9309,27 @@ class ThinGpuCausalLMRuntime:
                     if bias is not None:
                         result.add_(bias)
                     return self._apply_final_logit_softcap(result)
-                result = self.kernel_backend.scaled_matvec(
-                    head,
-                    self._lm_head_scale,
-                    hidden,
-                    self._logits_buffer,
-                    config_name=(
-                        choice if choice.startswith("triton_loop_") else None
-                    ),
-                )
+                if self.lm_head_int4_enabled:
+                    rows, cols, group_size = self._int4_metadata[id(head)]
+                    result = self.kernel_backend.int4_scaled_matvec(
+                        head,
+                        self._lm_head_scale,
+                        hidden,
+                        self._logits_buffer,
+                        rows=rows,
+                        cols=cols,
+                        group_size=group_size,
+                    )
+                else:
+                    result = self.kernel_backend.scaled_matvec(
+                        head,
+                        self._lm_head_scale,
+                        hidden,
+                        self._logits_buffer,
+                        config_name=(
+                            choice if choice.startswith("triton_loop_") else None
+                        ),
+                    )
                 bias = _optional_tensor(self.weights, "lm_head.bias")
                 if bias is not None:
                     result.add_(bias)
@@ -8577,13 +10271,43 @@ class ThinGpuCausalLMRuntime:
         x: torch.Tensor,
         out: torch.Tensor,
     ) -> torch.Tensor:
+        rows = int(weight.shape[0])
+        cols = int(weight.shape[1])
+        if (rows < 128 or cols > 8192) and self._weight_scale(weight) is None:
+            if out is None:
+                out = torch.empty(rows, device=self.device, dtype=x.dtype)
+            torch.mv(weight, x, out=out)
+            self._record_streamed_tensor_use(weight)
+            return out
+
         if isinstance(self.weights, ThinGpuPagePool):
             page_id = self.weights._tensor_id_to_page_id.get(id(weight))
-            int4_cache = getattr(
-                self.weights, "_int4_metadata_by_page", {}
-            )
+            int4_cache = getattr(self.weights, "_int4_metadata_by_page", {})
+            mxfp4_cache = getattr(self.weights, "_mxfp4_metadata_by_page", {})
             if page_id in int4_cache:
                 self._int4_metadata[id(weight)] = int4_cache[page_id]
+                self._mxfp4_metadata.pop(id(weight), None)
+            elif page_id in mxfp4_cache:
+                metadata = mxfp4_cache[page_id]
+                rows, cols = metadata[:2]
+                hadamard_size = int(metadata[2]) if len(metadata) > 2 else 0
+                self._mxfp4_metadata[id(weight)] = (rows, cols, hadamard_size)
+                self._int4_metadata.pop(id(weight), None)
+                signs_cache = getattr(self.weights, "_mxfp4_hadamard_signs_by_page", {})
+                if page_id in signs_cache:
+                    self._mxfp4_hadamard_signs[id(weight)] = signs_cache[page_id]
+                else:
+                    self._mxfp4_hadamard_signs.pop(id(weight), None)
+                binary_cache = getattr(self.weights, "_mxfp4_binary_residuals_by_page", {})
+                if page_id in binary_cache:
+                    self._mxfp4_binary_residuals[id(weight)] = binary_cache[page_id]
+                else:
+                    self._mxfp4_binary_residuals.pop(id(weight), None)
+            else:
+                self._int4_metadata.pop(id(weight), None)
+                self._mxfp4_metadata.pop(id(weight), None)
+                self._mxfp4_hadamard_signs.pop(id(weight), None)
+                self._mxfp4_binary_residuals.pop(id(weight), None)
         mxfp4_meta = self._mxfp4_metadata.get(id(weight))
         if mxfp4_meta is not None:
             assert self.kernel_backend is not None
@@ -8746,6 +10470,7 @@ class ThinGpuCausalLMRuntime:
                     * scale.to(dtype=x.dtype)[:, None]
                 )
                 torch.mv(dequant, x, out=out)
+                self._record_streamed_tensor_use(weight, scale)
                 return out
             elif choice == "torch_matmul":
                 dequant = (
@@ -8753,6 +10478,7 @@ class ThinGpuCausalLMRuntime:
                     * scale.to(dtype=x.dtype)[:, None]
                 )
                 torch.matmul(dequant, x, out=out)
+                self._record_streamed_tensor_use(weight, scale)
                 return out
             elif choice == "triton":
                 assert self.kernel_backend is not None
@@ -8770,6 +10496,7 @@ class ThinGpuCausalLMRuntime:
                     self.kernel_backend.sparse_residual_matvec(
                         values, indices, x, result
                     )
+                self._record_streamed_tensor_use(weight, scale)
                 return result
             elif choice.startswith("triton_loop_"):
                 assert self.kernel_backend is not None
@@ -8788,6 +10515,7 @@ class ThinGpuCausalLMRuntime:
                     self.kernel_backend.sparse_residual_matvec(
                         values, indices, x, result
                     )
+                self._record_streamed_tensor_use(weight, scale)
                 return result
             else:
                 dequant = (
@@ -8795,38 +10523,46 @@ class ThinGpuCausalLMRuntime:
                     * scale.to(dtype=x.dtype)[:, None]
                 )
                 torch.mv(dequant, x, out=out)
+                self._record_streamed_tensor_use(weight, scale)
                 return out
 
         if choice is None:
             if self.kernel_backend is not None and self.use_triton_matvec:
-                return self.kernel_backend.matvec(
+                result = self.kernel_backend.matvec(
                     weight,
                     x,
                     out,
                     block_m=block_m,
                     num_warps=num_warps,
                 )
+                self._record_streamed_tensor_use(weight)
+                return result
             torch.mv(weight, x, out=out)
+            self._record_streamed_tensor_use(weight)
             return out
 
         if choice == "torch_mv":
             torch.mv(weight, x, out=out)
+            self._record_streamed_tensor_use(weight)
             return out
         elif choice == "torch_matmul":
             torch.matmul(weight, x, out=out)
+            self._record_streamed_tensor_use(weight)
             return out
         elif choice == "triton":
             assert self.kernel_backend is not None
-            return self.kernel_backend.matvec(
+            result = self.kernel_backend.matvec(
                 weight,
                 x,
                 out,
                 block_m=block_m,
                 num_warps=num_warps,
             )
+            self._record_streamed_tensor_use(weight)
+            return result
         elif choice.startswith("triton_loop_"):
             assert self.kernel_backend is not None
-            return self.kernel_backend.matvec(
+            result = self.kernel_backend.matvec(
                 weight,
                 x,
                 out,
@@ -8834,9 +10570,33 @@ class ThinGpuCausalLMRuntime:
                 block_m=block_m,
                 num_warps=num_warps,
             )
+            self._record_streamed_tensor_use(weight)
+            return result
         else:
             torch.mv(weight, x, out=out)
+            self._record_streamed_tensor_use(weight)
             return out
+
+    def _record_streamed_tensor_use(
+        self,
+        *tensors: torch.Tensor | None,
+    ) -> None:
+        if not isinstance(self.weights, ThinGpuPagePool):
+            return
+        stream: torch.cuda.Stream | None = None
+        event: torch.cuda.Event | None = None
+        for tensor in tensors:
+            if tensor is None or not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                continue
+            page_id = self.weights._tensor_id_to_page_id.get(id(tensor))
+            if page_id is None:
+                continue
+            if stream is None:
+                stream = torch.cuda.current_stream(tensor.device)
+                event = torch.cuda.Event()
+                event.record(stream)
+            tensor.record_stream(stream)
+            self.weights._page_use_events[page_id] = event
 
     def _large_matvec_config(
         self,
@@ -9098,22 +10858,43 @@ def benchmark_gpu_runtime(
     try:
         load_start = time.perf_counter()
         weights = ThinGpuWeights(archive_path, device=device, dtype=dtype)
-        runtime = ThinGpuCausalLMRuntime(weights)
+        model = weights.manifest["model"]
+        model_heads = int(model["heads"])
+        cache = PagedKVCache(
+            layers=int(model["layers"]),
+            kv_heads=int(model.get("kv_heads") or model_heads),
+            head_dim=int(
+                model.get("head_dim")
+                or int(model["hidden_size"]) // model_heads
+            ),
+            device=weights.device,
+            dtype=dtype or weights.tensor("model.norm.weight").dtype,
+            old_codec="bf16",
+        )
+        runtime = ThinGpuCausalLMRuntime(weights, kv_cache=cache)
         if device == "cuda":
             torch.cuda.synchronize()
         load_s = time.perf_counter() - load_start
 
         guard.raise_if_hot("before first forward")
         first_start = time.perf_counter()
-        hidden = runtime.forward_token(token_id, layers=layers)
+        hidden = runtime.forward_token(
+            token_id,
+            layers=layers,
+            token_index=0,
+        )
         if device == "cuda":
             torch.cuda.synchronize()
         first_s = time.perf_counter() - first_start
 
         guard.raise_if_hot("before timed loop")
         timed_start = time.perf_counter()
-        for _ in range(max(1, steps)):
-            hidden = runtime.forward_token(token_id, layers=layers)
+        for step in range(max(1, steps)):
+            hidden = runtime.forward_token(
+                token_id,
+                layers=layers,
+                token_index=step + 1,
+            )
         if device == "cuda":
             torch.cuda.synchronize()
         forward_s = time.perf_counter() - timed_start
@@ -9152,6 +10933,8 @@ def benchmark_gpu_runtime(
             "gpu_peak_reserved_bytes": _gpu_peak_reserved(device),
             "gpu_peak_temp_c": guard.peak_temp,
             "thermal_stop": guard.too_hot,
+            "attention_mode": runtime.attention_mode,
+            "kv_cache": cache.telemetry(),
             "top_logits": top_logits,
         }
         weights.close()
@@ -9292,19 +11075,36 @@ def _is_dense_projection(page_id: str) -> bool:
             "self_attn.v_proj.weight",
             "self_attn.qkv_proj.weight",
             "self_attn.o_proj.weight",
+            "linear_attn.in_proj_qkv.weight",
+            "linear_attn.in_proj_z.weight",
+            "linear_attn.out_proj.weight",
         )
     ) and ".experts." not in page_id
 
 
 def _is_separate_expert_page(page_id: str) -> bool:
+    def has_numbered_expert(marker: str) -> bool:
+        if marker not in page_id:
+            return False
+        tail = page_id.split(marker, 1)[1]
+        expert_id = tail.split(".", 1)[0]
+        return expert_id.isdigit()
+
     return (
-        ".mlp.experts." in page_id
-        or ".block_sparse_moe.experts." in page_id
+        has_numbered_expert(".mlp.experts.")
+        or has_numbered_expert(".block_sparse_moe.experts.")
         or (
             page_id.startswith("__runtime__.layer.")
             and ".experts." in page_id
         )
     )
+
+
+def _is_packed_expert_stream_page(page_id: str) -> bool:
+    if ".mlp.experts." not in page_id and ".block_sparse_moe.experts." not in page_id:
+        return False
+    leaf = page_id.rsplit(".", 1)[-1]
+    return leaf.endswith("_blocks") or leaf.endswith("_scales")
 
 
 def _is_separate_expert_weight(page_id: str) -> bool:

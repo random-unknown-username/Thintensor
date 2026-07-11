@@ -26,7 +26,11 @@ def test_shared_tensor_detection():
     tensors_by_checksum = {}
     
     # Simulate our aliasing loader
-    page_ids = [p["id"] for p in archive.manifest.get("pages", [])]
+    page_ids = [
+        page["id"]
+        for page in archive.manifest.get("pages", [])
+        if page.get("kind") != "fused_physical"
+    ]
     for page_id in page_ids:
         p_meta = archive.get_tensor_metadata(page_id)
         checksum = p_meta["checksum"]
@@ -46,11 +50,21 @@ def test_shared_tensor_detection():
     lm_head_name = "lm_head.weight"
     
     if embed_name in state_dict and lm_head_name in state_dict:
+        tied_by_content = (
+            archive.get_tensor_metadata(embed_name)["checksum"]
+            == archive.get_tensor_metadata(lm_head_name)["checksum"]
+            and tuple(state_dict[embed_name].shape)
+            == tuple(state_dict[lm_head_name].shape)
+        )
         is_aliased = state_dict[embed_name] is state_dict[lm_head_name]
         print(f"\nChecking aliasing for {embed_name} and {lm_head_name}:")
         print(f"  Same Python Object: {is_aliased}")
-        assert is_aliased, "Tensors with same checksum/shape are not aliased to the same object!"
-        print("SUCCESS: Shared tensor detection and aliasing works perfectly!")
+        if tied_by_content:
+            assert is_aliased, "Tensors with same checksum/shape are not aliased to the same object!"
+            print("SUCCESS: Shared tensor detection and aliasing works perfectly!")
+        else:
+            assert not is_aliased, "Distinct embedding/head tensors were incorrectly aliased"
+            print("SUCCESS: Distinct embedding/head tensors remain independent.")
     else:
         print(f"WARNING: embed_tokens or lm_head not found in state_dict. Found keys: {list(state_dict.keys())[:5]}")
 

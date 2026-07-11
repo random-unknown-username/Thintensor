@@ -297,6 +297,31 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     p_bench.add_argument("--max-gpu-temp", type=int, default=87)
+    p_bench.add_argument(
+        "--auto-search",
+        action="store_true",
+        help=(
+            "Probe multiple residency/quantization candidates in fresh "
+            "subprocesses, then benchmark the fastest successful command"
+        ),
+    )
+    p_bench.add_argument(
+        "--auto-search-steps",
+        type=int,
+        default=16,
+        help="Measured decode steps for each auto-search probe",
+    )
+    p_bench.add_argument(
+        "--auto-search-warmup",
+        type=int,
+        default=2,
+        help="Warmup decode steps for each auto-search probe",
+    )
+    p_bench.add_argument(
+        "--auto-search-out",
+        type=str,
+        help="Optional JSON file or directory for auto-search probe details",
+    )
     p_bench.add_argument("--json", action="store_true")
     p_bench.add_argument("--out", type=str, help="Write JSON results to this file or directory")
     p_bench.add_argument("--dry-run", action="store_true", help="Print commands without executing")
@@ -919,21 +944,42 @@ def cmd_bench(args: argparse.Namespace) -> None:
                 else f"[cyan]Running profile: {profile['name']}...[/cyan]"
             )
 
-        result = _run_benchmark_profile(
-            archive_path=archive_path,
-            profile=profile,
-            profile_name=profile["name"],
-            steps=args.steps,
-            warmup=args.warmup,
-            device=args.device,
-            dtype=args.dtype,
-            max_gpu_temp=args.max_gpu_temp,
-            dry_run=args.dry_run,
-            quiet=args.json,
-            residency=args.residency,
-            gpu_weight_budget=args.gpu_weight_budget,
-            auto_quant=args.auto_quant,
-        )
+        if args.auto_search:
+            result = _run_benchmark_profile_search(
+                archive_path=archive_path,
+                model=model,
+                profile=profile,
+                profile_name=profile["name"],
+                steps=args.steps,
+                warmup=args.warmup,
+                search_steps=args.auto_search_steps,
+                search_warmup=args.auto_search_warmup,
+                device=args.device,
+                dtype=args.dtype,
+                max_gpu_temp=args.max_gpu_temp,
+                dry_run=args.dry_run,
+                quiet=args.json,
+                residency=args.residency,
+                gpu_weight_budget=args.gpu_weight_budget,
+                auto_quant=args.auto_quant,
+                out=args.auto_search_out,
+            )
+        else:
+            result = _run_benchmark_profile(
+                archive_path=archive_path,
+                profile=profile,
+                profile_name=profile["name"],
+                steps=args.steps,
+                warmup=args.warmup,
+                device=args.device,
+                dtype=args.dtype,
+                max_gpu_temp=args.max_gpu_temp,
+                dry_run=args.dry_run,
+                quiet=args.json,
+                residency=args.residency,
+                gpu_weight_budget=args.gpu_weight_budget,
+                auto_quant=args.auto_quant,
+            )
         if result:
             results.append(result)
         if not args.json:
@@ -1016,21 +1062,51 @@ def cmd_validate(args: argparse.Namespace) -> None:
     )
     prefill_lens = "1,128" if args.suite == "quick" else "1,8,32,128"
     steps = "1,10" if args.suite == "quick" else "1,10,50"
-    runtime_flags = profile_to_runtime_flags(profile)
-    runtime_flags = [
-        flag for flag in runtime_flags if flag != "--keep-bf16-lm-head"
-    ]
+    auto_quant_mode = "autofit" if args.profile == "autofit" else "off"
     auto_fit_plan = _automatic_fit_plan(
         str(archive),
         device=args.device,
         context=128 if args.suite == "quick" else 512,
         budget_text="0",
-        auto_quant="off",
+        auto_quant=auto_quant_mode,
     )
+    profile = _profile_with_auto_fit(profile, auto_fit_plan)
+    runtime_flags = profile_to_runtime_flags(profile)
+    runtime_flags = [
+        flag for flag in runtime_flags if flag not in ("--keep-bf16-lm-head", "--lm-head-fp8")
+    ]
     if auto_fit_plan.residency == "stream" and not profile.get("exact_prefill", False):
         runtime_flags.extend([
             "--weight-residency", "stream",
             "--gpu-weight-budget", str(auto_fit_plan.weight_budget_bytes)
+        ])
+    if getattr(auto_fit_plan, "dense_int4", False):
+        runtime_flags.append("--dense-int4")
+        if auto_fit_plan.dense_int4_layer_spec:
+            runtime_flags.extend([
+                "--dense-int4-layers", auto_fit_plan.dense_int4_layer_spec
+            ])
+        runtime_flags.extend([
+            "--dense-int4-group-size", str(auto_fit_plan.dense_int4_group_size)
+        ])
+    if getattr(auto_fit_plan, "expert_int4", False):
+        runtime_flags.append("--expert-int4")
+        if auto_fit_plan.expert_int4_layer_spec:
+            runtime_flags.extend([
+                "--expert-int4-layers", auto_fit_plan.expert_int4_layer_spec
+            ])
+        runtime_flags.extend([
+            "--expert-int4-group-size", str(auto_fit_plan.expert_int4_group_size)
+        ])
+    if auto_fit_plan.packed_expert_q2_layer_spec:
+        runtime_flags.extend([
+            "--packed-expert-q2-layers",
+            auto_fit_plan.packed_expert_q2_layer_spec,
+        ])
+    if auto_fit_plan.packed_expert_q1_layer_spec:
+        runtime_flags.extend([
+            "--packed-expert-q1-layers",
+            auto_fit_plan.packed_expert_q1_layer_spec,
         ])
     report_path = Path(args.out)
     if not args.dry_run:
@@ -1751,10 +1827,11 @@ def _adapt_profile_for_device(
             "qkv_fp8",
             "o_proj_fp8",
             "lm_head_fp8",
+            "lm_head_int4_group_size",
         )
     ):
         raise ValueError(
-            "FP8 profiles require CUDA; use --profile bf16 on CPU"
+            "Approximate-weight profiles require CUDA; use --profile bf16 on CPU"
         )
     result = dict(profile)
     result["kernel_backend"] = "torch"
@@ -1816,13 +1893,72 @@ def _automatic_fit_plan(
     )
 
 
+def _profile_with_auto_fit(
+    profile: dict[str, Any],
+    auto_fit_plan: Any | None,
+) -> dict[str, Any]:
+    if auto_fit_plan is None or not (
+        getattr(auto_fit_plan, "dense_fp8", False)
+        or getattr(auto_fit_plan, "dense_int4", False)
+        or getattr(auto_fit_plan, "lm_head_fp8", False)
+    ):
+        return profile
+    result = dict(profile)
+    for key in (
+        "gate_up_fp8",
+        "down_proj_fp8",
+        "qkv_fp8",
+        "o_proj_fp8",
+    ):
+        result[key] = False
+    for key in (
+        "fp8_layer_spec",
+        "down_fp8_layer_spec",
+        "qkv_fp8_layer_spec",
+        "o_fp8_layer_spec",
+    ):
+        result.pop(key, None)
+    if getattr(auto_fit_plan, "dense_fp8", False):
+        layer_spec = auto_fit_plan.dense_fp8_layer_spec
+        packed_expert_plan = bool(
+            getattr(auto_fit_plan, "packed_expert_q2_layers", ())
+        )
+        sparse_expert_plan = bool(
+            getattr(auto_fit_plan, "expert_int4", False)
+        )
+        result.update(
+            {
+                "gate_up_fp8": not (
+                    packed_expert_plan or sparse_expert_plan
+                ),
+                "down_proj_fp8": not (
+                    packed_expert_plan or sparse_expert_plan
+                ),
+                "qkv_fp8": True,
+                "o_proj_fp8": True,
+                "fp8_layer_spec": layer_spec,
+                "down_fp8_layer_spec": layer_spec,
+                "qkv_fp8_layer_spec": layer_spec,
+                "o_fp8_layer_spec": layer_spec,
+            }
+        )
+    if getattr(auto_fit_plan, "lm_head_fp8", False):
+        result["lm_head_fp8"] = True
+        result["keep_bf16_lm_head"] = False
+        result["lm_head_topk_guard"] = 0
+        result["lm_head_int4_group_size"] = 0
+    return result
+
+
 def _profile_auto_quant_mode(profile: dict[str, Any], requested: str) -> str:
     if requested != "auto":
         return requested
     preferred = profile.get("preferred_auto_quant")
-    if preferred in {"off", "on", "aggressive"}:
+    if preferred in {"off", "on", "aggressive", "autofit"}:
         return str(preferred)
     name = str(profile.get("name") or "balanced")
+    if name == "autofit":
+        return "autofit"
     if name in {"safe", "lab"}:
         return "off"
     if name in {"max-performance", "max-max-perf"}:
@@ -2286,10 +2422,17 @@ def _run_inference(
             device=device,
             context=context,
             budget_text=gpu_weight_budget,
-            auto_quant="off",
+            auto_quant=auto_quant,
         )
+    profile = _profile_with_auto_fit(profile, auto_fit_plan)
 
-    if weight_residency == "stream":
+    needs_quantized_pool = auto_fit_plan is not None and bool(
+        auto_fit_plan.expert_int4
+        or auto_fit_plan.dense_fp8
+        or auto_fit_plan.dense_int4
+        or auto_fit_plan.packed_expert_q2_layers
+    )
+    if weight_residency == "stream" or needs_quantized_pool:
         budget = (
             auto_fit_plan.weight_budget_bytes
             if auto_fit_plan is not None
@@ -2299,18 +2442,6 @@ def _run_inference(
             raise ValueError(
                 "streaming requires a positive device budget after KV and runtime reserves"
             )
-        if auto_fit_plan is not None and auto_fit_plan.dense_fp8:
-            profile = {
-                **profile,
-                "gate_up_fp8": True,
-                "down_proj_fp8": True,
-                "qkv_fp8": True,
-                "o_proj_fp8": True,
-                "down_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-                "fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-                "qkv_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-                "o_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-            }
         weights = ThinGpuPagePool(
             archive_path,
             device=device,
@@ -2323,10 +2454,15 @@ def _run_inference(
             gate_up_fp8=bool(profile.get("gate_up_fp8")),
             qkv_fp8=bool(profile.get("qkv_fp8")),
             o_proj_fp8=bool(profile.get("o_proj_fp8")),
+            embed_fp8=bool(profile.get("embed_fp8")),
             down_fp8_layer_spec=profile.get("down_fp8_layer_spec"),
             fp8_layer_spec=profile.get("fp8_layer_spec"),
             qkv_fp8_layer_spec=profile.get("qkv_fp8_layer_spec"),
             o_fp8_layer_spec=profile.get("o_fp8_layer_spec"),
+            lm_head_fp8=bool(profile.get("lm_head_fp8")),
+            lm_head_int4_group_size=int(
+                profile.get("lm_head_int4_group_size") or 0
+            ),
             expert_int4=bool(
                 auto_fit_plan is not None and auto_fit_plan.expert_int4
             ),
@@ -2353,6 +2489,14 @@ def _run_inference(
                 if auto_fit_plan is not None
                 else 32
             ),
+            packed_expert_q2_layer_spec=(
+                auto_fit_plan.packed_expert_q2_layer_spec
+                if auto_fit_plan is not None else None
+            ),
+            packed_expert_q1_layer_spec=(
+                auto_fit_plan.packed_expert_q1_layer_spec
+                if auto_fit_plan is not None else None
+            ),
         )
         weights.warm_start()
     else:
@@ -2377,7 +2521,12 @@ def _run_inference(
 
     runtime_kwargs = profile_to_runtime_kwargs(profile)
     exact_prefill = bool(profile.get("exact_prefill"))
-    if auto_fit_plan is not None and (auto_fit_plan.expert_int4 or auto_fit_plan.dense_fp8 or auto_fit_plan.dense_int4):
+    if auto_fit_plan is not None and (
+        auto_fit_plan.expert_int4
+        or auto_fit_plan.dense_fp8
+        or auto_fit_plan.dense_int4
+        or auto_fit_plan.packed_expert_q2_layers
+    ):
         exact_prefill = False
         runtime_kwargs["adaptive_body_int8_start_token"] = -1
     if exact_prefill:
@@ -2608,22 +2757,20 @@ def _run_chat_loop(
             device=device,
             context=context,
             budget_text=gpu_weight_budget,
-            auto_quant="off",
+            auto_quant=auto_quant,
         )
-    if weight_residency == "stream":
-        assert auto_fit_plan is not None
-        if auto_fit_plan.dense_fp8:
-            profile = {
-                **profile,
-                "gate_up_fp8": True,
-                "down_proj_fp8": True,
-                "qkv_fp8": True,
-                "o_proj_fp8": True,
-                "fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-                "down_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-                "qkv_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-                "o_fp8_layer_spec": auto_fit_plan.dense_fp8_layer_spec,
-            }
+    profile = _profile_with_auto_fit(profile, auto_fit_plan)
+    needs_quantized_pool = auto_fit_plan is not None and bool(
+        auto_fit_plan.expert_int4
+        or auto_fit_plan.dense_fp8
+        or auto_fit_plan.dense_int4
+        or auto_fit_plan.packed_expert_q2_layers
+    )
+    if weight_residency == "stream" or needs_quantized_pool:
+        if auto_fit_plan is None:
+            raise ValueError(
+                "streaming requires an automatic fit plan and positive budget"
+            )
         weights = ThinGpuPagePool(
             archive_path,
             device=device,
@@ -2634,13 +2781,23 @@ def _run_chat_loop(
             gate_up_fp8=bool(profile.get("gate_up_fp8")),
             qkv_fp8=bool(profile.get("qkv_fp8")),
             o_proj_fp8=bool(profile.get("o_proj_fp8")),
+            embed_fp8=bool(profile.get("embed_fp8")),
             fp8_layer_spec=profile.get("fp8_layer_spec"),
             down_fp8_layer_spec=profile.get("down_fp8_layer_spec"),
             qkv_fp8_layer_spec=profile.get("qkv_fp8_layer_spec"),
             o_fp8_layer_spec=profile.get("o_fp8_layer_spec"),
+            lm_head_fp8=bool(profile.get("lm_head_fp8")),
+            lm_head_int4_group_size=int(
+                profile.get("lm_head_int4_group_size") or 0
+            ),
             expert_int4=auto_fit_plan.expert_int4,
             expert_int4_layer_spec=auto_fit_plan.expert_int4_layer_spec,
             expert_int4_group_size=auto_fit_plan.expert_int4_group_size,
+            dense_int4=auto_fit_plan.dense_int4,
+            dense_int4_layer_spec=auto_fit_plan.dense_int4_layer_spec,
+            dense_int4_group_size=auto_fit_plan.dense_int4_group_size,
+            packed_expert_q2_layer_spec=auto_fit_plan.packed_expert_q2_layer_spec,
+            packed_expert_q1_layer_spec=auto_fit_plan.packed_expert_q1_layer_spec,
         )
         weights.warm_start()
     else:
@@ -2662,6 +2819,14 @@ def _run_chat_loop(
 
     runtime_kwargs = profile_to_runtime_kwargs(profile)
     exact_prefill = bool(profile.get("exact_prefill"))
+    if auto_fit_plan is not None and (
+        auto_fit_plan.expert_int4
+        or auto_fit_plan.dense_fp8
+        or auto_fit_plan.dense_int4
+        or auto_fit_plan.packed_expert_q2_layers
+    ):
+        exact_prefill = False
+        runtime_kwargs["adaptive_body_int8_start_token"] = -1
     if exact_prefill and weight_residency != "all":
         weights.close()
         raise ValueError("exact prefill currently requires all-resident weights")
@@ -2881,6 +3046,10 @@ def _run_benchmark_profile(
     residency: str,
     gpu_weight_budget: str,
     auto_quant: str,
+    extra_env: Mapping[str, str] | None = None,
+    extra_flags: list[str] | None = None,
+    fixed_gpu_weight_budget: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> Optional[dict]:
     """Run the trusted real causal-KV decode benchmark in a fresh process."""
     from .profile_presets import (
@@ -2888,14 +3057,14 @@ def _run_benchmark_profile(
         subprocess_environment,
     )
 
-    runtime_flags = [
-        flag
-        for flag in profile_to_runtime_flags(profile)
-        if flag != "--exact-prefill"
-    ]
     auto_fit_plan = None
     effective_residency = residency
     auto_quant = _profile_auto_quant_mode(profile, auto_quant)
+    fixed_gpu_weight_budget_bytes = (
+        _parse_bytes(fixed_gpu_weight_budget)
+        if fixed_gpu_weight_budget
+        else 0
+    )
     if residency == "auto":
         auto_fit_plan = _automatic_fit_plan(
             archive_path,
@@ -2905,14 +3074,29 @@ def _run_benchmark_profile(
             auto_quant=auto_quant,
         )
         effective_residency = auto_fit_plan.residency
-    elif residency == "stream":
+    elif residency == "stream" and fixed_gpu_weight_budget_bytes <= 0:
         auto_fit_plan = _automatic_fit_plan(
             archive_path,
             device=device,
             context=max(512, steps + warmup + 1),
             budget_text=gpu_weight_budget,
-            auto_quant="off",
+            auto_quant=auto_quant,
         )
+    if auto_fit_plan is not None and (
+        auto_fit_plan.expert_int4
+        or auto_fit_plan.dense_fp8
+        or auto_fit_plan.dense_int4
+        or auto_fit_plan.packed_expert_q2_layers
+    ):
+        # Runtime requantization is implemented by the page pool. An "all"
+        # fit therefore means a fully pinned pool, not the exact-weight loader.
+        effective_residency = "stream"
+    profile = _profile_with_auto_fit(profile, auto_fit_plan)
+    runtime_flags = [
+        flag
+        for flag in profile_to_runtime_flags(profile)
+        if flag != "--exact-prefill"
+    ]
     command = [
         sys.executable,
         str(_tool_script("thin_runtime.py")),
@@ -2934,15 +3118,23 @@ def _run_benchmark_profile(
         str(max_gpu_temp),
         "--json",
         *runtime_flags,
+        *(extra_flags or []),
     ]
-    if auto_fit_plan is not None and effective_residency == "stream":
+    if effective_residency == "stream" and (
+        auto_fit_plan is not None or fixed_gpu_weight_budget_bytes > 0
+    ):
+        weight_budget_bytes = (
+            fixed_gpu_weight_budget_bytes
+            if fixed_gpu_weight_budget_bytes > 0
+            else auto_fit_plan.weight_budget_bytes  # type: ignore[union-attr]
+        )
         command.extend(
             [
                 "--gpu-weight-budget",
-                str(auto_fit_plan.weight_budget_bytes),
+                str(weight_budget_bytes),
             ]
         )
-        if auto_fit_plan.expert_int4:
+        if auto_fit_plan is not None and auto_fit_plan.expert_int4:
             command.append("--expert-int4")
             if auto_fit_plan.expert_int4_layer_spec:
                 command.extend(
@@ -2957,20 +3149,33 @@ def _run_benchmark_profile(
                     str(auto_fit_plan.expert_int4_group_size),
                 ]
             )
-        if auto_fit_plan.dense_fp8:
-            layer_spec = auto_fit_plan.dense_fp8_layer_spec
+        if auto_fit_plan is not None and auto_fit_plan.dense_int4:
+            command.append("--dense-int4")
+            if auto_fit_plan.dense_int4_layer_spec:
+                command.extend(
+                    [
+                        "--dense-int4-layers",
+                        auto_fit_plan.dense_int4_layer_spec,
+                    ]
+                )
             command.extend(
                 [
-                    "--mlp-fp8",
-                    "--attn-proj-fp8",
-                    "--fp8-layers",
-                    str(layer_spec),
-                    "--down-fp8-layers",
-                    str(layer_spec),
-                    "--qkv-fp8-layers",
-                    str(layer_spec),
-                    "--o-fp8-layers",
-                    str(layer_spec),
+                    "--dense-int4-group-size",
+                    str(auto_fit_plan.dense_int4_group_size),
+                ]
+            )
+        if auto_fit_plan is not None and auto_fit_plan.packed_expert_q2_layer_spec:
+            command.extend(
+                [
+                    "--packed-expert-q2-layers",
+                    auto_fit_plan.packed_expert_q2_layer_spec,
+                ]
+            )
+        if auto_fit_plan is not None and auto_fit_plan.packed_expert_q1_layer_spec:
+            command.extend(
+                [
+                    "--packed-expert-q1-layers",
+                    auto_fit_plan.packed_expert_q1_layer_spec,
                 ]
             )
     if profile.get("experimental_int8_tensorcore"):
@@ -2980,12 +3185,22 @@ def _run_benchmark_profile(
             "profile": profile_name,
             "engine": "thintensor",
             "command": command,
+            "env_overrides": dict(extra_env or {}),
+            "runtime_extra_flags": list(extra_flags or []),
+            "fixed_gpu_weight_budget": fixed_gpu_weight_budget,
+            "auto_fit": (
+                auto_fit_plan.as_dict() if auto_fit_plan is not None else None
+            ),
             "dry_run": True,
+            **(metadata or {}),
         }
     completed = subprocess.run(
         command,
         cwd=Path.cwd(),
-        env=subprocess_environment(profile),
+        env={
+            **subprocess_environment(profile),
+            **({} if extra_env is None else dict(extra_env)),
+        },
         text=True,
         capture_output=True,
         check=False,
@@ -2996,7 +3211,12 @@ def _run_benchmark_profile(
         return {
             "profile": profile_name,
             "error": f"benchmark exited with status {completed.returncode}",
+            "stderr_tail": completed.stderr[-8000:] if completed.stderr else "",
             "command": command,
+            "env_overrides": dict(extra_env or {}),
+            "runtime_extra_flags": list(extra_flags or []),
+            "fixed_gpu_weight_budget": fixed_gpu_weight_budget,
+            **(metadata or {}),
         }
     try:
         raw = _parse_json_stdout(completed.stdout)
@@ -3005,16 +3225,54 @@ def _run_benchmark_profile(
             "profile": profile_name,
             "error": f"benchmark returned invalid JSON: {exc}",
             "command": command,
+            "env_overrides": dict(extra_env or {}),
+            "runtime_extra_flags": list(extra_flags or []),
+            "fixed_gpu_weight_budget": fixed_gpu_weight_budget,
+            **(metadata or {}),
         }
+    gpu_cache = raw.get("gpu_cache") if isinstance(raw, dict) else None
+    if not isinstance(gpu_cache, dict):
+        page_pool = raw.get("page_pool") if isinstance(raw, dict) else None
+        gpu_cache = (
+            page_pool.get("gpu_cache", {})
+            if isinstance(page_pool, dict)
+            else {}
+        )
+    bytes_moved_per_token = raw.get("bytes_moved_per_token")
+    if (
+        not isinstance(bytes_moved_per_token, (int, float))
+        or float(bytes_moved_per_token) <= 0.0
+    ):
+        bytes_moved_per_token = gpu_cache.get("h2d_transfer_bytes_per_token")
+    effective_bandwidth = raw.get("effective_bandwidth_gb_s")
+    if (
+        not isinstance(effective_bandwidth, (int, float))
+        or float(effective_bandwidth) <= 0.0
+    ):
+        h2d_bytes = gpu_cache.get("h2d_transfer_bytes")
+        h2d_ms = gpu_cache.get("h2d_transfer_time_ms")
+        if (
+            isinstance(h2d_bytes, (int, float))
+            and isinstance(h2d_ms, (int, float))
+            and h2d_ms > 0
+        ):
+            effective_bandwidth = float(h2d_bytes) / (float(h2d_ms) / 1000.0) / 1e9
     return {
         "profile": profile_name,
         "engine": "thintensor",
+        "command": command,
+        "env_overrides": dict(extra_env or {}),
+        "runtime_extra_flags": list(extra_flags or []),
+        "fixed_gpu_weight_budget": fixed_gpu_weight_budget,
         "tokens_per_s": raw.get("tokens_per_s"),
         "ms_per_token": raw.get("ms_per_token"),
         "resident_weight_bytes": raw.get("resident_weight_bytes"),
         "gpu_peak_allocated_bytes": raw.get("gpu_peak_allocated_bytes"),
-        "effective_bandwidth_gb_s": raw.get("effective_bandwidth_gb_s"),
-        "bytes_moved_per_token": raw.get("bytes_moved_per_token"),
+        "effective_bandwidth_gb_s": effective_bandwidth,
+        "bytes_moved_per_token": bytes_moved_per_token,
+        "h2d_transfer_bytes_per_token": gpu_cache.get(
+            "h2d_transfer_bytes_per_token"
+        ),
         "steps": raw.get("steps"),
         "warmup_steps": raw.get("warmup_steps"),
         "auto_fit": (
@@ -3028,6 +3286,7 @@ def _run_benchmark_profile(
             if steps >= 200 and warmup >= 10
             else "smoke run only; use at least 10 warmup and 200 measured steps"
         ),
+        **(metadata or {}),
         "raw": raw,
     }
 
@@ -3110,6 +3369,642 @@ def _run_transformers_benchmark(
     }
 
 
+def _run_benchmark_profile_search(
+    *,
+    archive_path: str,
+    model: dict[str, Any],
+    profile: dict,
+    profile_name: str,
+    steps: int,
+    warmup: int,
+    search_steps: int,
+    search_warmup: int,
+    device: str,
+    dtype: str,
+    max_gpu_temp: int,
+    dry_run: bool,
+    quiet: bool,
+    residency: str,
+    gpu_weight_budget: str,
+    auto_quant: str,
+    out: str | None,
+) -> Optional[dict]:
+    if search_steps < 1 or search_warmup < 0:
+        raise SystemExit("--auto-search-steps must be positive and --auto-search-warmup non-negative")
+
+    candidates = _auto_search_candidates(
+        profile=profile,
+        model=model,
+        residency=residency,
+        gpu_weight_budget=gpu_weight_budget,
+        auto_quant=auto_quant,
+        device=device,
+    )
+    probes: list[dict[str, Any]] = []
+    probe_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    dry_run_commands: list[list[str]] = []
+    seen_commands: dict[str, str] = {}
+    for candidate in candidates:
+        common = {
+            "archive_path": archive_path,
+            "profile": candidate["profile"],
+            "profile_name": f"{profile_name}/{candidate['name']}",
+            "device": device,
+            "dtype": dtype,
+            "max_gpu_temp": max_gpu_temp,
+            "quiet": True,
+            "residency": candidate["residency"],
+            "gpu_weight_budget": candidate["gpu_weight_budget"],
+            "auto_quant": candidate["auto_quant"],
+            "extra_env": candidate.get("env"),
+            "extra_flags": candidate.get("extra_flags"),
+            "fixed_gpu_weight_budget": candidate.get(
+                "fixed_gpu_weight_budget"
+            ),
+            "metadata": {
+                "auto_search_candidate": candidate["name"],
+                "auto_search_probe": True,
+                "auto_search_reason": candidate["reason"],
+            },
+        }
+        planned = _run_benchmark_profile(
+            steps=search_steps,
+            warmup=search_warmup,
+            dry_run=True,
+            **common,
+        )
+        if planned is None:
+            continue
+        command_key = json.dumps(
+            {
+                "command": planned.get("command"),
+                "env": planned.get("env_overrides", {}),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        duplicate_of = seen_commands.get(command_key)
+        if duplicate_of is not None:
+            summary_row = _auto_search_probe_summary(planned)
+            summary_row["skipped_duplicate_of"] = duplicate_of
+            probes.append(summary_row)
+            continue
+        seen_commands[command_key] = candidate["name"]
+
+        if dry_run:
+            probe = planned
+        else:
+            probe = _run_benchmark_profile(
+                steps=search_steps,
+                warmup=search_warmup,
+                dry_run=False,
+                **common,
+            )
+        if probe is None:
+            continue
+        summary_row = _auto_search_probe_summary(probe)
+        probes.append(summary_row)
+        probe_pairs.append((candidate, summary_row))
+        if probe.get("dry_run") and probe.get("command"):
+            dry_run_commands.append(probe["command"])
+
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "profile": profile_name,
+        "probe_steps": search_steps,
+        "probe_warmup": search_warmup,
+        "candidate_count": len(candidates),
+        "unique_command_count": len(seen_commands),
+        "probes": probes,
+    }
+    if dry_run:
+        result = {
+            "profile": profile_name,
+            "engine": "thintensor",
+            "dry_run": True,
+            "command": dry_run_commands[0] if dry_run_commands else [],
+            "commands": dry_run_commands,
+            "auto_search": summary,
+        }
+        _write_auto_search_summary(out, profile_name, summary)
+        return result
+
+    successful = [
+        (candidate, probe)
+        for candidate, probe in probe_pairs
+        if not probe.get("error")
+        and isinstance(_probe_speed(probe), (int, float))
+        and float(_probe_speed(probe)) > 0.0
+    ]
+    if not successful:
+        summary["selected"] = None
+        summary["error"] = "all auto-search candidates failed"
+        _write_auto_search_summary(out, profile_name, summary)
+        return {
+            "profile": profile_name,
+            "engine": "thintensor",
+            "error": "all auto-search candidates failed",
+            "auto_search": summary,
+        }
+
+    max_probe_speed = max(
+        float(_probe_speed(probe) or 0.0) for _, probe in successful
+    )
+    ranked_successful = sorted(
+        successful,
+        key=lambda item: _auto_search_rank_key(
+            item[0],
+            item[1],
+            max_probe_speed=max_probe_speed,
+        ),
+        reverse=True,
+    )
+    summary["final_attempts"] = []
+    final: Optional[dict[str, Any]] = None
+    best_candidate: dict[str, Any] | None = None
+    best_probe: dict[str, Any] | None = None
+    for candidate, probe in ranked_successful:
+        attempt = {
+            "candidate": candidate["name"],
+            "probe_tokens_per_s": _probe_speed(probe),
+        }
+        summary["final_attempts"].append(attempt)
+        selected_final = _run_benchmark_profile(
+            archive_path=archive_path,
+            profile=candidate["profile"],
+            profile_name=profile_name,
+            steps=steps,
+            warmup=warmup,
+            device=device,
+            dtype=dtype,
+            max_gpu_temp=max_gpu_temp,
+            dry_run=False,
+            quiet=quiet,
+            residency=candidate["residency"],
+            gpu_weight_budget=candidate["gpu_weight_budget"],
+            auto_quant=candidate["auto_quant"],
+            extra_env=candidate.get("env"),
+            extra_flags=candidate.get("extra_flags"),
+            fixed_gpu_weight_budget=candidate.get(
+                "fixed_gpu_weight_budget"
+            ),
+            metadata={
+                "auto_search_selected": candidate["name"],
+                "auto_search_selected_reason": candidate["reason"],
+            },
+        )
+        if selected_final is None:
+            attempt["error"] = "selected candidate produced no result"
+            continue
+        if selected_final.get("error"):
+            attempt["error"] = selected_final.get("error")
+            continue
+        attempt["tokens_per_s"] = selected_final.get("tokens_per_s")
+        final = selected_final
+        best_candidate = candidate
+        best_probe = probe
+        break
+    if final is None or best_candidate is None or best_probe is None:
+        summary["selected"] = None
+        summary["final_error"] = "all successful probes failed final rerun"
+        _write_auto_search_summary(out, profile_name, summary)
+        return {
+            "profile": profile_name,
+            "engine": "thintensor",
+            "error": "all successful probes failed final rerun",
+            "auto_search": summary,
+        }
+    summary["selected"] = best_candidate["name"]
+    summary["selected_reason"] = best_candidate["reason"]
+    summary["selected_probe"] = best_probe
+    final["auto_search"] = summary
+    _write_auto_search_summary(out, profile_name, summary)
+    return final
+
+
+def _auto_search_candidates(
+    *,
+    profile: dict[str, Any],
+    model: dict[str, Any],
+    residency: str,
+    gpu_weight_budget: str,
+    auto_quant: str,
+    device: str,
+) -> list[dict[str, Any]]:
+    layers = int(model.get("layers") or model.get("num_hidden_layers") or 0)
+    stream_budget = gpu_weight_budget or "0"
+    device_total_bytes = _cuda_total_bytes(device)
+    is_moe = int(
+        model.get("num_local_experts")
+        or model.get("num_experts")
+        or 0
+    ) > 0
+    candidates: list[dict[str, Any]] = []
+
+    def add(
+        name: str,
+        candidate_profile: dict[str, Any],
+        *,
+        candidate_residency: str,
+        candidate_auto_quant: str,
+        reason: str,
+        env: Mapping[str, str] | None = None,
+        extra_flags: list[str] | None = None,
+        fixed_gpu_weight_budget: str | None = None,
+    ) -> None:
+        candidates.append(
+            {
+                "name": name,
+                "profile": candidate_profile,
+                "residency": candidate_residency,
+                "gpu_weight_budget": stream_budget,
+                "auto_quant": candidate_auto_quant,
+                "env": dict(env or {}),
+                "extra_flags": list(extra_flags or []),
+                "fixed_gpu_weight_budget": fixed_gpu_weight_budget,
+                "reason": reason,
+            }
+        )
+
+    add(
+        "profile-default",
+        dict(profile),
+        candidate_residency=residency,
+        candidate_auto_quant=auto_quant,
+        reason="the requested profile and auto-quant policy",
+    )
+    add(
+        "auto-fit-quality",
+        dict(profile),
+        candidate_residency="auto" if residency == "auto" else residency,
+        candidate_auto_quant="on",
+        reason="quality-biased automatic fit plan",
+    )
+    add(
+        "auto-fit-aggressive",
+        dict(profile),
+        candidate_residency="auto" if residency == "auto" else residency,
+        candidate_auto_quant="aggressive",
+        reason="aggressive automatic fit plan",
+    )
+
+    if is_moe:
+        native_moe = _native_moe_profile(profile)
+        native_moe_int4_head = _native_moe_profile(profile)
+        native_moe_int4_head.update(
+            {
+                "lm_head_fp8": False,
+                "lm_head_int4_group_size": 128,
+            }
+        )
+        add(
+            "native-moe-stream-pageable",
+            native_moe,
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason="stream native packed MoE weights with direct pageable staging",
+            extra_flags=["--no-pinned-staging"],
+        )
+        add(
+            "native-moe-embed-fp8-stream-pageable",
+            native_moe,
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason=(
+                "stream native packed MoE weights with FP8 lm head, "
+                "scaled FP8 embeddings, and direct pageable staging"
+            ),
+            extra_flags=["--embed-fp8", "--no-pinned-staging"],
+        )
+        add(
+            "native-moe-embed-int4-head-stream-pageable",
+            native_moe_int4_head,
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason=(
+                "stream native packed MoE weights with grouped INT4 lm head, "
+                "scaled FP8 embeddings, and direct pageable staging"
+            ),
+            extra_flags=["--embed-fp8", "--no-pinned-staging"],
+        )
+        budget_base_name = "native-moe-embed-fp8-stream-pageable"
+        budget_profile = native_moe
+        budget_reason = (
+            "stream native packed MoE weights with FP8 lm head and "
+            "scaled FP8 embeddings"
+        )
+    else:
+        full_fp8 = _body_fp8_profile(profile, layer_spec=None)
+        add(
+            "body-fp8-stream",
+            full_fp8,
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason="stream all dense body projections as FP8 without INT4",
+        )
+        add(
+            "body-fp8-stream-pageable",
+            full_fp8,
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason="same FP8 stream plan using direct pageable staging",
+            extra_flags=["--no-pinned-staging"],
+        )
+        add(
+            "body-embed-fp8-stream-pageable",
+            full_fp8,
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason=(
+                "stream FP8 body projections and store the shared "
+                "embedding/execution head as scaled FP8"
+            ),
+            extra_flags=["--embed-fp8", "--no-pinned-staging"],
+        )
+        budget_base_name = "body-embed-fp8-stream-pageable"
+        budget_profile = full_fp8
+        budget_reason = (
+            "stream FP8 body projections and scaled FP8 embeddings"
+        )
+    for label, reserve_mib in (("safe", 576), ("tight", 448)):
+        if device_total_bytes <= 0:
+            continue
+        budget_bytes = max(0, device_total_bytes - reserve_mib * 1024**2)
+        if budget_bytes <= 0:
+            continue
+        add(
+            f"{budget_base_name}-{label}-budget",
+            budget_profile,
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason=(
+                f"{budget_reason} "
+                f"with {reserve_mib} MiB reserved for non-weight runtime memory"
+            ),
+            extra_flags=["--embed-fp8", "--no-pinned-staging"],
+            fixed_gpu_weight_budget=str(budget_bytes),
+        )
+
+    if is_moe and device_total_bytes > 0:
+        high_residency_budget = max(
+            0,
+            min(device_total_bytes - 96 * 1024**2, 8_000_000_000),
+        )
+        if high_residency_budget > 0:
+            add(
+                "native-moe-embed-int4-head-stream-pageable-high-budget",
+                native_moe_int4_head,
+                candidate_residency="stream",
+                candidate_auto_quant="off",
+                reason=(
+                    "stream native packed MoE weights with grouped INT4 lm head "
+                    "and the highest measured stable low-VRAM residency budget"
+                ),
+                extra_flags=["--embed-fp8", "--no-pinned-staging"],
+                fixed_gpu_weight_budget=str(high_residency_budget),
+            )
+
+    if not is_moe:
+        for fraction, label in ((0.75, "middle75"), (0.50, "middle50")):
+            layer_spec = _middle_layer_spec(layers, fraction)
+            if layer_spec:
+                add(
+                    f"body-fp8-{label}-stream",
+                    _body_fp8_profile(profile, layer_spec=layer_spec),
+                    candidate_residency="stream",
+                    candidate_auto_quant="off",
+                    reason=f"stream FP8 body projections only on layers {layer_spec}",
+                )
+
+        add(
+            "mlp-fp8-stream",
+            _projection_fp8_profile(profile, mlp=True, attention=False),
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason="stream MLP projections as FP8 and leave attention projections exact",
+        )
+        add(
+            "attention-fp8-stream",
+            _projection_fp8_profile(profile, mlp=False, attention=True),
+            candidate_residency="stream",
+            candidate_auto_quant="off",
+            reason="stream QKV/O projections as FP8 and leave MLP projections exact",
+        )
+
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for candidate in candidates:
+        key = json.dumps(
+            {
+                "profile": candidate["profile"],
+                "residency": candidate["residency"],
+                "budget": candidate["gpu_weight_budget"],
+                "auto_quant": candidate["auto_quant"],
+                "env": candidate["env"],
+                "extra_flags": candidate["extra_flags"],
+                "fixed_gpu_weight_budget": candidate[
+                    "fixed_gpu_weight_budget"
+                ],
+            },
+            sort_keys=True,
+            default=str,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _cuda_total_bytes(device: str) -> int:
+    if device != "cuda":
+        return 0
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        return int(torch.cuda.mem_get_info()[1])
+    except Exception:
+        return 0
+
+
+def _native_moe_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(profile)
+    result.update(
+        {
+            "gate_up_fp8": False,
+            "down_proj_fp8": False,
+            "qkv_fp8": False,
+            "o_proj_fp8": False,
+            "lm_head_fp8": True,
+            "lm_head_int4_group_size": 0,
+            "keep_bf16_lm_head": False,
+            "lm_head_topk_guard": 0,
+            "adaptive_body_int8_start_token": -1,
+            "experimental_int8_tensorcore": False,
+            "fused_scaled_mlp": False,
+            "fused_residual_norm": False,
+            "fused_rope": False,
+            "attention_backend": "torch",
+            "kernel_backend": "triton-matvec",
+        }
+    )
+    for key in (
+        "fp8_layer_spec",
+        "down_fp8_layer_spec",
+        "qkv_fp8_layer_spec",
+        "o_fp8_layer_spec",
+    ):
+        result.pop(key, None)
+    return result
+
+
+def _body_fp8_profile(
+    profile: Mapping[str, Any],
+    *,
+    layer_spec: str | None,
+) -> dict[str, Any]:
+    result = dict(profile)
+    result.update(
+        {
+            "gate_up_fp8": True,
+            "down_proj_fp8": True,
+            "qkv_fp8": True,
+            "o_proj_fp8": True,
+            "lm_head_fp8": False,
+            "keep_bf16_lm_head": True,
+            "lm_head_topk_guard": 0,
+            "adaptive_body_int8_start_token": -1,
+            "experimental_int8_tensorcore": False,
+        }
+    )
+    for key in (
+        "fp8_layer_spec",
+        "down_fp8_layer_spec",
+        "qkv_fp8_layer_spec",
+        "o_fp8_layer_spec",
+    ):
+        if layer_spec:
+            result[key] = layer_spec
+        else:
+            result.pop(key, None)
+    return result
+
+
+def _projection_fp8_profile(
+    profile: Mapping[str, Any],
+    *,
+    mlp: bool,
+    attention: bool,
+) -> dict[str, Any]:
+    result = dict(profile)
+    result.update(
+        {
+            "gate_up_fp8": mlp,
+            "down_proj_fp8": mlp,
+            "qkv_fp8": attention,
+            "o_proj_fp8": attention,
+            "lm_head_fp8": False,
+            "keep_bf16_lm_head": True,
+            "lm_head_topk_guard": 0,
+            "adaptive_body_int8_start_token": -1,
+            "experimental_int8_tensorcore": False,
+        }
+    )
+    for key in (
+        "fp8_layer_spec",
+        "down_fp8_layer_spec",
+        "qkv_fp8_layer_spec",
+        "o_fp8_layer_spec",
+    ):
+        result.pop(key, None)
+    return result
+
+
+def _middle_layer_spec(layers: int, fraction: float) -> str | None:
+    if layers < 3:
+        return None
+    selectable = layers - 2
+    count = max(1, min(selectable, int(round(selectable * fraction))))
+    start = 1 + max(0, (selectable - count) // 2)
+    end = min(layers - 1, start + count)
+    if end <= start:
+        return None
+    return f"{start}:{end}"
+
+
+def _probe_speed(probe: Mapping[str, Any]) -> float | None:
+    raw = probe.get("raw")
+    steady = raw.get("steady_tokens_per_s") if isinstance(raw, Mapping) else None
+    speed = steady if steady is not None else probe.get("tokens_per_s")
+    return float(speed) if isinstance(speed, (int, float)) else None
+
+
+def _auto_search_rank_key(
+    candidate: Mapping[str, Any],
+    probe: Mapping[str, Any],
+    *,
+    max_probe_speed: float,
+) -> tuple[int, int, float]:
+    speed = float(_probe_speed(probe) or 0.0)
+    fixed_budget = _parse_bytes(str(candidate.get("fixed_gpu_weight_budget") or "0"))
+    # Short decode probes are intentionally cheap and therefore noisy. If a
+    # tighter resident-budget candidate is within 5% of the fastest probe, try
+    # it first and rely on final-rerun fallback if the budget was too tight.
+    in_speed_band = int(max_probe_speed <= 0.0 or speed >= max_probe_speed * 0.95)
+    return (in_speed_band, fixed_budget, speed)
+
+
+def _auto_search_probe_summary(row: Mapping[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw")
+    raw_mapping = raw if isinstance(raw, Mapping) else {}
+    return {
+        "candidate": row.get("auto_search_candidate"),
+        "reason": row.get("auto_search_reason"),
+        "error": row.get("error"),
+        "tokens_per_s": row.get("tokens_per_s"),
+        "steady_tokens_per_s": raw_mapping.get("steady_tokens_per_s"),
+        "ms_per_token": row.get("ms_per_token"),
+        "resident_weight_bytes": row.get("resident_weight_bytes"),
+        "gpu_peak_allocated_bytes": row.get("gpu_peak_allocated_bytes"),
+        "bytes_moved_per_token": row.get("bytes_moved_per_token"),
+        "effective_bandwidth_gb_s": row.get("effective_bandwidth_gb_s"),
+        "auto_fit": row.get("auto_fit"),
+        "command": row.get("command"),
+        "env_overrides": row.get("env_overrides", {}),
+        "runtime_extra_flags": row.get("runtime_extra_flags", []),
+        "warning": row.get("warning"),
+    }
+
+
+def _write_auto_search_summary(
+    out: str | None,
+    profile_name: str,
+    summary: Mapping[str, Any],
+) -> None:
+    if not out:
+        return
+    path = Path(out)
+    if path.suffix.lower() == ".json":
+        if path.exists() and path.is_dir():
+            path = path / f"{_slug(profile_name)}_auto_search.json"
+    else:
+        path = path / f"{_slug(profile_name)}_auto_search.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _slug(value: str) -> str:
+    return "".join(
+        character.lower() if character.isalnum() else "_"
+        for character in value
+    ).strip("_") or "profile"
+
+
 def _parse_json_stdout(stdout: str) -> Any:
     """Parse a tool result even when an upstream library logs to stdout."""
     try:
@@ -3151,7 +4046,12 @@ def _print_bench_table(results: list[dict], json_output: bool = False, out_dir: 
 
     if results and all(row.get("dry_run") for row in results):
         for row in results:
-            _emit_command(row["command"], json_output=False)
+            commands = row.get("commands")
+            if isinstance(commands, list) and commands:
+                for command in commands:
+                    _emit_command(command, json_output=False)
+            else:
+                _emit_command(row["command"], json_output=False)
         return
 
     if _RICH_AVAILABLE and _console:

@@ -146,6 +146,10 @@ pub struct ModelSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStage {
     pub stage: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operator: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operator_params: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub page_refs: Vec<String>,
 }
@@ -238,7 +242,10 @@ fn validate_model(manifest: &Manifest, report: &mut Report) {
     if model.kv_heads > model.heads {
         report.error("model.kv_heads cannot exceed model.heads");
     }
-    if model.heads != 0 && !model.hidden_size.is_multiple_of(model.heads as u64) {
+    if model.head_dim.is_none()
+        && model.heads != 0
+        && !model.hidden_size.is_multiple_of(model.heads as u64)
+    {
         report.error("model.hidden_size must be divisible by model.heads");
     }
     if model.head_dim == Some(0) {
@@ -340,6 +347,20 @@ fn validate_tape(manifest: &Manifest, pages: &BTreeMap<String, PageSpec>, report
     let mut stages = BTreeSet::new();
     for stage in &manifest.execution_tape {
         require_id("execution_tape[].stage", &stage.stage, report);
+        if stage.operator.is_empty() {
+            report.warn(format!(
+                "execution stage {} has no explicit operator contract",
+                stage.stage
+            ));
+        } else {
+            require_name("execution_tape[].operator", &stage.operator, report);
+            if !is_known_operator(&stage.operator) {
+                report.error(format!(
+                    "execution stage {} requires unknown operator {}",
+                    stage.stage, stage.operator
+                ));
+            }
+        }
         if !stages.insert(stage.stage.clone()) {
             report.error(format!("duplicate execution stage {}", stage.stage));
         }
@@ -373,6 +394,38 @@ fn validate_memory_plan(manifest: &Manifest, report: &mut Report) {
 
 fn is_known_kind(kind: &str) -> bool {
     matches!(kind, "weight" | "embedding" | "lm_head" | "fused_physical")
+}
+
+fn is_known_operator(operator: &str) -> bool {
+    matches!(
+        operator,
+        "embedding"
+            | "lm_head"
+            | "rms_norm"
+            | "layer_norm"
+            | "qkv_projection"
+            | "o_projection"
+            | "rope"
+            | "mha_attention"
+            | "mqa_attention"
+            | "gqa_attention"
+            | "attention_sinks"
+            | "per_layer_attention_window"
+            | "gated_activation"
+            | "down_projection"
+            | "topk_router"
+            | "sparse_experts"
+            | "expert_weighted_sum"
+            | "gated_delta_net"
+            | "depthwise_causal_conv1d"
+            | "recurrent_state_cache"
+            | "gated_full_attention"
+            | "per_layer_embeddings"
+            | "variable_head_dim_attention"
+            | "shared_kv_attention"
+            | "post_attention_norm"
+            | "post_feedforward_norm"
+    )
 }
 
 fn checked_shape_elems(shape: &[u64]) -> Option<u64> {

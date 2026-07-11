@@ -19,6 +19,7 @@ from thinruntime.model_arch import (
     descriptor_from_hf_config,
     descriptor_from_manifest,
 )
+from thinruntime.operator_registry import unsupported_operators
 from thinruntime.quantization import precision_ladder
 
 
@@ -75,11 +76,11 @@ def main() -> None:
         "cuda_capability": list(capability) if capability else None,
         "execution_plan": plan.as_dict(),
         "performance_contract": {
-            "minimum_claimed_speedup": 0.0,
-            "target_speedup": 0.30,
+            "minimum_speedup_vs_hf": 1.0,
+            "target_speedup_vs_hf": 3.0,
             "claim_rule": (
-                "claim 30% only after correctness-gated real decode beats "
-                "the same-model same-precision baseline"
+                "claim a win only after correctness-gated real decode beats "
+                "the same-model same-precision HF baseline"
             ),
             "candidate_optimizations": list(
                 plan.optimization_candidates
@@ -139,16 +140,24 @@ def available_quant_kernels() -> set[str]:
 def current_executor_gaps(plan: Any) -> list[str]:
     descriptor = plan.descriptor
     gaps = []
-    if plan.schema not in {
+    supported_schemas = {
         "separate_qkv_gated_dense",
         "fused_qkv_dense",
         "separate_qkv_fused_gate_up_dense",
         "fused_qkv_fused_gate_up_dense",
         "packed_expert_moe",
-    }:
-        gaps.append(
-            f"native executor for schema {plan.schema!r} is not implemented"
-        )
+        "separate_expert_moe",
+        "gated_delta_net_dense",
+    }
+    for layer in plan.layers:
+        if layer.schema not in supported_schemas:
+            gaps.append(
+                f"layer {layer.layer} schema {layer.schema!r} is not implemented"
+            )
+        for operator in unsupported_operators(layer.operators):
+            gaps.append(
+                f"layer {layer.layer} operator {operator!r} is not registered"
+            )
     if descriptor.quantization.is_quantized and plan.quantization.storage_action not in {
         "preserve",
         "dequantize_selected_experts_on_demand",
@@ -204,7 +213,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                 for row in report["precision_ladder"]
             ],
             "",
-            "A 30% speedup is a benchmark target, not a compatibility claim.",
+            "A 3x speedup is a benchmark target, not a compatibility claim.",
         ]
     )
     return "\n".join(lines) + "\n"

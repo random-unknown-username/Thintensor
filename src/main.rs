@@ -1024,5 +1024,6 @@ fn weight_residency_name(value: WeightResidency) -> &'static str {
         WeightResidency::Stream => "stream",
         WeightResidency::OffloadLastN => "offload-last-n",
         WeightResidency::OffloadFirstN => "offload-first-n",
+        WeightResidency::OffloadMiddleOut => "offload-middle-out",
     }
 }

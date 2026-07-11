@@ -74,11 +74,13 @@ def load_thin_model(
     copied_count = 0
     total_tensor_bytes = 0
     
-    page_ids = [p["id"] for p in archive.manifest.get("pages", [])]
+    page_specs = {
+        str(page["id"]): page
+        for page in archive.manifest.get("pages", [])
+    }
     tensors_by_checksum = {}
     
-    for page_id in page_ids:
-        p_spec = next(p for p in archive.manifest.get("pages", []) if p["id"] == page_id)
+    for page_id, p_spec in page_specs.items():
         if p_spec.get("kind") == "fused_physical":
             continue
 

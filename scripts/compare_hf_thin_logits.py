@@ -94,6 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-weight-offload", action="store_true")
     parser.add_argument("--pin-cpu-weight-pages", action="store_true")
     parser.add_argument("--mlp-fp8", action="store_true")
+    parser.add_argument("--embed-fp8", action="store_true")
     parser.add_argument("--down-proj-fp8", action="store_true")
     parser.add_argument("--gate-up-fp8", action="store_true")
     parser.add_argument("--fused-scaled-mlp", action="store_true")
@@ -129,6 +130,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dense-int4", action="store_true")
     parser.add_argument("--dense-int4-layers")
     parser.add_argument("--dense-int4-group-size", type=int, default=32)
+    parser.add_argument("--packed-expert-q2-layers")
+    parser.add_argument("--packed-expert-q1-layers")
     parser.add_argument("--mxfp4-gate-up-layers")
     parser.add_argument("--mxfp4-down-layers")
     parser.add_argument("--mxfp4-qkv-layers")
@@ -179,6 +182,19 @@ def should_load_on_cpu(model_path: str, device: torch.device) -> bool:
     try:
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(model_path)
+        quant = getattr(config, "quantization_config", None) or {}
+        quant_method = (
+            quant.get("quant_method")
+            if isinstance(quant, dict)
+            else getattr(quant, "quant_method", None)
+        )
+        if quant_method == "mxfp4":
+            try:
+                import kernels  # noqa: F401
+
+                return False
+            except Exception:
+                pass
         is_moe = (
             getattr(config, "num_local_experts", 0) > 0
             or getattr(config, "num_experts", 0) > 0
@@ -257,16 +273,11 @@ def main() -> None:
     print(f"loading HF model {args.hf_model}", file=sys.stderr)
     hf_model, success = try_load_hf(args, dtype, device)
     if not success:
-        # Force-release any leaked CUDA tensors from the failed load attempt
-        for obj in gc.get_objects():
-            try:
-                if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-                    if obj.device.type == 'cuda':
-                        obj.data = torch.empty(0)
-            except Exception:
-                pass
+        # The failed model is scoped inside try_load_hf. Never mutate arbitrary
+        # live tensors discovered through the process-wide GC registry.
         gc.collect()
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         hf_device = torch.device("cpu")
         hf_model = AutoModelForCausalLM.from_pretrained(
             args.hf_model,
@@ -346,44 +357,73 @@ def main() -> None:
 
     os.environ.setdefault("THINTENSOR_DISABLE_AUTOTUNE", "1")
     print(f"loading ThinTensor archive {args.archive}", file=sys.stderr)
-    if args.weight_residency == "stream":
-        weight_budget = parse_bytes(args.gpu_weight_budget)
-        if weight_budget <= 0:
-            raise ValueError(
-                "--weight-residency stream requires --gpu-weight-budget"
+    has_quantization = (
+        args.dense_int4
+        or args.expert_int4
+        or args.down_proj_fp8
+        or args.gate_up_fp8
+        or args.qkv_fp8
+        or args.o_proj_fp8
+        or args.mlp_fp8
+        or args.embed_fp8
+        or args.attn_proj_fp8
+        or args.fp8_layers
+        or args.down_fp8_layers
+        or args.qkv_fp8_layers
+        or args.o_fp8_layers
+        or args.lm_head_fp8
+        or args.lm_head_int4_group_size > 0
+        or args.packed_expert_q2_layers
+        or args.packed_expert_q1_layers
+    )
+    def create_weights_manager():
+        if args.weight_residency == "stream" or has_quantization:
+            weight_budget = 0
+            if args.weight_residency == "stream":
+                weight_budget = parse_bytes(args.gpu_weight_budget)
+                if weight_budget <= 0:
+                    raise ValueError(
+                        "--weight-residency stream requires --gpu-weight-budget"
+                    )
+            pool = ThinGpuPagePool(
+                args.archive,
+                device=args.device,
+                dtype=dtype,
+                vram_budget_bytes=weight_budget or None,
+                prefetch_distance=args.weight_prefetch_layers,
+                cpu_offload=args.cpu_weight_offload,
+                pin_cpu_pages=args.pin_cpu_weight_pages,
+                down_proj_fp8=args.down_proj_fp8 or args.mlp_fp8,
+                gate_up_fp8=args.gate_up_fp8 or args.mlp_fp8,
+                qkv_fp8=args.qkv_fp8 or args.attn_proj_fp8,
+                o_proj_fp8=args.o_proj_fp8 or args.attn_proj_fp8,
+                embed_fp8=args.embed_fp8,
+                fp8_layer_spec=args.fp8_layers,
+                down_fp8_layer_spec=args.down_fp8_layers,
+                qkv_fp8_layer_spec=args.qkv_fp8_layers,
+                o_fp8_layer_spec=args.o_fp8_layers,
+                fp8_scale_block=args.fp8_scale_block,
+                lm_head_fp8=args.lm_head_fp8,
+                lm_head_fp8_scale_block=args.lm_head_fp8_scale_block,
+                lm_head_int4_group_size=args.lm_head_int4_group_size,
+                expert_int4=args.expert_int4,
+                expert_int4_layer_spec=args.expert_int4_layers,
+                expert_int4_group_size=args.expert_int4_group_size,
+                dense_int4=args.dense_int4,
+                dense_int4_layer_spec=args.dense_int4_layers,
+                dense_int4_group_size=args.dense_int4_group_size,
+                packed_expert_q2_layer_spec=args.packed_expert_q2_layers,
+                packed_expert_q1_layer_spec=args.packed_expert_q1_layers,
             )
-        weights: ThinGpuWeights | ThinGpuPagePool = ThinGpuPagePool(
-            args.archive,
-            device=args.device,
-            dtype=dtype,
-            vram_budget_bytes=weight_budget,
-            prefetch_distance=args.weight_prefetch_layers,
-            cpu_offload=args.cpu_weight_offload,
-            pin_cpu_pages=args.pin_cpu_weight_pages,
-            down_proj_fp8=args.down_proj_fp8 or args.mlp_fp8,
-            gate_up_fp8=args.gate_up_fp8 or args.mlp_fp8,
-            qkv_fp8=args.qkv_fp8 or args.attn_proj_fp8,
-            o_proj_fp8=args.o_proj_fp8 or args.attn_proj_fp8,
-            fp8_layer_spec=args.fp8_layers,
-            down_fp8_layer_spec=args.down_fp8_layers,
-            qkv_fp8_layer_spec=args.qkv_fp8_layers,
-            o_fp8_layer_spec=args.o_fp8_layers,
-            fp8_scale_block=args.fp8_scale_block,
-            lm_head_fp8_scale_block=args.lm_head_fp8_scale_block,
-            expert_int4=args.expert_int4,
-            expert_int4_layer_spec=args.expert_int4_layers,
-            expert_int4_group_size=args.expert_int4_group_size,
-            dense_int4=args.dense_int4,
-            dense_int4_layer_spec=args.dense_int4_layers,
-            dense_int4_group_size=args.dense_int4_group_size,
-        )
-        weights.warm_start()
-    else:
-        weights = ThinGpuWeights(
-            args.archive,
-            device=args.device,
-            dtype=dtype,
-        )
+            pool.warm_start()
+            return pool
+        else:
+            return ThinGpuWeights(
+                args.archive,
+                device=args.device,
+                dtype=dtype,
+            )
+    weights = create_weights_manager()
     thin_descriptor = descriptor_from_manifest(weights.manifest)
     thin_config_summary = summarize_thin_config(
         weights.manifest,
@@ -407,11 +447,7 @@ def main() -> None:
             input_ids_by_length.items()
         ):
             if args.exact_prefill and run_index:
-                weights = ThinGpuWeights(
-                    args.archive,
-                    device=args.device,
-                    dtype=dtype,
-                )
+                weights = create_weights_manager()
             hf_run = hf_runs[prefill_len]
             thin_run = run_thin_trajectory(
                 weights=weights,
@@ -1922,6 +1958,7 @@ def build_summary(
             args.attn_proj_fp8,
             args.qkv_fp8,
             args.o_proj_fp8,
+            args.embed_fp8,
             args.adaptive_body_int8_start_token >= 0,
             args.body_int4_group_size > 0,
             args.mxfp4_gate_up_layers is not None,
