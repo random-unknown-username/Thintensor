@@ -24,6 +24,7 @@ structures for bandwidth and preserve a BF16 source or exact shortlist guard.
 | Gemma-4-E2B | candidate | 200 | 43.60 | 1.62 | 26.91x | 6.490 / 6.620 | -2.0% | 0.999671 | yes | yes | no | full BF16 |
 | OLMoE-1B-7B-0924-Instruct | candidate | 200 | 33.70 | 9.22 | 3.65x | 6.820 / 6.450 | +5.7% | 0.999218 | yes | yes | no | full BF16 |
 | GPT-OSS-20B | verified | 200 | 50.34 | 40.36 | 1.247x | n/a / n/a | n/a | 0.983299 | yes | n/a | n/a | max-max-perf autotune |
+| Llama-3.2-11B-Vision | candidate | 200 | ~24  | 14.96 | n/a | 0.939758 | n/a | 0.80 | n/a |
 
 `candidate` is deliberate for TinyLlama: the short suite retained exact top-1
 and 0.997788 minimum cosine, but one BF16 fifth-place cutoff tie changed the
@@ -67,8 +68,9 @@ Gemma2 is really slow rn ik, its a older and a kind of bad arch for our case
 | OLMoE-1B-7B-0924-Instruct | Transformers | 9.22 | 6.450 | 1.000000 | yes | yes | yes |
 | GPT-OSS-20B | body-embed-fp8-stream-pageable-tight-budget | 17.01 | 8.55 | 0.983299 | yes | n/a | n/a |
 | GPT-OSS-20B | max-max-perf | 50.34 | 7.38 | 0.983299 | yes | n/a | n/a |
+| GPT-OSS-20B | llama.cpp Q_4_M | 40.36 | 6.93 | 0.792350 | n/a | n/a | n/a |
 | Qwen3.5-9B | max-max-perf | 12.16 | 7.13 | 0.997576 | yes | yes | n/a |
-| Llama-3.2-11B-Vision | text-only (ThinTensor) | n/a | 14.96 | 0.939758 | n/a | 0.80 | n/a |
+| Llama-3.2-11B-Vision | text-only (ThinTensor) | 24tk/s  | 14.96 | 0.939758 | n/a | 0.80 | n/a |
 | Llama-3.2-11B-Vision | Ollama Q4_K_M | 22.08 | n/a | 0.720495 | no | 0.55 | n/a |
 
 Quality rows are the minimum across the public quick suite at prefill lengths
