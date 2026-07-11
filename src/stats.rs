@@ -153,7 +153,10 @@ pub fn build_stats(archive: &Archive) -> ArchiveStats {
 
     let mut largest_pages = page_stats.clone();
     sort_pages_by_size(&mut largest_pages);
-    largest_pages.truncate(16);
+    // Profiles need enough candidates to cover deep heterogeneous models where the first
+    // few dozen pages may all belong to one expert operator. Presentation code applies its
+    // own smaller display limit.
+    largest_pages.truncate(128);
 
     ArchiveStats {
         archive_bytes: archive.file_len(),

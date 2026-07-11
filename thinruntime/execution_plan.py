@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import re
 from typing import Any, Iterable
 
 from .model_arch import ModelDescriptor
@@ -16,6 +17,8 @@ class LayerExecutionPlan:
     attention_window: int | None
     tensors: dict[str, str]
     optional_tensors: dict[str, str]
+    tensor_groups: dict[str, tuple[str, ...]]
+    operators: tuple[str, ...]
     missing_required_roles: tuple[str, ...]
 
     def as_dict(self) -> dict[str, Any]:
@@ -23,6 +26,10 @@ class LayerExecutionPlan:
         result["missing_required_roles"] = list(
             self.missing_required_roles
         )
+        result["tensor_groups"] = {
+            role: list(values) for role, values in self.tensor_groups.items()
+        }
+        result["operators"] = list(self.operators)
         return result
 
 
@@ -62,11 +69,20 @@ def compile_execution_plan(
     allow_requantize: bool = False,
 ) -> CompiledExecutionPlan:
     names = set(str(name) for name in tensor_names)
-    schema = _detect_schema(descriptor, names)
     globals_map = _global_roles(names)
-    layer_plans = tuple(
-        _compile_layer(descriptor, names, layer, schema)
+    layer_schemas = tuple(
+        _detect_schema(descriptor, _names_for_layer(names, layer), layer)
         for layer in range(descriptor.num_hidden_layers)
+    )
+    layer_plans = tuple(
+        _compile_layer(descriptor, names, layer, layer_schemas[layer])
+        for layer in range(descriptor.num_hidden_layers)
+    )
+    unique_schemas = tuple(dict.fromkeys(layer_schemas))
+    schema = (
+        unique_schemas[0]
+        if len(unique_schemas) == 1
+        else "heterogeneous:" + ",".join(unique_schemas)
     )
     reasons = []
     for role in ("embed_tokens", "final_norm", "lm_head"):
@@ -88,7 +104,7 @@ def compile_execution_plan(
         allow_requantize=allow_requantize,
     )
     if (
-        schema == "packed_expert_moe"
+        any(layer.schema == "packed_expert_moe" for layer in layer_plans)
         and descriptor.quantization.method == "mxfp4"
         and quant.supported
         and not quant.exact_storage_preserved
@@ -117,8 +133,19 @@ def compile_execution_plan(
     )
 
 
-def _detect_schema(descriptor: ModelDescriptor, names: set[str]) -> str:
+def _detect_schema(
+    descriptor: ModelDescriptor, names: set[str], layer: int
+) -> str:
+    if any(".linear_attn." in name for name in names) or (
+        layer < len(descriptor.layer_types)
+        and descriptor.layer_types[layer] == "linear_attention"
+    ):
+        return "gated_delta_net_dense"
     if any(".block_sparse_moe.experts." in name for name in names):
+        return "separate_expert_moe"
+    if any(
+        re.search(r"\.mlp\.experts\.\d+\.", name) for name in names
+    ):
         return "separate_expert_moe"
     if any(".mlp.experts." in name for name in names):
         return "packed_expert_moe"
@@ -134,8 +161,6 @@ def _detect_schema(descriptor: ModelDescriptor, names: set[str]) -> str:
         return "fused_qkv_dense"
     if fused_gate_up:
         return "separate_qkv_fused_gate_up_dense"
-    if descriptor.mlp_kind == "sparse_moe":
-        return "packed_expert_moe"
     return "separate_qkv_gated_dense"
 
 
@@ -178,6 +203,7 @@ def _compile_layer(
     )
     tensors: dict[str, str] = {}
     optional: dict[str, str] = {}
+    groups: dict[str, tuple[str, ...]] = {}
 
     def required(role: str, *suffixes: str) -> None:
         value = _first_present(
@@ -247,6 +273,20 @@ def _compile_layer(
     optional_role("k_norm", "self_attn.k_norm.weight")
     optional_role("attention_sinks", "self_attn.sinks")
 
+    if schema == "gated_delta_net_dense":
+        for role, suffix in (
+            ("linear_qkv_weight", "linear_attn.in_proj_qkv.weight"),
+            ("linear_z_weight", "linear_attn.in_proj_z.weight"),
+            ("linear_a_weight", "linear_attn.in_proj_a.weight"),
+            ("linear_b_weight", "linear_attn.in_proj_b.weight"),
+            ("linear_conv_weight", "linear_attn.conv1d.weight"),
+            ("linear_dt_bias", "linear_attn.dt_bias"),
+            ("linear_a_log", "linear_attn.A_log"),
+            ("linear_norm_weight", "linear_attn.norm.weight"),
+            ("linear_out_weight", "linear_attn.out_proj.weight"),
+        ):
+            required(role, suffix)
+
     if schema == "packed_expert_moe":
         required("router_weight", "mlp.router.weight", "block_sparse_moe.gate.weight")
         optional_role("router_bias", "mlp.router.bias", "block_sparse_moe.gate.bias")
@@ -275,31 +315,41 @@ def _compile_layer(
         optional_role("experts_down_bias", "mlp.experts.down_proj_bias")
     elif schema == "separate_expert_moe":
         required("router_weight", "block_sparse_moe.gate.weight", "mlp.gate.weight")
+        expert_roles: dict[str, list[str]] = {
+            "experts_gate": [], "experts_up": [], "experts_down": []
+        }
         for expert in range(descriptor.num_local_experts):
             for role, suffixes in (
                 (
-                    f"expert_{expert}_gate",
+                    "experts_gate",
                     (
                         f"block_sparse_moe.experts.{expert}.w1.weight",
                         f"mlp.experts.{expert}.gate_proj.weight",
                     ),
                 ),
                 (
-                    f"expert_{expert}_up",
+                    "experts_up",
                     (
                         f"block_sparse_moe.experts.{expert}.w3.weight",
                         f"mlp.experts.{expert}.up_proj.weight",
                     ),
                 ),
                 (
-                    f"expert_{expert}_down",
+                    "experts_down",
                     (
                         f"block_sparse_moe.experts.{expert}.w2.weight",
                         f"mlp.experts.{expert}.down_proj.weight",
                     ),
                 ),
             ):
-                required(role, *suffixes)
+                value = _first_present(
+                    names, tuple(prefix + suffix for suffix in suffixes)
+                )
+                if value is not None:
+                    expert_roles[role].append(value)
+        groups.update(
+            (role, tuple(values)) for role, values in expert_roles.items()
+        )
     elif "fused_gate_up" in schema:
         required(
             "gate_up_weight",
@@ -341,40 +391,55 @@ def _compile_layer(
         ):
             optional_role(role, f"mlp.{projection}.bias")
 
-    missing = tuple(
+    missing_list = [
         role
         for role in _required_roles(schema, descriptor.num_local_experts)
         if role not in tensors
-    )
+    ]
+    if schema == "separate_expert_moe":
+        for role in ("experts_gate", "experts_up", "experts_down"):
+            if len(groups.get(role, ())) != descriptor.num_local_experts:
+                missing_list.append(
+                    f"{role}[{descriptor.num_local_experts}]"
+                )
+    operators = _layer_operators(descriptor, schema, layer)
     return LayerExecutionPlan(
         layer=layer,
         schema=schema,
         attention_window=descriptor.layer_attention_window(layer),
         tensors=tensors,
         optional_tensors=optional,
-        missing_required_roles=missing,
+        tensor_groups=groups,
+        operators=operators,
+        missing_required_roles=tuple(missing_list),
     )
 
 
 def _required_roles(schema: str, experts: int) -> tuple[str, ...]:
-    common = (
-        "input_norm",
-        "post_attention_norm",
-        "o_weight",
-    )
-    attention = (
-        ("qkv_weight",)
-        if schema.startswith("fused_qkv")
-        else ("q_weight", "k_weight", "v_weight")
-    )
+    common = ("input_norm", "post_attention_norm")
+    if schema == "gated_delta_net_dense":
+        attention = (
+            "linear_qkv_weight",
+            "linear_z_weight",
+            "linear_a_weight",
+            "linear_b_weight",
+            "linear_conv_weight",
+            "linear_dt_bias",
+            "linear_a_log",
+            "linear_norm_weight",
+            "linear_out_weight",
+        )
+    else:
+        common += ("o_weight",)
+        attention = (
+            ("qkv_weight",)
+            if schema.startswith("fused_qkv")
+            else ("q_weight", "k_weight", "v_weight")
+        )
     if schema == "packed_expert_moe":
         mlp = ("router_weight", "experts_gate_up", "experts_down")
     elif schema == "separate_expert_moe":
-        mlp = ("router_weight",) + tuple(
-            f"expert_{expert}_{role}"
-            for expert in range(experts)
-            for role in ("gate", "up", "down")
-        )
+        mlp = ("router_weight",)
     elif "fused_gate_up" in schema:
         mlp = ("gate_up_weight", "down_weight")
     else:
@@ -397,7 +462,7 @@ def _optimization_candidates(
         candidates.append("separate_quantized_execution_head")
     if descriptor.layer_types:
         candidates.append("layer_window_aware_kv")
-    if schema.endswith("_moe"):
+    if "moe" in schema:
         candidates.extend(
             (
                 "router_topk_gpu",
@@ -418,3 +483,46 @@ def _first_present(
     candidates: tuple[str, ...],
 ) -> str | None:
     return next((value for value in candidates if value in names), None)
+
+
+def _names_for_layer(names: set[str], layer: int) -> set[str]:
+    prefixes = (
+        f"model.layers.{layer}.",
+        f"transformer.h.{layer}.",
+        f"model.decoder.layers.{layer}.",
+    )
+    return {name for name in names if name.startswith(prefixes)}
+
+
+def _layer_operators(
+    descriptor: ModelDescriptor, schema: str, layer: int
+) -> tuple[str, ...]:
+    if schema == "gated_delta_net_dense":
+        operators = [
+            descriptor.norm_kind,
+            "gated_delta_net",
+            "depthwise_causal_conv1d",
+            "recurrent_state_cache",
+        ]
+    else:
+        attention = (
+            "mha_attention"
+            if descriptor.num_key_value_heads == descriptor.num_attention_heads
+            else "mqa_attention"
+            if descriptor.num_key_value_heads == 1
+            else "gqa_attention"
+        )
+        operators = [
+            descriptor.norm_kind,
+            "qkv_projection",
+            "rope",
+            attention,
+            "o_projection",
+        ]
+    if descriptor.layer_attention_window(layer) is not None:
+        operators.append("per_layer_attention_window")
+    if schema.endswith("_moe"):
+        operators.extend(("topk_router", "sparse_experts", "expert_weighted_sum"))
+    else:
+        operators.extend(("gated_activation", "down_projection"))
+    return tuple(operators)

@@ -10,23 +10,6 @@ import json
 from .quantization import QuantizationDescriptor, descriptor_from_config
 
 
-KNOWN_MODEL_TYPES = {
-    "llama",
-    "qwen2",
-    "qwen2_5",
-    "qwen3",
-    "qwen3_5",
-    "smollm",
-    "smollm3",
-    "tinyllama",
-    "phi3",
-    "gpt_oss",
-    "olmoe",
-    "gemma",
-    "gemma2",
-    "gemma4",
-}
-
 @dataclass(frozen=True)
 class ModelDescriptor:
     model_type: str
@@ -146,7 +129,12 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
     hidden = _required_int(config, "hidden_size")
     heads = _required_int(config, "num_attention_heads")
     layers = _required_int(config, "num_hidden_layers")
-    kv_heads = int(config.get("num_key_value_heads") or heads)
+    kv_heads = int(
+        _first_config_value(
+            config, "num_key_value_heads", "num_kv_heads", "n_head_kv"
+        )
+        or heads
+    )
     head_dim = int(config.get("head_dim") or hidden // heads)
     no_rope = tuple(bool(value) for value in config.get("no_rope_layers", []))
     if not no_rope and model_type == "smollm3":
@@ -157,7 +145,7 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
     return ModelDescriptor(
         model_type=model_type,
         hidden_size=hidden,
-        intermediate_size=_required_int(config, "intermediate_size"),
+        intermediate_size=_intermediate_size(config, hidden),
         num_hidden_layers=layers,
         num_attention_heads=heads,
         num_key_value_heads=kv_heads,
@@ -177,19 +165,19 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         rope_scaling=config.get("rope_scaling") or config.get("rope_parameters"),
         rms_norm_eps=float(
             config.get("rms_norm_eps")
-            or config.get("layer_norm_eps")
+            or _first_config_value(config, "layer_norm_eps", "layer_norm_epsilon")
             or default_norm_eps
         ),
         norm_kind=(
             "rms_norm"
             if config.get("rms_norm_eps") is not None
             else "layer_norm"
-            if config.get("layer_norm_eps") is not None
+            if _first_config_value(config, "layer_norm_eps", "layer_norm_epsilon") is not None
             else "rms_norm"
         ),
         norm_eps=float(
             config.get("rms_norm_eps")
-            or config.get("layer_norm_eps")
+            or _first_config_value(config, "layer_norm_eps", "layer_norm_epsilon")
             or default_norm_eps
         ),
         partial_rotary_factor=float(
@@ -297,6 +285,23 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         required_operators=traits["required_operators"],
         quantization=descriptor_from_config(config, tensor_names),
     )
+
+
+def required_operators_from_config(
+    config: dict[str, Any], tensor_names: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    effective = _effective_text_config(config)
+    heads = _required_int(effective, "num_attention_heads")
+    layers = _required_int(effective, "num_hidden_layers")
+    kv_heads = int(
+        _first_config_value(
+            effective, "num_key_value_heads", "num_kv_heads", "n_head_kv"
+        )
+        or heads
+    )
+    return _semantic_traits(
+        effective, tensor_names, heads, kv_heads, layers
+    )["required_operators"]
 
 
 def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescriptor:
@@ -513,10 +518,44 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
 
 
 def _required_int(config: dict[str, Any], key: str) -> int:
-    value = config.get(key)
+    aliases = {
+        "hidden_size": ("hidden_size", "n_embd", "d_model"),
+        "intermediate_size": (
+            "intermediate_size",
+            "ffn_dim",
+            "ffn_hidden_size",
+            "n_inner",
+            "d_ff",
+            "moe_intermediate_size",
+            "expert_intermediate_size",
+        ),
+        "num_hidden_layers": ("num_hidden_layers", "n_layer", "num_layers"),
+        "num_attention_heads": ("num_attention_heads", "n_head", "num_heads"),
+        "vocab_size": ("vocab_size", "n_vocab", "padded_vocab_size"),
+    }
+    value = next(
+        (config.get(name) for name in aliases.get(key, (key,)) if config.get(name) is not None),
+        None,
+    )
     if value is None:
         raise ValueError(f"config.json is missing required field {key!r}")
     return int(value)
+
+
+def _first_config_value(config: dict[str, Any], *names: str) -> Any:
+    return next(
+        (config.get(name) for name in names if config.get(name) is not None),
+        None,
+    )
+
+
+def _intermediate_size(config: dict[str, Any], hidden_size: int) -> int:
+    try:
+        return _required_int(config, "intermediate_size")
+    except ValueError:
+        # GPT-style non-gated MLPs conventionally omit n_inner when it is 4*d_model.
+        # Tensor-backed manifests replace this fallback with the converter-inferred shape.
+        return 4 * hidden_size
 
 
 def _raw_arch(config: dict[str, Any]) -> str:
@@ -532,6 +571,16 @@ def _effective_text_config(config: dict[str, Any]) -> dict[str, Any]:
     for key in ("architectures", "tie_word_embeddings", "model_type"):
         if key in config:
             effective[key] = config[key]
+    skipped_layers = len(_cross_attention_layers(config))
+    if skipped_layers:
+        layer_count = int(
+            _first_config_value(
+                effective, "num_hidden_layers", "n_layer", "num_layers"
+            )
+            or 0
+        )
+        if layer_count:
+            effective["num_hidden_layers"] = max(0, layer_count - skipped_layers)
     return effective
 
 
@@ -541,11 +590,66 @@ def _canonical_text_tensor_names(
 ) -> tuple[str, ...]:
     if not isinstance(config.get("text_config"), dict):
         return names
-    prefix = "model.language_model."
-    return tuple(
-        f"model.{name.removeprefix(prefix)}"
-        for name in names
-        if name.startswith(prefix)
+    prefixes = ("model.language_model.", "language_model.")
+    cross_layers = _cross_attention_layers(config)
+    canonical: list[str] = []
+    for name in names:
+        suffix = next(
+            (name.removeprefix(prefix) for prefix in prefixes if name.startswith(prefix)),
+            None,
+        )
+        if suffix is None:
+            continue
+        if _is_text_adapter_tensor(suffix):
+            continue
+        compact = _canonical_text_tensor_name(suffix, cross_layers)
+        if compact is not None:
+            canonical.append(compact)
+    return tuple(canonical)
+
+
+def _cross_attention_layers(config: dict[str, Any]) -> set[int]:
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        return set()
+    layers = text.get("cross_attention_layers")
+    if not isinstance(layers, list):
+        return set()
+    result: set[int] = set()
+    for layer in layers:
+        try:
+            result.add(int(layer))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def _canonical_text_tensor_name(suffix: str, cross_layers: set[int]) -> str | None:
+    if suffix == "lm_head.weight":
+        return suffix
+    normalized = suffix if suffix.startswith("model.") else f"model.{suffix}"
+    prefix = "model.layers."
+    if not normalized.startswith(prefix):
+        return normalized
+    rest = normalized.removeprefix(prefix)
+    layer_text, sep, layer_suffix = rest.partition(".")
+    if not sep:
+        return normalized
+    try:
+        layer = int(layer_text)
+    except ValueError:
+        return normalized
+    if layer in cross_layers:
+        return None
+    skipped_before = sum(1 for skipped in cross_layers if skipped < layer)
+    return f"model.layers.{layer - skipped_before}.{layer_suffix}"
+
+
+def _is_text_adapter_tensor(suffix: str) -> bool:
+    return (
+        ".cross_attn." in suffix
+        or ".cross_attn_attn_gate" in suffix
+        or ".cross_attn_mlp_gate" in suffix
     )
 
 
@@ -638,10 +742,19 @@ def _semantic_traits(
         attention_variants.append("sliding_causal_kv")
     required = [
         "embedding",
-        "rms_norm",
+        "layer_norm"
+        if _first_config_value(config, "layer_norm_eps", "layer_norm_epsilon") is not None
+        and config.get("rms_norm_eps") is None
+        else "rms_norm",
         "qkv_projection",
         "rope",
-        "gqa_attention" if kv_heads < heads else "mha_attention",
+        (
+            "mha_attention"
+            if kv_heads == heads
+            else "mqa_attention"
+            if kv_heads == 1
+            else "gqa_attention"
+        ),
         "o_projection",
         "lm_head",
     ]
@@ -658,7 +771,15 @@ def _semantic_traits(
                 "gated_full_attention",
             )
         )
-    if raw_model_type == "gemma4":
+    if any(
+        int(config.get(field) or 0) > 0
+        for field in (
+            "hidden_size_per_layer_input",
+            "vocab_size_per_layer_input",
+            "num_kv_shared_layers",
+            "global_head_dim",
+        )
+    ):
         required.extend(
             (
                 "per_layer_embeddings",
@@ -668,6 +789,14 @@ def _semantic_traits(
                 "post_feedforward_norm",
             )
         )
+    if any(
+        name.endswith("pre_feedforward_layernorm.weight")
+        for name in tensor_names
+    ) and any(
+        name.endswith("post_feedforward_layernorm.weight")
+        for name in tensor_names
+    ):
+        required.extend(("post_attention_norm", "post_feedforward_norm"))
     if mlp_kind == "sparse_moe":
         required.extend(("topk_router", "sparse_experts", "expert_weighted_sum"))
     else:

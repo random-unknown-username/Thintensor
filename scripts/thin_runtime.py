@@ -202,16 +202,42 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--gpu-weight-budget", default="0")
     run.add_argument("--prefetch-layers", type=int, default=0)
     run.add_argument("--pin-cpu-pages", action="store_true")
+    run.add_argument(
+        "--pinned-staging",
+        dest="pinned_staging",
+        action="store_true",
+        default=None,
+        help="Force pinned CPU staging buffers for streamed GPU page loads",
+    )
+    run.add_argument(
+        "--no-pinned-staging",
+        dest="pinned_staging",
+        action="store_false",
+        help="Use direct pageable H2D copies for streamed GPU page loads",
+    )
     run.add_argument("--debug-stream-refs", action="store_true")
     run.add_argument("--expert-int4", action="store_true")
     run.add_argument("--expert-int4-layers")
     run.add_argument("--expert-int4-group-size", type=int, default=32)
+    run.add_argument("--dense-int4", action="store_true")
+    run.add_argument("--dense-int4-layers")
+    run.add_argument("--dense-int4-group-size", type=int, default=32)
+    run.add_argument("--packed-expert-q2-layers")
+    run.add_argument("--packed-expert-q1-layers")
     run.add_argument("--down-proj-fp8", action="store_true")
     run.add_argument("--mlp-fp8", action="store_true")
     run.add_argument("--gate-up-fp8", action="store_true")
     run.add_argument("--attn-proj-fp8", action="store_true")
     run.add_argument("--qkv-fp8", action="store_true")
     run.add_argument("--o-proj-fp8", action="store_true")
+    run.add_argument(
+        "--embed-fp8",
+        action="store_true",
+        help=(
+            "Store model.embed_tokens.weight as scaled FP8 and reuse it as "
+            "the execution head when the archive has no separate lm_head"
+        ),
+    )
     run.add_argument("--validate-lm-head-fp8", action="store_true")
     run.add_argument(
         "--fp8-layers",
@@ -336,6 +362,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Single-token causal attention implementation; SDPA and fused "
             "Triton remain opt-in until correctness and real decode pass"
+        ),
+    )
+    run.add_argument(
+        "--moe-top-k-limit",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in approximate MoE execution limit. 0 uses the model's full "
+            "router top-k; positive values execute only the top N routed "
+            "experts and are reported as not HF-equivalent."
+        ),
+    )
+    run.add_argument(
+        "--moe-top-k-no-renorm",
+        action="store_true",
+        help=(
+            "When --moe-top-k-limit drops routed experts, keep the original "
+            "softmax mass instead of renormalizing the retained experts."
         ),
     )
     run.add_argument("--exact-hf-mode", action="store_true")
@@ -532,6 +576,12 @@ def calculate_per_shape_bandwidths(runtime, breakdown):
 
 
 def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
+    if str(args.kv).lower() not in PagedKVCache.EXACT_CODECS:
+        raise ValueError(
+            f"--kv {args.kv!r} is not executable: lossy KV codecs are "
+            "capacity-model experiments until payload encode/decode kernels "
+            "pass causal-logit parity."
+        )
     selected_fast_profiles = sum(
         bool(value)
         for value in (args.fast_60, args.fast_80, args.fast_90)
@@ -572,6 +622,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["THINTENSOR_INT8_TC_BLOCK_N"] = "2"
         os.environ["THINTENSOR_INT8_TC_BLOCK_M"] = "64"
         os.environ["THINTENSOR_INT8_TC_BLOCK_K"] = "256"
+    if args.pinned_staging is not None:
+        os.environ["THINTENSOR_PINNED_STAGING"] = (
+            "1" if args.pinned_staging else "0"
+        )
     dtype = parse_dtype(args.dtype)
     reset_gpu(args.device)
     rss0 = _rss_bytes()
@@ -605,15 +659,23 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 gate_up_fp8=args.gate_up_fp8 or args.mlp_fp8,
                 qkv_fp8=args.qkv_fp8 or args.attn_proj_fp8,
                 o_proj_fp8=args.o_proj_fp8 or args.attn_proj_fp8,
+                embed_fp8=args.embed_fp8,
                 fp8_layer_spec=args.fp8_layers,
                 down_fp8_layer_spec=args.down_fp8_layers,
                 qkv_fp8_layer_spec=args.qkv_fp8_layers,
                 o_fp8_layer_spec=args.o_fp8_layers,
                 fp8_scale_block=args.fp8_scale_block,
+                lm_head_fp8=args.lm_head_fp8,
                 lm_head_fp8_scale_block=args.lm_head_fp8_scale_block,
+                lm_head_int4_group_size=args.lm_head_int4_group_size,
                 expert_int4=args.expert_int4,
                 expert_int4_layer_spec=args.expert_int4_layers,
                 expert_int4_group_size=args.expert_int4_group_size,
+                dense_int4=args.dense_int4,
+                dense_int4_layer_spec=args.dense_int4_layers,
+                dense_int4_group_size=args.dense_int4_group_size,
+                packed_expert_q2_layer_spec=args.packed_expert_q2_layers,
+                packed_expert_q1_layer_spec=args.packed_expert_q1_layers,
             )
             weights.warm_start()
             pool_telemetry = weights.telemetry()
@@ -723,6 +785,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 mxfp4_binary_residual=args.mxfp4_binary_residual,
                 mxfp4_int8_row_fraction=args.mxfp4_int8_row_fraction,
                 mxfp4_row_postscale=args.mxfp4_row_postscale,
+                moe_top_k_limit=args.moe_top_k_limit,
+                moe_top_k_renorm=not args.moe_top_k_no_renorm,
                 exact_hf_mode=args.exact_hf_mode,
                 fp8_scale_block=args.fp8_scale_block,
                 fp8_residual_terms=args.fp8_residual_terms,
@@ -762,7 +826,11 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
 
         if (
             getattr(args, "cuda_graphs", False)
-            and args.residency == "all"
+            and (
+                args.residency == "all"
+                or isinstance(weights, ThinGpuPagePool)
+                and weights.is_fully_pinned
+            )
             and args.device == "cuda"
         ):
             runtime.capture_cuda_graph(args.steps)
@@ -807,9 +875,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         if args.mode != "embeddings" and args.top_k > 0:
             top_logits = runtime.topk(hidden, args.top_k, exact=args.exact_topk)
             if args.validate_lm_head_fp8:
-                if not args.lm_head_fp8:
+                if not runtime.lm_head_fp8_enabled:
                     raise RuntimeError(
-                        "--validate-lm-head-fp8 requires --lm-head-fp8"
+                        "--validate-lm-head-fp8 requires an approximate "
+                        "lm_head execution path"
                     )
                 approximate = runtime.topk(hidden, max(5, args.top_k))
                 exact = runtime.topk(
@@ -829,6 +898,11 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                         approx_ids & exact_ids
                     )
                     / 5.0,
+                    "lm_head_approx_mode": (
+                        "int4"
+                        if runtime.lm_head_int4_enabled
+                        else "fp8"
+                    ),
                 }
 
         if (
@@ -897,6 +971,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 args.experimental_int8_tensorcore
             ),
             "persistent_buffers": not args.no_persistent_buffers,
+            "pinned_staging": args.pinned_staging,
             "steps": max(1, args.steps),
             "warmup_steps": max(0, args.warmup_steps),
             "layers": args.layers,
@@ -1004,7 +1079,12 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 runtime.mxfp4_int8_row_override_bytes
             ),
             "mxfp4_row_postscale": args.mxfp4_row_postscale,
+            "mxfp4_selected_tensorcore": runtime.mxfp4_selected_tensorcore,
             "mxfp4_row_postscale_bytes": runtime.mxfp4_row_postscale_bytes,
+            "model_moe_top_k": runtime.model_moe_top_k,
+            "moe_top_k_limit": runtime.moe_top_k_limit,
+            "moe_top_k_renorm": runtime.moe_top_k_renorm,
+            "effective_moe_top_k": runtime.effective_moe_top_k,
             "fp8_sparse_residual_terms": runtime._fp8_sparse_residual_terms,
             "fp8_sparse_residual_bytes": runtime.fp8_sparse_residual_bytes,
             "fp8_sparse_residual_layers": sorted(
@@ -1016,6 +1096,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "fp8_sparse_residual_dtype": str(
                 runtime._fp8_sparse_residual_dtype
             ).replace("torch.", ""),
+            "embed_fp8": args.embed_fp8,
             "fp8_layers": args.fp8_layers or "all",
             "down_fp8_layers": (
                 args.down_fp8_layers or args.fp8_layers or "all"
@@ -1044,6 +1125,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                     args.qkv_fp8,
                     args.o_proj_fp8,
                     args.attn_proj_fp8,
+                    args.embed_fp8,
                 )
             ),
             "exact_topk": args.exact_topk,
@@ -1115,7 +1197,7 @@ def cmd_optimize_runtime(args: argparse.Namespace) -> dict[str, Any]:
     candidates = []
     try:
         for residency in ["all", "stream"]:
-            for kv in ["fp8", "q8", "q4", "q3", "q2"]:
+            for kv in ["bf16", "fp16"]:
                 for prefetch in [0, 1, 2, 4]:
                     profile = build_runtime_profile(
                         archive.manifest,
@@ -1160,6 +1242,7 @@ def build_runtime_profile(
     forced_residency: str | None = None,
     forced_prefetch: int | None = None,
 ) -> dict[str, Any]:
+    kv_executable = str(kv).lower() in PagedKVCache.EXACT_CODECS
     model = manifest["model"]
     pages = [page for page in manifest.get("pages", []) if page.get("kind") != "fused_physical"]
     globals_ = [page["id"] for page in pages if page.get("layer") is None]
@@ -1192,10 +1275,11 @@ def build_runtime_profile(
         "vram_bytes": vram_bytes,
         "ctx": ctx,
         "batch": batch,
-        "fits": expected_total <= vram_bytes,
+        "fits": kv_executable and expected_total <= vram_bytes,
         "chosen_weight_layout": native_layouts[0] if native_layouts else "generic",
         "available_layouts": layouts,
         "chosen_kv_dtype": kv,
+        "kv_executable": kv_executable,
         "resident_pages": pages_to_ranges(globals_ if residency == "stream" else [page["id"] for page in pages]),
         "resident_page_count": len(globals_ if residency == "stream" else pages),
         "streamed_pages": pages_to_ranges(layer_pages if residency == "stream" else []),
@@ -1272,7 +1356,8 @@ def compatibility_matrix(device: str) -> dict[str, Any]:
         "device": device,
         "cuda_capability": capability,
         "weights": ["fp32", "fp16", "bf16", "q8_contract", "q4_contract"],
-        "kv": ["fp16", "bf16", "fp8", "q8", "q4", "q3", "q2"],
+        "kv": ["fp16", "bf16"],
+        "lossy_kv": "capacity_model_only_not_executable",
         "nvfp4_kv": bool(capability and int(capability.split(".")[0]) >= 10),
     }
 
@@ -1281,8 +1366,8 @@ def unsupported_runtime_flags(args: argparse.Namespace) -> dict[str, str]:
     gates = {}
     if args.kv_layout == "cuda-vmm":
         gates["cuda_vmm_kv"] = "requested; v0 records profile contract but uses paged KV backend"
-    if args.cuda_graphs and (args.device != "cuda" or args.residency != "all"):
-        gates["cuda_graphs"] = "requested; CUDA Graphs only supported in all-resident CUDA mode"
+    if args.cuda_graphs and args.device != "cuda":
+        gates["cuda_graphs"] = "requested; CUDA Graphs require CUDA"
     if args.gds:
         gates["gpudirect_storage"] = "requested; v0 falls back to mmap plus pinned staging"
     if args.speculative or args.draft is not None:

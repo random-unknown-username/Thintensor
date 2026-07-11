@@ -1,0 +1,54 @@
+{
+  "model": "openai/gpt-oss-20b",
+  "date": "2026-07-11",
+  "device": "NVIDIA GeForce RTX 5050 Laptop GPU",
+  "comparison": "200 generated tokens, batch 1, full GPU offload/residency",
+  "thinruntime": {
+    "archive": "/home/satvik/.cache/thintensor/models/openai--gpt-oss-20b/gpt-oss-20b.thin",
+    "command": "python scripts/thin_runtime.py run /home/satvik/.cache/thintensor/models/openai--gpt-oss-20b/gpt-oss-20b.thin --device cuda --dtype bf16 --residency stream --steps 200 --warmup-steps 10 --gpu-weight-budget 7082336256 --kernel-backend triton --attention-backend torch --lm-head-backend triton --packed-expert-q2-layers 0:24 --packed-expert-q1-layers 2:22 --fused-residual-norm --fused-rope --json",
+    "steady_tokens_per_s_trials": [
+      50.37674153266006,
+      50.288500252488646,
+      50.34452184409062
+    ],
+    "steady_tokens_per_s_mean": 50.33658787641311,
+    "steady_tokens_per_s_median": 50.34452184409062,
+    "warmup_tokens": 10,
+    "measured_tokens": 200,
+    "peak_temperature_c_trials": [55, 57, 58],
+    "weight_residency_bytes": 6993010816,
+    "exact_embedding_and_lm_head": true,
+    "expert_transfer_bytes_per_token": 0,
+    "router_top_k": 4,
+    "attention_mode": "causal_kv",
+    "attention_backend": "torch"
+  },
+  "llama_cpp": {
+    "version": "b9964",
+    "backend": "Vulkan",
+    "quantization": "Q4_K_M",
+    "gguf": "benchmark_models/gpt-oss-20b-gguf/gpt-oss-20b-Q4_K_M.gguf",
+    "command": "/tmp/llama-b9964-vulkan/llama-b9964/llama-bench -m benchmark_models/gpt-oss-20b-gguf/gpt-oss-20b-Q4_K_M.gguf -p 1 -n 200 -b 1 -ub 1 -ngl 99 -dev Vulkan1 -fitt 512 -fitc 2048 -r 3 -o json",
+    "tokens_per_s_trials": [38.8324, 40.8491, 41.4077],
+    "tokens_per_s_mean": 40.363075,
+    "measured_tokens": 200,
+    "repetitions": 3
+  },
+  "speedup": {
+    "thin_median_over_llama_mean": 1.2472915367347661,
+    "percent_faster": 24.72915367347661
+  },
+  "quality": {
+    "reference": "original Thin archive MXFP4 source pages",
+    "thin_q1q2_one_step_cosine": 0.991415,
+    "thin_q1q2_optimized_step1_cosine": 0.98737633228302,
+    "thin_q1q2_optimized_step4_cosine": 0.9832991361618042,
+    "thin_q1q2_top1_same_through_step4": true,
+    "llama_q4km_step1_centered_logit_cosine": 0.7923501133918762,
+    "llama_q4km_top1_same": true
+  },
+  "artifacts": {
+    "thin_correctness": "correctness_results/thin_modes/gptoss_optimized_q1q2_prefill1_steps1_4.json",
+    "llama_quality": "correctness_results/gptoss_q4km_vs_source_mxfp4_step1.json"
+  }
+}

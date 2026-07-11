@@ -1,0 +1,110 @@
+{
+  "model": "openai/gpt-oss-20b",
+  "archive": "/home/satvik/.cache/thintensor/models/openai--gpt-oss-20b/gpt-oss-20b.thin",
+  "profile_source": "manual full ThinTensor run after adding grouped INT4 lm-head execution and high-residency packed-MoE promotion",
+  "command": "THINTENSOR_PINNED_STAGING=0 python scripts/thin_runtime.py run /home/satvik/.cache/thintensor/models/openai--gpt-oss-20b/gpt-oss-20b.thin --device cuda --dtype bf16 --residency stream --steps 200 --warmup-steps 10 --attention-mode causal_kv --max-gpu-temp 83 --json --kernel-backend triton-matvec --attention-backend torch --embed-fp8 --lm-head-int4-group-size 128 --no-pinned-staging --gpu-weight-budget 8000000000",
+  "steps": 200,
+  "warmup_steps": 10,
+  "tokens_per_s": 6.677251153064767,
+  "steady_tokens_per_s": 6.678585003049699,
+  "ms_per_token": 149.7622265625,
+  "gpu_peak_temp_c": 53,
+  "gpu_peak_allocated_bytes": 7750550528,
+  "gpu_peak_reserved_bytes": 7843348480,
+  "resident_weight_bytes": 7987620480,
+  "gpu_weight_budget_bytes": 8000000000,
+  "h2d_transfer_bytes": 136491609728,
+  "h2d_transfer_bytes_per_token": 620416407.8545455,
+  "h2d_transfer_time_ms": 12172.585197215085,
+  "selected_expert_h2d_transfer_bytes": 127961856000,
+  "selected_expert_h2d_transfer_time_ms": 11378.521192251355,
+  "effective_bandwidth_gb_s": 16.36451909305193,
+  "budget_resident_layers": "0-23",
+  "budget_resident_expert_layers": "0-12",
+  "promoted_packed_expert_layers": [10, 11, 12],
+  "streamed_packed_expert_pages": 44,
+  "streamed_packed_expert_bytes": 4653158400,
+  "packed_expert_promotion_ooms": 0,
+  "lm_head_approx_mode": "int4",
+  "lm_head_int4_group_size": 128,
+  "lm_head_fp8_bytes": 308066816,
+  "lm_head_memory_saved_bytes": 850200064,
+  "lm_head_validation": {
+    "command": "THINTENSOR_PINNED_STAGING=0 python scripts/thin_runtime.py run /home/satvik/.cache/thintensor/models/openai--gpt-oss-20b/gpt-oss-20b.thin --device cuda --dtype bf16 --residency stream --steps 8 --warmup-steps 1 --attention-mode causal_kv --max-gpu-temp 83 --json --kernel-backend triton-matvec --attention-backend torch --embed-fp8 --lm-head-int4-group-size 128 --keep-bf16-lm-head --validate-lm-head-fp8 --no-pinned-staging --gpu-weight-budget 7653097472",
+    "checkpoints": 1,
+    "lm_head_fp8_safe": true,
+    "lm_head_fp8_top1_agreement": true,
+    "lm_head_fp8_top5_overlap": 1.0,
+    "lm_head_approx_mode": "int4"
+  },
+  "rejected_probes": {
+    "lm_head_int4_group_size_2048": {
+      "tokens_per_s": 6.288551924585524,
+      "decision": "slower than group size 128"
+    },
+    "gpu_weight_budget_8400000000": {
+      "decision": "too tight for startup or backed off after promotion OOM; no speedup over 8.0GB budget"
+    },
+    "gpu_weight_budget_8100000000_after_head_reserve": {
+      "steps": 4,
+      "warmup_steps": 1,
+      "tokens_per_s": 5.788767233542345,
+      "lm_head_quantization_reserve_bytes": 375175680,
+      "packed_expert_promotion_ooms": 0,
+      "decision": "startup OOM fixed by head quantization reserve, but no extra packed expert layer fits"
+    },
+    "mxfp4_expert_slice_cache_64mib": {
+      "tokens_per_s": 6.073972683019652,
+      "hits": 0,
+      "misses": 42240,
+      "decision": "disabled by default"
+    },
+    "pinned_staging": {
+      "tokens_per_s": 5.636502607377851,
+      "cpu_stage_s": 9.215563667545212,
+      "decision": "keep pageable selected copies by default"
+    },
+    "moe_top2_limit": {
+      "steady_tokens_per_s_smoke": 9.348392191046436,
+      "selected_expert_h2d_transfer_bytes_smoke": 5525625600,
+      "correctness_artifact": "correctness_results/thin_modes/gptoss_top2_vs_full_top4.md",
+      "minimum_cosine_similarity": 0.9334375262260437,
+      "minimum_top5_overlap": 0.2,
+      "top1_same_all_records": false,
+      "decision": "speed is close to 10 tok/s, but accuracy regression is too large"
+    },
+    "moe_top3_limit": {
+      "steady_tokens_per_s_smoke": 7.472136808356684,
+      "selected_expert_h2d_transfer_bytes_smoke": 8288438400,
+      "correctness_artifact": "correctness_results/thin_modes/gptoss_top3_vs_full_top4.md",
+      "minimum_cosine_similarity": 0.983904242515564,
+      "minimum_top5_overlap": 0.6,
+      "top1_same_all_records": false,
+      "decision": "closer than top-2, but still fails top-1 and is not fast enough"
+    },
+    "moe_top3_no_renorm": {
+      "steady_tokens_per_s_smoke": 8.009704349613664,
+      "correctness_artifact": "correctness_results/thin_modes/gptoss_top3_no_renorm_vs_full_top4.md",
+      "minimum_cosine_similarity": 0.9232053160667419,
+      "minimum_top5_overlap": 0.2,
+      "top1_same_all_records": false,
+      "decision": "worse correctness than renormalized top-3"
+    }
+  },
+  "post_patch_smoke": {
+    "command": "THINTENSOR_PINNED_STAGING=0 python scripts/thin_runtime.py run /home/satvik/.cache/thintensor/models/openai--gpt-oss-20b/gpt-oss-20b.thin --device cuda --dtype bf16 --residency stream --steps 4 --warmup-steps 1 --attention-mode causal_kv --max-gpu-temp 83 --json --kernel-backend triton-matvec --attention-backend torch --embed-fp8 --lm-head-int4-group-size 128 --no-pinned-staging --gpu-weight-budget 8000000000",
+    "tokens_per_s": 6.614209974522535,
+    "steady_tokens_per_s": 6.608130069058872,
+    "budget_resident_expert_layers": "0-12",
+    "promoted_packed_expert_layers": [9, 10, 11, 12],
+    "resident_weight_bytes": 7987620480,
+    "lm_head_quantization_reserve_bytes": 375175680,
+    "packed_expert_promotion_ooms": 0
+  },
+  "previous_fp8_head_tokens_per_s": 6.25295893497454,
+  "previous_perfmode_tokens_per_s": 4.017867267400603,
+  "llamacpp_q4km_vulkan_tokens_per_s": 50.222607,
+  "thin_vs_q4_speed_ratio": 0.13295309725886525,
+  "fp8_head_relative_speedup": 0.06785463050413502,
+  "conclusion": "Grouped INT4 lm head plus an 8.0GB low-VRAM residency cap improved GPT-OSS ThinTensor to 6.68 tok/s and promoted packed expert layer 12, cutting selected-expert H2D to 127.96GB for the 200-token run. This is still only 0.133x of the same-model llama.cpp Q4_K_M Vulkan baseline, so the remaining target is to reduce streamed packed-expert traffic rather than tuning launch flags."
+}

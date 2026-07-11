@@ -24,6 +24,7 @@ pub enum WeightResidency {
     Stream,
     OffloadLastN,
     OffloadFirstN,
+    OffloadMiddleOut,
 }
 
 impl FromStr for WeightResidency {
@@ -35,6 +36,7 @@ impl FromStr for WeightResidency {
             "stream" => Ok(Self::Stream),
             "offload-last-n" => Ok(Self::OffloadLastN),
             "offload-first-n" => Ok(Self::OffloadFirstN),
+            "offload-middle-out" => Ok(Self::OffloadMiddleOut),
             _ => Err(format!("unknown weight residency mode {value}")),
         }
     }
@@ -181,7 +183,29 @@ fn page_is_resident(manifest: &Manifest, page: &PageSpec, options: &PlanOptions)
             };
             layer >= options.offload_layers.min(manifest.model.layers)
         }
+        WeightResidency::OffloadMiddleOut => {
+            let Some(layer) = page.layer else {
+                return true;
+            };
+            let offload = options.offload_layers.min(manifest.model.layers);
+            !middle_out_layers(manifest.model.layers)
+                .into_iter()
+                .take(offload as usize)
+                .any(|candidate| candidate == layer)
+        }
     }
+}
+
+fn middle_out_layers(layers: u32) -> Vec<u32> {
+    let mut result: Vec<_> = (0..layers).collect();
+    result.sort_by_key(|layer| {
+        let doubled = i64::from(*layer) * 2;
+        (
+            (doubled - i64::from(layers.saturating_sub(1))).abs(),
+            *layer,
+        )
+    });
+    result
 }
 
 fn estimate_kv_cache_bytes(manifest: &Manifest, options: &PlanOptions, batch_size: u64) -> u64 {

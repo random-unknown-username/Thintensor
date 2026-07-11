@@ -24,8 +24,10 @@ def main():
         "fp32": torch.float32,
     }[args.dtype]
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+    uses_cuda = "cuda" in args.device
+    if uses_cuda:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
     load_t0 = time.perf_counter()
 
@@ -53,7 +55,8 @@ def main():
         model.to(args.device)
     model.eval()
 
-    torch.cuda.synchronize()
+    if uses_cuda:
+        torch.cuda.synchronize()
     load_s = time.perf_counter() - load_t0
 
     input_ids = tok(args.prompt, return_tensors="pt").input_ids.to(args.device)
@@ -69,7 +72,8 @@ def main():
         past = out.past_key_values
         token = torch.argmax(out.logits[:, -1, :], dim=-1).view(1, 1)
 
-    torch.cuda.synchronize()
+    if uses_cuda:
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     for _ in range(args.steps):
@@ -77,7 +81,8 @@ def main():
         past = out.past_key_values
         token = torch.argmax(out.logits[:, -1, :], dim=-1).view(1, 1)
 
-    torch.cuda.synchronize()
+    if uses_cuda:
+        torch.cuda.synchronize()
     t1 = time.perf_counter()
 
     # After timing only.
@@ -95,8 +100,12 @@ def main():
         "tokens_per_s": args.steps / dt,
         "ms_per_token": 1000.0 * dt / args.steps,
         "final_token": final_token,
-        "gpu_peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
-        "gpu_peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        "gpu_peak_allocated_bytes": (
+            int(torch.cuda.max_memory_allocated()) if uses_cuda else None
+        ),
+        "gpu_peak_reserved_bytes": (
+            int(torch.cuda.max_memory_reserved()) if uses_cuda else None
+        ),
         "note": "Custom greedy decode loop. No token .item() inside timed loop.",
     }, indent=2))
 

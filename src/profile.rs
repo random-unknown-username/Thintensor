@@ -4,6 +4,7 @@ use crate::archive::Archive;
 use crate::plan::{Plan, PlanOptions, PlanStatus, WeightResidency, build_plan};
 use crate::stats::{BucketStats, LayerStats, PageStats, build_stats};
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 pub struct ProfileOptions {
@@ -104,22 +105,22 @@ fn candidate_plans(archive: &Archive, options: &ProfileOptions) -> Vec<(String, 
     let quarter = (layers / 4).max(1);
     let half = (layers / 2).max(1);
     let candidates = [
-        ("all_q4", WeightResidency::All, 0, "q4"),
-        ("all_q2", WeightResidency::All, 0, "q2"),
+        ("all_weights_kv_q4", WeightResidency::All, 0, "q4"),
+        ("all_weights_kv_q2", WeightResidency::All, 0, "q2"),
         (
-            "offload_last_quarter_q4",
-            WeightResidency::OffloadLastN,
+            "offload_middle_quarter_kv_q4",
+            WeightResidency::OffloadMiddleOut,
             quarter,
             "q4",
         ),
         (
-            "offload_last_half_q4",
-            WeightResidency::OffloadLastN,
+            "offload_middle_half_kv_q4",
+            WeightResidency::OffloadMiddleOut,
             half,
             "q4",
         ),
-        ("stream_q4", WeightResidency::Stream, 0, "q4"),
-        ("stream_q2", WeightResidency::Stream, 0, "q2"),
+        ("stream_weights_kv_q4", WeightResidency::Stream, 0, "q4"),
+        ("stream_weights_kv_q2", WeightResidency::Stream, 0, "q2"),
     ];
 
     candidates
@@ -183,13 +184,18 @@ fn always_hot_pages(archive: &Archive) -> Vec<String> {
 
 fn streamable_pages(archive: &Archive) -> Vec<String> {
     let manifest = archive.manifest();
+    let layered: BTreeSet<&str> = manifest
+        .pages
+        .iter()
+        .filter(|page| page.layer.is_some())
+        .map(|page| page.id.as_str())
+        .collect();
+    let mut seen = BTreeSet::new();
     let mut pages = Vec::new();
     for stage in &manifest.execution_tape {
         for page_id in &stage.page_refs {
-            if let Some(page) = manifest.pages.iter().find(|page| page.id == *page_id)
-                && page.layer.is_some()
-            {
-                pages.push(page.id.clone());
+            if layered.contains(page_id.as_str()) && seen.insert(page_id.as_str()) {
+                pages.push(page_id.clone());
             }
         }
     }
@@ -206,16 +212,18 @@ fn cpu_offload_candidates(largest_pages: &[PageStats]) -> Vec<PageStats> {
 }
 
 fn is_big_weight(page: &PageStats) -> bool {
-    matches!(
-        page.op.as_str(),
-        "mlp_down_proj"
-            | "mlp_gate_proj"
-            | "mlp_up_proj"
-            | "attn_q_proj"
-            | "attn_k_proj"
-            | "attn_v_proj"
-            | "attn_o_proj"
-    )
+    let op = page.op.as_str();
+    op.starts_with("attn_") && op.ends_with("_proj")
+        || op.starts_with("mlp_") && op.ends_with("_proj")
+        || matches!(op, "moe_gate_up" | "moe_down")
+        || op.starts_with("linear_attn_")
+            && matches!(
+                op,
+                "linear_attn_input_projection"
+                    | "linear_attn_depthwise_conv"
+                    | "linear_attn_output_projection"
+            )
+        || matches!(op, "per_layer_model_projection" | "per_layer_projection")
 }
 
 fn profile_notes(stats: &crate::stats::ArchiveStats, selected_plan: Option<&Plan>) -> Vec<String> {

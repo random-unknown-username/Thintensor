@@ -149,6 +149,9 @@ def run_case(
                 "top_logits": benchmark.get("top_logits"),
                 "attention_mode": benchmark.get("attention_mode"),
                 "not_hf_equivalent": benchmark.get("not_hf_equivalent"),
+                "steady_state_eligible": (
+                    args.steps >= 200 and args.warmup_steps >= 10
+                ),
                 "body_fp8_memory_saved_bytes": benchmark.get(
                     "body_fp8_memory_saved_bytes"
                 ),
@@ -245,6 +248,7 @@ def write_outputs(out_dir: Path, rows: list[dict[str, Any]]) -> None:
             and row.get("hf_equivalent")
             and row.get("attention_mode") == "causal_kv"
             and not row.get("not_hf_equivalent")
+            and row.get("steady_state_eligible")
         ):
             safe.append(
                 f"- {label}: {number(row.get('tokens_per_s'))} tok/s in "

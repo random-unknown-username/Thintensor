@@ -49,6 +49,7 @@ thinruntime = ["bin/*"]
 "share/thintensor/scripts" = [
   "scripts/bench_hf_transformers_decode.py",
   "scripts/compare_hf_thin_logits.py",
+  "scripts/compare_thin_modes.py",
   "scripts/optimize_runtime_one_by_one.py",
   "scripts/stress_validate_thin.py",
   "scripts/thin_runtime.py",

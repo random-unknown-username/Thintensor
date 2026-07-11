@@ -1,0 +1,976 @@
+{
+  "case_count": 3,
+  "elapsed_s": 7.024733887999901,
+  "hf_model": "/home/satvik/.cache/thintensor/models/unsloth--Llama-3.2-11B-Vision-Instruct",
+  "metric_scope": "top-20 only; Ollama 0.21 rejects top_logprobs > 20, so this is not full-vocabulary logit cosine",
+  "min_top20_logprob_cosine_with_floor": 0.5056079263212657,
+  "min_top20_overlap_fraction": 0.55,
+  "min_top20_probability_cosine": 0.7204952047380317,
+  "ollama_model": "llama3.2-vision:11b",
+  "ollama_quantization": "Q4_K_M",
+  "rows": [
+    {
+      "hf_input_tokens": 36,
+      "hf_top1": {
+        "logprob": -0.7719940543174744,
+        "token": "It",
+        "token_id": 2181
+      },
+      "hf_top20": [
+        {
+          "logprob": -0.7719940543174744,
+          "token": "It",
+          "token_id": 2181
+        },
+        {
+          "logprob": -0.8969940543174744,
+          "token": "How",
+          "token_id": 4438
+        },
+        {
+          "logprob": -2.146994113922119,
+          "token": "Hello",
+          "token_id": 9906
+        },
+        {
+          "logprob": -4.771994113922119,
+          "token": "Is",
+          "token_id": 3957
+        },
+        {
+          "logprob": -5.896994113922119,
+          "token": "Welcome",
+          "token_id": 14262
+        },
+        {
+          "logprob": -7.396994113922119,
+          "token": "What",
+          "token_id": 3923
+        },
+        {
+          "logprob": -8.021993637084961,
+          "token": "Its",
+          "token_id": 37220
+        },
+        {
+          "logprob": -8.021993637084961,
+          "token": " How",
+          "token_id": 2650
+        },
+        {
+          "logprob": -8.021993637084961,
+          "token": " Hello",
+          "token_id": 22691
+        },
+        {
+          "logprob": -8.646993637084961,
+          "token": "Hi",
+          "token_id": 13347
+        },
+        {
+          "logprob": -9.271993637084961,
+          "token": " It",
+          "token_id": 1102
+        },
+        {
+          "logprob": -10.646993637084961,
+          "token": "\u5b83",
+          "token_id": 103282
+        },
+        {
+          "logprob": -11.271993637084961,
+          "token": "hello",
+          "token_id": 15339
+        },
+        {
+          "logprob": -11.459493637084961,
+          "token": "That",
+          "token_id": 4897
+        },
+        {
+          "logprob": -11.459493637084961,
+          "token": "it",
+          "token_id": 275
+        },
+        {
+          "logprob": -11.459493637084961,
+          "token": "Nice",
+          "token_id": 46078
+        },
+        {
+          "logprob": -11.521993637084961,
+          "token": "Can",
+          "token_id": 6854
+        },
+        {
+          "logprob": -11.646993637084961,
+          "token": "You",
+          "token_id": 2675
+        },
+        {
+          "logprob": -11.646993637084961,
+          "token": " it",
+          "token_id": 433
+        },
+        {
+          "logprob": -11.709493637084961,
+          "token": "Greetings",
+          "token_id": 92886
+        }
+      ],
+      "messages": [
+        {
+          "content": "Hello",
+          "role": "user"
+        }
+      ],
+      "ollama_top1": {
+        "logprob": -0.9971672892570496,
+        "token": "Hello"
+      },
+      "ollama_top20": [
+        {
+          "bytes": [
+            72,
+            101,
+            108,
+            108,
+            111
+          ],
+          "logprob": -0.9971672892570496,
+          "token": "Hello"
+        },
+        {
+          "bytes": [
+            72,
+            111,
+            119
+          ],
+          "logprob": -1.1426427364349365,
+          "token": "How"
+        },
+        {
+          "bytes": [
+            73,
+            116
+          ],
+          "logprob": -1.9178998470306396,
+          "token": "It"
+        },
+        {
+          "bytes": [
+            73
+          ],
+          "logprob": -2.565173864364624,
+          "token": "I"
+        },
+        {
+          "bytes": [
+            87,
+            104,
+            97,
+            116
+          ],
+          "logprob": -3.319883108139038,
+          "token": "What"
+        },
+        {
+          "bytes": [
+            72,
+            105
+          ],
+          "logprob": -4.388417720794678,
+          "token": "Hi"
+        },
+        {
+          "bytes": [
+            87,
+            101,
+            108,
+            99,
+            111,
+            109,
+            101
+          ],
+          "logprob": -4.556830883026123,
+          "token": "Welcome"
+        },
+        {
+          "bytes": [
+            73,
+            115
+          ],
+          "logprob": -5.116574764251709,
+          "token": "Is"
+        },
+        {
+          "bytes": [
+            89,
+            111,
+            117
+          ],
+          "logprob": -5.958070278167725,
+          "token": "You"
+        },
+        {
+          "bytes": [
+            67,
+            97,
+            110
+          ],
+          "logprob": -6.177287578582764,
+          "token": "Can"
+        },
+        {
+          "bytes": [
+            78,
+            105,
+            99,
+            101
+          ],
+          "logprob": -6.338620662689209,
+          "token": "Nice"
+        },
+        {
+          "bytes": [
+            84,
+            104,
+            101
+          ],
+          "logprob": -6.467519283294678,
+          "token": "The"
+        },
+        {
+          "bytes": [
+            72,
+            111,
+            119,
+            101,
+            118,
+            101,
+            114
+          ],
+          "logprob": -6.628024578094482,
+          "token": "However"
+        },
+        {
+          "bytes": [
+            84,
+            104,
+            101,
+            114,
+            101
+          ],
+          "logprob": -6.705855846405029,
+          "token": "There"
+        },
+        {
+          "bytes": [
+            71,
+            111,
+            111,
+            100
+          ],
+          "logprob": -6.731439113616943,
+          "token": "Good"
+        },
+        {
+          "bytes": [
+            87,
+            104,
+            111
+          ],
+          "logprob": -6.782541751861572,
+          "token": "Who"
+        },
+        {
+          "bytes": [
+            87,
+            111,
+            117,
+            108,
+            100
+          ],
+          "logprob": -7.536268711090088,
+          "token": "Would"
+        },
+        {
+          "bytes": [
+            65
+          ],
+          "logprob": -7.600135326385498,
+          "token": "A"
+        },
+        {
+          "bytes": [
+            84,
+            104,
+            97,
+            116
+          ],
+          "logprob": -7.6821064949035645,
+          "token": "That"
+        },
+        {
+          "bytes": [
+            78,
+            111,
+            116
+          ],
+          "logprob": -7.842326641082764,
+          "token": "Not"
+        }
+      ],
+      "ollama_usage": {
+        "eval_count": 1,
+        "eval_duration": null,
+        "prompt_eval_count": 10,
+        "prompt_eval_duration": 54026361
+      },
+      "top1_same_text": false,
+      "top20_logprob_cosine_with_floor": 0.5303749655702765,
+      "top20_overlap_count": 11,
+      "top20_overlap_fraction": 0.55,
+      "top20_probability_cosine": 0.7440204532608855
+    },
+    {
+      "hf_input_tokens": 46,
+      "hf_top1": {
+        "logprob": -0.651071310043335,
+        "token": "**",
+        "token_id": 334
+      },
+      "hf_top20": [
+        {
+          "logprob": -0.651071310043335,
+          "token": "**",
+          "token_id": 334
+        },
+        {
+          "logprob": -1.151071310043335,
+          "token": "Here",
+          "token_id": 8586
+        },
+        {
+          "logprob": -3.151071310043335,
+          "token": "To",
+          "token_id": 1271
+        },
+        {
+          "logprob": -3.526071310043335,
+          "token": "Below",
+          "token_id": 39314
+        },
+        {
+          "logprob": -3.651071310043335,
+          "token": "#",
+          "token_id": 2
+        },
+        {
+          "logprob": -3.776071310043335,
+          "token": "##",
+          "token_id": 567
+        },
+        {
+          "logprob": -4.151071548461914,
+          "token": "You",
+          "token_id": 2675
+        },
+        {
+          "logprob": -4.276071548461914,
+          "token": "###",
+          "token_id": 14711
+        },
+        {
+          "logprob": -5.526071548461914,
+          "token": "Thin",
+          "token_id": 94188
+        },
+        {
+          "logprob": -5.901071548461914,
+          "token": "Benchmark",
+          "token_id": 86071
+        },
+        {
+          "logprob": -6.901071548461914,
+          "token": "```",
+          "token_id": 74694
+        },
+        {
+          "logprob": -7.901071548461914,
+          "token": "Th",
+          "token_id": 1016
+        },
+        {
+          "logprob": -8.151071548461914,
+          "token": "A",
+          "token_id": 32
+        },
+        {
+          "logprob": -8.151071548461914,
+          "token": "For",
+          "token_id": 2520
+        },
+        {
+          "logprob": -8.151071548461914,
+          "token": "B",
+          "token_id": 33
+        },
+        {
+          "logprob": -8.401071548461914,
+          "token": "Raw",
+          "token_id": 20613
+        },
+        {
+          "logprob": -8.401071548461914,
+          "token": "Compar",
+          "token_id": 17561
+        },
+        {
+          "logprob": -8.526071548461914,
+          "token": "The",
+          "token_id": 791
+        },
+        {
+          "logprob": -8.588571548461914,
+          "token": "Creating",
+          "token_id": 26021
+        },
+        {
+          "logprob": -9.276071548461914,
+          "token": "`",
+          "token_id": 63
+        }
+      ],
+      "messages": [
+        {
+          "content": "ThinTensor benchmark prompt for comparing raw greedy decode throughput.",
+          "role": "user"
+        }
+      ],
+      "ollama_top1": {
+        "logprob": -0.44633421301841736,
+        "token": "Here"
+      },
+      "ollama_top20": [
+        {
+          "bytes": [
+            72,
+            101,
+            114,
+            101
+          ],
+          "logprob": -0.44633421301841736,
+          "token": "Here"
+        },
+        {
+          "bytes": [
+            42,
+            42
+          ],
+          "logprob": -1.764487624168396,
+          "token": "**"
+        },
+        {
+          "bytes": [
+            96,
+            96,
+            96
+          ],
+          "logprob": -3.296260118484497,
+          "token": "```"
+        },
+        {
+          "bytes": [
+            35
+          ],
+          "logprob": -3.756678819656372,
+          "token": "#"
+        },
+        {
+          "bytes": [
+            66,
+            101,
+            108,
+            111,
+            119
+          ],
+          "logprob": -3.8307602405548096,
+          "token": "Below"
+        },
+        {
+          "bytes": [
+            96,
+            96
+          ],
+          "logprob": -4.252334117889404,
+          "token": "``"
+        },
+        {
+          "bytes": [
+            89,
+            111,
+            117
+          ],
+          "logprob": -4.416228771209717,
+          "token": "You"
+        },
+        {
+          "bytes": [
+            84,
+            111
+          ],
+          "logprob": -4.452022075653076,
+          "token": "To"
+        },
+        {
+          "bytes": [
+            84,
+            104,
+            105,
+            110
+          ],
+          "logprob": -4.648074626922607,
+          "token": "Thin"
+        },
+        {
+          "bytes": [
+            96
+          ],
+          "logprob": -4.682981014251709,
+          "token": "`"
+        },
+        {
+          "bytes": [
+            84,
+            104,
+            101
+          ],
+          "logprob": -4.829609394073486,
+          "token": "The"
+        },
+        {
+          "bytes": [
+            65
+          ],
+          "logprob": -5.104008197784424,
+          "token": "A"
+        },
+        {
+          "bytes": [
+            35,
+            35
+          ],
+          "logprob": -5.337917804718018,
+          "token": "##"
+        },
+        {
+          "bytes": [
+            84,
+            104,
+            105,
+            115
+          ],
+          "logprob": -6.102403163909912,
+          "token": "This"
+        },
+        {
+          "bytes": [
+            66,
+            101,
+            110,
+            99,
+            104,
+            109,
+            97,
+            114,
+            107
+          ],
+          "logprob": -6.1238627433776855,
+          "token": "Benchmark"
+        },
+        {
+          "bytes": [
+            73,
+            116
+          ],
+          "logprob": -6.214599132537842,
+          "token": "It"
+        },
+        {
+          "bytes": [
+            35,
+            35,
+            35
+          ],
+          "logprob": -6.36594820022583,
+          "token": "###"
+        },
+        {
+          "bytes": [
+            73
+          ],
+          "logprob": -6.3671555519104,
+          "token": "I"
+        },
+        {
+          "bytes": [
+            42
+          ],
+          "logprob": -6.39310884475708,
+          "token": "*"
+        },
+        {
+          "bytes": [
+            73,
+            110
+          ],
+          "logprob": -6.42720365524292,
+          "token": "In"
+        }
+      ],
+      "ollama_usage": {
+        "eval_count": 1,
+        "eval_duration": null,
+        "prompt_eval_count": 20,
+        "prompt_eval_duration": 192008318
+      },
+      "top1_same_text": false,
+      "top20_logprob_cosine_with_floor": 0.5056079263212657,
+      "top20_overlap_count": 14,
+      "top20_overlap_fraction": 0.7,
+      "top20_probability_cosine": 0.7204952047380317
+    },
+    {
+      "hf_input_tokens": 47,
+      "hf_top1": {
+        "logprob": -0.07681989669799805,
+        "token": "Quant",
+        "token_id": 45320
+      },
+      "hf_top20": [
+        {
+          "logprob": -0.07681989669799805,
+          "token": "Quant",
+          "token_id": 45320
+        },
+        {
+          "logprob": -3.326819896697998,
+          "token": "In",
+          "token_id": 644
+        },
+        {
+          "logprob": -3.701819896697998,
+          "token": "During",
+          "token_id": 16397
+        },
+        {
+          "logprob": -4.451819896697998,
+          "token": "When",
+          "token_id": 4599
+        },
+        {
+          "logprob": -6.576819896697998,
+          "token": "Log",
+          "token_id": 2250
+        },
+        {
+          "logprob": -9.451820373535156,
+          "token": "Qu",
+          "token_id": 2232
+        },
+        {
+          "logprob": -9.951820373535156,
+          "token": "The",
+          "token_id": 791
+        },
+        {
+          "logprob": -11.201820373535156,
+          "token": " Quant",
+          "token_id": 32541
+        },
+        {
+          "logprob": -11.701820373535156,
+          "token": "quant",
+          "token_id": 31548
+        },
+        {
+          "logprob": -11.701820373535156,
+          "token": "Upon",
+          "token_id": 50384
+        },
+        {
+          "logprob": -11.826820373535156,
+          "token": "Prior",
+          "token_id": 50571
+        },
+        {
+          "logprob": -11.951820373535156,
+          "token": "A",
+          "token_id": 32
+        },
+        {
+          "logprob": -12.076820373535156,
+          "token": "during",
+          "token_id": 82977
+        },
+        {
+          "logprob": -12.576820373535156,
+          "token": "Logs",
+          "token_id": 52153
+        },
+        {
+          "logprob": -12.701820373535156,
+          "token": "Quantity",
+          "token_id": 17794
+        },
+        {
+          "logprob": -12.826820373535156,
+          "token": "Logging",
+          "token_id": 35675
+        },
+        {
+          "logprob": -12.826820373535156,
+          "token": "Before",
+          "token_id": 10438
+        },
+        {
+          "logprob": -12.889320373535156,
+          "token": "Due",
+          "token_id": 34160
+        },
+        {
+          "logprob": -12.889320373535156,
+          "token": "However",
+          "token_id": 11458
+        },
+        {
+          "logprob": -12.889320373535156,
+          "token": "At",
+          "token_id": 1688
+        }
+      ],
+      "messages": [
+        {
+          "content": "Explain why quantization changes logits in one short paragraph.",
+          "role": "user"
+        }
+      ],
+      "ollama_top1": {
+        "logprob": -0.20068185031414032,
+        "token": "Quant"
+      },
+      "ollama_top20": [
+        {
+          "bytes": [
+            81,
+            117,
+            97,
+            110,
+            116
+          ],
+          "logprob": -0.20068185031414032,
+          "token": "Quant"
+        },
+        {
+          "bytes": [
+            87,
+            104,
+            101,
+            110
+          ],
+          "logprob": -1.9817372560501099,
+          "token": "When"
+        },
+        {
+          "bytes": [
+            73,
+            110
+          ],
+          "logprob": -3.863741159439087,
+          "token": "In"
+        },
+        {
+          "bytes": [
+            68,
+            117,
+            114,
+            105,
+            110,
+            103
+          ],
+          "logprob": -3.937633752822876,
+          "token": "During"
+        },
+        {
+          "bytes": [
+            76,
+            111,
+            103
+          ],
+          "logprob": -7.51249885559082,
+          "token": "Log"
+        },
+        {
+          "bytes": [
+            84,
+            104,
+            101
+          ],
+          "logprob": -7.52574348449707,
+          "token": "The"
+        },
+        {
+          "bytes": [
+            72,
+            101,
+            114,
+            101
+          ],
+          "logprob": -7.865083694458008,
+          "token": "Here"
+        },
+        {
+          "bytes": [
+            81,
+            117
+          ],
+          "logprob": -8.549148559570312,
+          "token": "Qu"
+        },
+        {
+          "bytes": [
+            73
+          ],
+          "logprob": -8.658363342285156,
+          "token": "I"
+        },
+        {
+          "bytes": [
+            65
+          ],
+          "logprob": -8.712621688842773,
+          "token": "A"
+        },
+        {
+          "bytes": [
+            32,
+            81,
+            117,
+            97,
+            110,
+            116
+          ],
+          "logprob": -9.520231246948242,
+          "token": " Quant"
+        },
+        {
+          "bytes": [
+            79,
+            110,
+            101
+          ],
+          "logprob": -9.674225807189941,
+          "token": "One"
+        },
+        {
+          "bytes": [
+            87,
+            105,
+            116,
+            104
+          ],
+          "logprob": -9.682823181152344,
+          "token": "With"
+        },
+        {
+          "bytes": [
+            65,
+            115
+          ],
+          "logprob": -9.84170150756836,
+          "token": "As"
+        },
+        {
+          "bytes": [
+            84,
+            111
+          ],
+          "logprob": -9.924110412597656,
+          "token": "To"
+        },
+        {
+          "bytes": [
+            72,
+            111,
+            119,
+            101,
+            118,
+            101,
+            114
+          ],
+          "logprob": -9.997581481933594,
+          "token": "However"
+        },
+        {
+          "bytes": [
+            113,
+            117,
+            97,
+            110,
+            116
+          ],
+          "logprob": -10.184593200683594,
+          "token": "quant"
+        },
+        {
+          "bytes": [
+            80,
+            114,
+            105,
+            111,
+            114
+          ],
+          "logprob": -10.316381454467773,
+          "token": "Prior"
+        },
+        {
+          "bytes": [
+            65,
+            102,
+            116,
+            101,
+            114
+          ],
+          "logprob": -10.340340614318848,
+          "token": "After"
+        },
+        {
+          "bytes": [
+            66,
+            101,
+            99,
+            97,
+            117,
+            115,
+            101
+          ],
+          "logprob": -10.414958000183105,
+          "token": "Because"
+        }
+      ],
+      "ollama_usage": {
+        "eval_count": 1,
+        "eval_duration": null,
+        "prompt_eval_count": 21,
+        "prompt_eval_duration": 198576433
+      },
+      "top1_same_text": true,
+      "top20_logprob_cosine_with_floor": 0.6512388420110109,
+      "top20_overlap_count": 12,
+      "top20_overlap_fraction": 0.6,
+      "top20_probability_cosine": 0.988042525009662
+    }
+  ],
+  "top1_same_all": false
+}

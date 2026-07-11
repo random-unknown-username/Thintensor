@@ -1,0 +1,92 @@
+{
+  "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b.thin",
+  "candidate": "ThinTensor selected runtime flags",
+  "candidate_flags": {
+    "down_fp8_layers": null,
+    "down_proj_fp8": true,
+    "fp8_layers": null,
+    "fused_residual_norm": true,
+    "fused_rope": true,
+    "fused_scaled_mlp": true,
+    "gate_up_fp8": true,
+    "mlp_fp8": false,
+    "o_fp8_layers": null,
+    "o_proj_fp8": true,
+    "pinned_staging": false,
+    "qkv_fp8": true,
+    "qkv_fp8_layers": null
+  },
+  "minimum_cosine_similarity": 0.9979195594787598,
+  "minimum_generated_token_match_rate": 1.0,
+  "minimum_top5_overlap": 1.0,
+  "record_count": 1,
+  "records": [
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b.thin",
+      "candidate_tokens": [
+        108832
+      ],
+      "candidate_top5": [
+        {
+          "logit": 10.0,
+          "token_id": 108832
+        },
+        {
+          "logit": 8.75,
+          "token_id": 9419
+        },
+        {
+          "logit": 8.5,
+          "token_id": 130199
+        },
+        {
+          "logit": 8.125,
+          "token_id": 26357
+        },
+        {
+          "logit": 8.0625,
+          "token_id": 110931
+        }
+      ],
+      "cosine_similarity": 0.9979195594787598,
+      "decode_step": 1,
+      "generated_token_match_rate": 1.0,
+      "kv_tokens_attended": 1,
+      "kv_tokens_expected": 1,
+      "max_abs_logit_error": 0.640625,
+      "mean_abs_logit_error": 0.09287405014038086,
+      "prefill_length": 1,
+      "prompt": "Hello",
+      "reference_tokens": [
+        108832
+      ],
+      "reference_top5": [
+        {
+          "logit": 9.75,
+          "token_id": 108832
+        },
+        {
+          "logit": 8.6875,
+          "token_id": 9419
+        },
+        {
+          "logit": 8.625,
+          "token_id": 130199
+        },
+        {
+          "logit": 8.1875,
+          "token_id": 110931
+        },
+        {
+          "logit": 8.1875,
+          "token_id": 26357
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 1.0
+    }
+  ],
+  "reference": "ThinTensor BF16 streamed weights",
+  "tokenizer": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B",
+  "top1_same_all_records": true
+}

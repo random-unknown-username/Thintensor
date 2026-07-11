@@ -1,0 +1,23 @@
+{
+  "model": "openai/gpt-oss-20b",
+  "archive": "/home/satvik/.cache/thintensor/models/openai--gpt-oss-20b/gpt-oss-20b.thin",
+  "profile_source": "autofit selected command rerun after user enabled laptop performance mode",
+  "steps": 200,
+  "warmup_steps": 10,
+  "tokens_per_s": 4.017867267400603,
+  "steady_tokens_per_s": 4.017487343844116,
+  "ms_per_token": 248.88826171875,
+  "gpu_peak_temp_c": 54,
+  "gpu_peak_allocated_bytes": 7577390080,
+  "gpu_peak_reserved_bytes": 7654604800,
+  "resident_weight_bytes": 6985307968,
+  "h2d_transfer_bytes": 312216993344,
+  "h2d_transfer_bytes_per_token": 1419168151.5636363,
+  "selected_expert_h2d_transfer_bytes": 151227648000,
+  "selected_expert_h2d_transfer_time_ms": 12906.387971175718,
+  "effective_bandwidth_gb_s": 9.775836976793443,
+  "previous_tokens_per_s": 4.029815598156863,
+  "previous_ms_per_token": 248.1503125,
+  "previous_h2d_transfer_bytes_per_token": 1419168151.5636363,
+  "conclusion": "Performance mode did not materially change throughput; remaining bottleneck is streamed H2D weight traffic."
+}

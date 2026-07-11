@@ -1,9 +1,7 @@
-"""Architecture capability discovery for engine routing.
+"""Operator-driven native capability discovery.
 
-ThinTensor accepts any Transformers causal-LM source.  This module decides
-whether the native decoder can execute it or whether the CLI should retain the
-source as a Transformers fallback.  Decisions are based on semantics and
-tensor structure, never a hard-coded model repository name.
+Model-family names carry evidence labels only. Native execution is accepted
+when geometry, tensor roles, and every required operator have an implementation.
 """
 
 from __future__ import annotations
@@ -12,6 +10,9 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from .model_arch import required_operators_from_config
+from .operator_registry import unsupported_operators
 
 
 @dataclass(frozen=True)
@@ -57,13 +58,21 @@ def analyze_hf_directory(path: str | Path) -> NativeSupport:
         for key in ("architectures", "tie_word_embeddings", "model_type"):
             if key in config:
                 effective[key] = config[key]
+        skipped_layers = len(_cross_attention_layers(config))
+        if skipped_layers:
+            layer_count = int(
+                _config_value(
+                    effective,
+                    "num_hidden_layers",
+                    "n_layer",
+                    "num_layers",
+                )
+                or 0
+            )
+            if layer_count:
+                effective["num_hidden_layers"] = max(0, layer_count - skipped_layers)
         config = effective
-        prefix = "model.language_model."
-        tensor_names = tuple(
-            f"model.{name.removeprefix(prefix)}"
-            for name in tensor_names
-            if name.startswith(prefix)
-        )
+        tensor_names = _canonical_text_tensor_names(config_path, tensor_names)
     return analyze_config(config, tensor_names=tensor_names)
 
 
@@ -146,31 +155,23 @@ def _semantic_reasons(
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     required_config = (
-        "hidden_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "vocab_size",
+        ("hidden_size", "hidden_size", "n_embd", "d_model"),
+        ("num_hidden_layers", "num_hidden_layers", "layers", "n_layer", "num_layers"),
+        ("num_attention_heads", "num_attention_heads", "heads", "n_head", "num_heads"),
+        ("vocab_size", "vocab_size", "n_vocab", "padded_vocab_size"),
     )
-    for field in required_config:
-        archive_field = {
-            "num_hidden_layers": "layers",
-            "num_attention_heads": "heads",
-        }.get(field, field)
-        if config.get(field) is None and config.get(archive_field) is None:
+    for field, *aliases in required_config:
+        if _config_value(config, *aliases) is None:
             reasons.append(f"missing required geometry field {field}")
 
-    supported_activations = {"silu", "swish"}
-    if str(config.get("model_type") or "").lower() == "gemma2" or str(
-        config.get("model_type") or ""
-    ).lower().startswith("gemma4"):
-        supported_activations.add("gelu_pytorch_tanh")
+    supported_activations = {"silu", "swish", "gelu_pytorch_tanh"}
     if activation not in supported_activations:
         reasons.append(
             f"native gated-MLP engine does not implement activation {activation!r}"
         )
     if (
         config.get("rms_norm_eps") is None
-        and config.get("layer_norm_eps") is None
+        and _config_value(config, "layer_norm_eps", "layer_norm_epsilon") is None
         and config.get("norm_eps") is None
         and str(config.get("model_type") or "").lower() != "olmoe"
     ):
@@ -179,17 +180,33 @@ def _semantic_reasons(
         )
 
     heads = int(
-        config.get("num_attention_heads")
-        or config.get("heads")
+        _config_value(
+            config, "num_attention_heads", "heads", "n_head", "num_heads"
+        )
         or 0
     )
-    hidden = int(config.get("hidden_size") or 0)
+    hidden = int(_config_value(config, "hidden_size", "n_embd", "d_model") or 0)
     head_dim = int(config.get("head_dim") or (hidden // heads if heads else 0))
     if not heads or not head_dim or head_dim % 2:
         reasons.append("attention head geometry is missing or has odd head_dim")
 
     if family not in {"decoder_dense", "decoder_moe", "hybrid_decoder"}:
         reasons.append(f"unsupported architecture family {family!r}")
+
+    try:
+        required_operators = tuple(config.get("required_operators") or ())
+        if not required_operators:
+            required_operators = required_operators_from_config(
+                config, tensor_names
+            )
+        missing_operators = unsupported_operators(required_operators)
+        if missing_operators:
+            reasons.append(
+                "native operator registry is missing: "
+                + ", ".join(missing_operators)
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        reasons.append(f"cannot compile required operator contract: {exc}")
 
     if family == "hybrid_decoder":
         for field in (
@@ -249,16 +266,6 @@ def _semantic_reasons(
             )
             if not separate_mlp and not fused_mlp:
                 reasons.append("native tensor layout requires a gated MLP")
-            if str(config.get("model_type") or "").lower() == "gemma2":
-                for suffix in (
-                    "pre_feedforward_layernorm.weight",
-                    "post_feedforward_layernorm.weight",
-                ):
-                    name = f"model.layers.0.{suffix}"
-                    if name not in names:
-                        reasons.append(
-                            f"Gemma2 native layout is missing {name}"
-                        )
         elif not any(
             name.startswith("model.layers.0.mlp.experts.")
             or name.startswith("model.layers.0.block_sparse_moe.experts.")
@@ -281,13 +288,19 @@ def _result(
 
     registry = architecture_status(model_type or architecture)
     heads = int(
-        config.get("num_attention_heads")
-        or config.get("heads")
+        _config_value(
+            config, "num_attention_heads", "heads", "n_head", "num_heads"
+        )
         or 0
     )
     kv_heads = int(
-        config.get("num_key_value_heads")
-        or config.get("kv_heads")
+        _config_value(
+            config,
+            "num_key_value_heads",
+            "kv_heads",
+            "num_kv_heads",
+            "n_head_kv",
+        )
         or heads
     )
     attention = (
@@ -304,7 +317,7 @@ def _result(
             if config.get("norm_kind") == "layer_norm"
             or (
                 config.get("rms_norm_eps") is None
-                and config.get("layer_norm_eps") is not None
+                and _config_value(config, "layer_norm_eps", "layer_norm_epsilon") is not None
             )
             else "rms_norm"
         ),
@@ -337,7 +350,7 @@ def _result(
         capabilities.append("attention_sinks")
     return NativeSupport(
         supported=not reasons,
-        engine="native" if not reasons else "transformers",
+        engine="native" if not reasons else "unsupported",
         model_type=model_type,
         architecture=architecture,
         architecture_family=family,
@@ -357,6 +370,13 @@ def _result(
     )
 
 
+def _config_value(config: dict[str, Any], *names: str) -> Any:
+    return next(
+        (config.get(name) for name in names if config.get(name) is not None),
+        None,
+    )
+
+
 def _unsupported(
     model_type: str,
     architecture: str,
@@ -364,7 +384,7 @@ def _unsupported(
 ) -> NativeSupport:
     return NativeSupport(
         supported=False,
-        engine="transformers",
+        engine="unsupported",
         model_type=model_type,
         architecture=architecture,
         architecture_family="unknown",
@@ -395,3 +415,71 @@ def _tensor_names(root: Path) -> tuple[str, ...]:
         except Exception:
             return ()
     return ()
+
+
+def _canonical_text_tensor_names(config_path: Path, names: tuple[str, ...]) -> tuple[str, ...]:
+    try:
+        source_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        source_config = {}
+    prefixes = ("model.language_model.", "language_model.")
+    cross_layers = _cross_attention_layers(source_config)
+    canonical: list[str] = []
+    for name in names:
+        suffix = next(
+            (name.removeprefix(prefix) for prefix in prefixes if name.startswith(prefix)),
+            None,
+        )
+        if suffix is None:
+            continue
+        if _is_text_adapter_tensor(suffix):
+            continue
+        compact = _canonical_text_tensor_name(suffix, cross_layers)
+        if compact is not None:
+            canonical.append(compact)
+    return tuple(canonical)
+
+
+def _cross_attention_layers(config: dict[str, Any]) -> set[int]:
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        return set()
+    layers = text.get("cross_attention_layers")
+    if not isinstance(layers, list):
+        return set()
+    result: set[int] = set()
+    for layer in layers:
+        try:
+            result.add(int(layer))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def _canonical_text_tensor_name(suffix: str, cross_layers: set[int]) -> str | None:
+    if suffix == "lm_head.weight":
+        return suffix
+    normalized = suffix if suffix.startswith("model.") else f"model.{suffix}"
+    prefix = "model.layers."
+    if not normalized.startswith(prefix):
+        return normalized
+    rest = normalized.removeprefix(prefix)
+    layer_text, sep, layer_suffix = rest.partition(".")
+    if not sep:
+        return normalized
+    try:
+        layer = int(layer_text)
+    except ValueError:
+        return normalized
+    if layer in cross_layers:
+        return None
+    skipped_before = sum(1 for skipped in cross_layers if skipped < layer)
+    return f"model.layers.{layer - skipped_before}.{layer_suffix}"
+
+
+def _is_text_adapter_tensor(suffix: str) -> bool:
+    return (
+        ".cross_attn." in suffix
+        or ".cross_attn_attn_gate" in suffix
+        or ".cross_attn_mlp_gate" in suffix
+    )

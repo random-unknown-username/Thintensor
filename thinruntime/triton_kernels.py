@@ -17,6 +17,7 @@ def _single_token_gqa_attention_kernel(
     keys,
     values,
     output,
+    sinks,
     tokens,
     stride_kk,
     stride_kt,
@@ -31,6 +32,7 @@ def _single_token_gqa_attention_kernel(
     token_bucket: tl.constexpr,
     block_t: tl.constexpr,
     block_d: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
 ) -> None:
     head = tl.program_id(0)
     kv_head = head // (heads // kv_heads)
@@ -42,8 +44,12 @@ def _single_token_gqa_attention_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    running_max = -3.4028234663852886e38
-    running_den = 0.0
+    if HAS_SINKS:
+        running_max = tl.load(sinks + head).to(tl.float32)
+        running_den = 1.0
+    else:
+        running_max = -3.4028234663852886e38
+        running_den = 0.0
     accumulator = tl.zeros((block_d,), dtype=tl.float32)
 
     for token_start in range(0, token_bucket, block_t):
@@ -599,11 +605,12 @@ def _fp8_bf16_tensorcore_matvec_kernel(
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for start_k in range(0, cols, BLOCK_K):
         offsets_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offsets_k < cols
         weight_values = tl.load(
             weight
             + offsets_m[:, None] * stride_wm
             + offsets_k[None, :],
-            mask=mask_m[:, None],
+            mask=mask_m[:, None] & mask_k[None, :],
             other=0.0,
         )
         vector = tl.load(x + offsets_k)
@@ -644,11 +651,12 @@ def _int8_bf16_tensorcore_matvec_kernel(
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for start_k in range(0, cols, BLOCK_K):
         offsets_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offsets_k < cols
         weight_values = tl.load(
             weight
             + offsets_m[:, None] * stride_wm
             + offsets_k[None, :],
-            mask=mask_m[:, None],
+            mask=mask_m[:, None] & mask_k[None, :],
             other=0,
         ).to(tl.bfloat16)
         vector = tl.load(x + offsets_k)
@@ -769,6 +777,591 @@ def _mxfp4_bf16_tensorcore_matvec_kernel(
     if HAS_POST_SCALE:
         result *= tl.load(post_scales + offsets_m, mask=mask_m, other=1.0)
     tl.store(y + offsets_m, result, mask=mask_m)
+
+
+@triton.jit
+def _mxfp4_selected_tensorcore_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    expert_indices,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wr: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sr: tl.constexpr,
+    stride_xe: tl.constexpr,
+    stride_oe: tl.constexpr,
+    stride_or: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Selected MXFP4 experts using Blackwell native scaled tensor cores."""
+    selected_slot = tl.program_id(1)
+    expert = tl.load(expert_indices + selected_slot)
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_packed_k = start_k // 2 + tl.arange(0, BLOCK_K // 2)
+        weight_values = tl.load(
+            packed_weight
+            + expert * stride_we
+            + offsets_m[:, None] * stride_wr
+            + offsets_packed_k[None, :],
+            mask=mask_m[:, None],
+            other=0,
+        )
+        offsets_scale_k = start_k // 32 + tl.arange(0, BLOCK_K // 32)
+        weight_scales = tl.load(
+            scales
+            + expert * stride_se
+            + offsets_m[:, None] * stride_sr
+            + offsets_scale_k[None, :],
+            mask=mask_m[:, None],
+            other=0,
+        )
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        vector = tl.load(x + selected_slot * stride_xe + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N),
+            dtype=tl.bfloat16,
+        )
+        accumulator = tl.dot_scaled(
+            weight_values,
+            weight_scales,
+            "e2m1",
+            vector_tile,
+            None,
+            "bf16",
+            acc=accumulator,
+            fast_math=True,
+        )
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(
+        out + selected_slot * stride_oe + offsets_m * stride_or,
+        result,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _mxfp_lowbit_selected_tensorcore_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    expert_indices,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wr: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sr: tl.constexpr,
+    stride_xe: tl.constexpr,
+    stride_oe: tl.constexpr,
+    stride_or: tl.constexpr,
+    BITS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Q1/Q2 experts expanded to E2M1 nibbles inside tensor-core tiles."""
+    selected_slot = tl.program_id(1)
+    expert = tl.load(expert_indices + selected_slot)
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        pair_offsets = start_k // 2 + tl.arange(0, BLOCK_K // 2)
+        if BITS == 2:
+            byte_offsets = pair_offsets // 2
+            shifts = (pair_offsets & 1) * 4
+            packed = tl.load(
+                packed_weight
+                + expert * stride_we
+                + offsets_m[:, None] * stride_wr
+                + byte_offsets[None, :],
+                mask=mask_m[:, None],
+                other=0,
+            ).to(tl.int32)
+            low_code = (packed >> shifts[None, :]) & 3
+            high_code = (packed >> (shifts[None, :] + 2)) & 3
+            low_magnitude = tl.where(
+                (low_code == 0) | (low_code == 3), 3, 1
+            )
+            high_magnitude = tl.where(
+                (high_code == 0) | (high_code == 3), 3, 1
+            )
+            low_nibble = low_magnitude | tl.where(low_code < 2, 8, 0)
+            high_nibble = high_magnitude | tl.where(high_code < 2, 8, 0)
+        else:
+            byte_offsets = pair_offsets // 4
+            shifts = (pair_offsets & 3) * 2
+            packed = tl.load(
+                packed_weight
+                + expert * stride_we
+                + offsets_m[:, None] * stride_wr
+                + byte_offsets[None, :],
+                mask=mask_m[:, None],
+                other=0,
+            ).to(tl.int32)
+            low_positive = ((packed >> shifts[None, :]) & 1) != 0
+            high_positive = ((packed >> (shifts[None, :] + 1)) & 1) != 0
+            low_nibble = tl.where(low_positive, 2, 10)
+            high_nibble = tl.where(high_positive, 2, 10)
+        weight_values = (low_nibble | (high_nibble << 4)).to(tl.uint8)
+        offsets_scale_k = start_k // 32 + tl.arange(0, BLOCK_K // 32)
+        weight_scales = tl.load(
+            scales
+            + expert * stride_se
+            + offsets_m[:, None] * stride_sr
+            + offsets_scale_k[None, :],
+            mask=mask_m[:, None],
+            other=127,
+        )
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        vector = tl.load(x + selected_slot * stride_xe + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N),
+            dtype=tl.bfloat16,
+        )
+        accumulator = tl.dot_scaled(
+            weight_values,
+            weight_scales,
+            "e2m1",
+            vector_tile,
+            None,
+            "bf16",
+            acc=accumulator,
+            fast_math=True,
+        )
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(
+        out + selected_slot * stride_oe + offsets_m * stride_or,
+        result,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _mxfp_ternary_selected_tensorcore_matvec_kernel(
+    packed_weight,
+    scales,
+    digit_lut,
+    x,
+    expert_indices,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    ternary_bytes: tl.constexpr,
+    row_bytes: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wr: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sr: tl.constexpr,
+    stride_xe: tl.constexpr,
+    stride_oe: tl.constexpr,
+    stride_or: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Grouped ternary experts expanded to E2M1 inside tensor-core tiles."""
+    selected_slot = tl.program_id(1)
+    expert = tl.load(expert_indices + selected_slot)
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        digit_byte = offsets_k // 5
+        digit_position = offsets_k % 5
+        packed_digits = tl.load(
+            packed_weight
+            + expert * stride_we
+            + offsets_m[:, None] * stride_wr
+            + digit_byte[None, :],
+            mask=mask_m[:, None],
+            other=0,
+        ).to(tl.int32)
+        expanded_digits = tl.load(digit_lut + packed_digits).to(tl.int32)
+        digits = (expanded_digits >> (2 * digit_position[None, :])) & 3
+
+        groups = offsets_k // 32
+        magnitude_bit = groups * 3
+        magnitude_byte = ternary_bytes + magnitude_bit // 8
+        magnitude_shift = magnitude_bit % 8
+        magnitude_low = tl.load(
+            packed_weight
+            + expert * stride_we
+            + offsets_m[:, None] * stride_wr
+            + magnitude_byte[None, :],
+            mask=mask_m[:, None],
+            other=0,
+        ).to(tl.int32)
+        crosses_byte = magnitude_shift > 5
+        magnitude_high = tl.load(
+            packed_weight
+            + expert * stride_we
+            + offsets_m[:, None] * stride_wr
+            + magnitude_byte[None, :]
+            + 1,
+            mask=(
+                mask_m[:, None]
+                & crosses_byte[None, :]
+                & ((magnitude_byte + 1) < row_bytes)[None, :]
+            ),
+            other=0,
+        ).to(tl.int32)
+        magnitude_code = (
+            (magnitude_low >> magnitude_shift[None, :])
+            | (magnitude_high << (8 - magnitude_shift)[None, :])
+        ) & 7
+        magnitude_nibble = magnitude_code + 1
+        nibbles = tl.where(
+            digits == 1,
+            0,
+            magnitude_nibble | tl.where(digits == 0, 8, 0),
+        ).to(tl.uint8)
+        nibble_pairs = tl.reshape(nibbles, (BLOCK_M, BLOCK_K // 2, 2))
+        low_nibbles, high_nibbles = tl.split(nibble_pairs)
+        weight_values = low_nibbles | (high_nibbles << 4)
+
+        offsets_scale_k = start_k // 32 + tl.arange(0, BLOCK_K // 32)
+        weight_scales = tl.load(
+            scales
+            + expert * stride_se
+            + offsets_m[:, None] * stride_sr
+            + offsets_scale_k[None, :],
+            mask=mask_m[:, None],
+            other=127,
+        )
+        vector = tl.load(x + selected_slot * stride_xe + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N), dtype=tl.bfloat16
+        )
+        accumulator = tl.dot_scaled(
+            weight_values,
+            weight_scales,
+            "e2m1",
+            vector_tile,
+            None,
+            "bf16",
+            acc=accumulator,
+            fast_math=True,
+        )
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(
+        out + selected_slot * stride_oe + offsets_m * stride_or,
+        result,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _mxfp_lowbit_selected_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    expert_indices,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wr: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sr: tl.constexpr,
+    stride_xe: tl.constexpr,
+    stride_oe: tl.constexpr,
+    stride_or: tl.constexpr,
+    BITS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    selected_slot = tl.program_id(1)
+    expert = tl.load(expert_indices + selected_slot)
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offsets_k < cols
+        group = offsets_k // 32
+        in_group = offsets_k & 31
+        if BITS == 2:
+            byte_offset = group * 8 + in_group // 4
+            shift = (in_group & 3) * 2
+        else:
+            byte_offset = group * 4 + in_group // 8
+            shift = in_group & 7
+        packed = tl.load(
+            packed_weight
+            + expert * stride_we
+            + offsets_m[:, None] * stride_wr
+            + byte_offset[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.int32)
+        code = (packed >> shift[None, :]) & ((1 << BITS) - 1)
+        if BITS == 2:
+            value = tl.where(
+                code == 0,
+                -1.5,
+                tl.where(code == 1, -0.5, tl.where(code == 2, 0.5, 1.5)),
+            )
+        else:
+            value = tl.where(code != 0, 1.0, -1.0)
+        exponent = tl.load(
+            scales
+            + expert * stride_se
+            + offsets_m[:, None] * stride_sr
+            + group[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=127,
+        ).to(tl.int32)
+        weight = value.to(tl.float32) * tl.exp2(
+            (exponent - 127).to(tl.float32)
+        )
+        vector = tl.load(
+            x + selected_slot * stride_xe + offsets_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += tl.sum(weight * vector[None, :], axis=1)
+    tl.store(
+        out + selected_slot * stride_oe + offsets_m * stride_or,
+        accumulator,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _mxfp_lowbit_selected_swiglu_kernel(
+    packed_weight,
+    scales,
+    x,
+    expert_indices,
+    bias,
+    out,
+    activation_rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wr: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sr: tl.constexpr,
+    stride_be: tl.constexpr,
+    stride_br: tl.constexpr,
+    stride_xe: tl.constexpr,
+    stride_oe: tl.constexpr,
+    stride_or: tl.constexpr,
+    BITS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    ALPHA: tl.constexpr,
+    LIMIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    selected_slot = tl.program_id(1)
+    expert = tl.load(expert_indices + selected_slot)
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < activation_rows
+    gate_rows = offsets_m * 2
+    up_rows = gate_rows + 1
+    gate_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offsets_k < cols
+        group = offsets_k // 32
+        in_group = offsets_k & 31
+        if BITS == 2:
+            byte_offset = group * 8 + in_group // 4
+            shift = (in_group & 3) * 2
+        else:
+            byte_offset = group * 4 + in_group // 8
+            shift = in_group & 7
+        gate_packed = tl.load(
+            packed_weight
+            + expert * stride_we
+            + gate_rows[:, None] * stride_wr
+            + byte_offset[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.int32)
+        up_packed = tl.load(
+            packed_weight
+            + expert * stride_we
+            + up_rows[:, None] * stride_wr
+            + byte_offset[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.int32)
+        gate_code = (gate_packed >> shift[None, :]) & ((1 << BITS) - 1)
+        up_code = (up_packed >> shift[None, :]) & ((1 << BITS) - 1)
+        if BITS == 2:
+            gate_value = tl.where(
+                gate_code == 0,
+                -1.5,
+                tl.where(gate_code == 1, -0.5, tl.where(gate_code == 2, 0.5, 1.5)),
+            )
+            up_value = tl.where(
+                up_code == 0,
+                -1.5,
+                tl.where(up_code == 1, -0.5, tl.where(up_code == 2, 0.5, 1.5)),
+            )
+        else:
+            gate_value = tl.where(gate_code != 0, 1.0, -1.0)
+            up_value = tl.where(up_code != 0, 1.0, -1.0)
+        gate_exponent = tl.load(
+            scales
+            + expert * stride_se
+            + gate_rows[:, None] * stride_sr
+            + group[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=127,
+        ).to(tl.int32)
+        up_exponent = tl.load(
+            scales
+            + expert * stride_se
+            + up_rows[:, None] * stride_sr
+            + group[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=127,
+        ).to(tl.int32)
+        gate_weight = gate_value.to(tl.float32) * tl.exp2(
+            (gate_exponent - 127).to(tl.float32)
+        )
+        up_weight = up_value.to(tl.float32) * tl.exp2(
+            (up_exponent - 127).to(tl.float32)
+        )
+        vector = tl.load(
+            x + selected_slot * stride_xe + offsets_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        gate_acc += tl.sum(gate_weight * vector[None, :], axis=1)
+        up_acc += tl.sum(up_weight * vector[None, :], axis=1)
+    gate = gate_acc.to(tl.bfloat16)
+    up = up_acc.to(tl.bfloat16)
+    if HAS_BIAS:
+        gate += tl.load(
+            bias + expert * stride_be + gate_rows * stride_br,
+            mask=mask_m,
+            other=0.0,
+        )
+        up += tl.load(
+            bias + expert * stride_be + up_rows * stride_br,
+            mask=mask_m,
+            other=0.0,
+        )
+        gate = gate.to(tl.bfloat16)
+        up = up.to(tl.bfloat16)
+    gate_f32 = tl.minimum(gate.to(tl.float32), LIMIT)
+    up_f32 = tl.maximum(tl.minimum(up.to(tl.float32), LIMIT), -LIMIT)
+    activated = (up_f32 + 1.0) * gate_f32 / (
+        1.0 + tl.exp(-gate_f32 * ALPHA)
+    )
+    tl.store(
+        out + selected_slot * stride_oe + offsets_m * stride_or,
+        activated,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _mxfp_lowbit_weighted_down_kernel(
+    packed_weight,
+    scales,
+    x,
+    expert_indices,
+    router_scores,
+    bias,
+    out,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wr: tl.constexpr,
+    stride_se: tl.constexpr,
+    stride_sr: tl.constexpr,
+    stride_xe: tl.constexpr,
+    stride_be: tl.constexpr,
+    stride_br: tl.constexpr,
+    BITS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    combined = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for selected_slot in range(TOP_K):
+        expert = tl.load(expert_indices + selected_slot)
+        accumulator = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        for start_k in range(0, cols, BLOCK_K):
+            offsets_k = start_k + tl.arange(0, BLOCK_K)
+            mask_k = offsets_k < cols
+            group = offsets_k // 32
+            in_group = offsets_k & 31
+            if BITS == 2:
+                byte_offset = group * 8 + in_group // 4
+                shift = (in_group & 3) * 2
+            else:
+                byte_offset = group * 4 + in_group // 8
+                shift = in_group & 7
+            packed = tl.load(
+                packed_weight
+                + expert * stride_we
+                + offsets_m[:, None] * stride_wr
+                + byte_offset[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0,
+            ).to(tl.int32)
+            code = (packed >> shift[None, :]) & ((1 << BITS) - 1)
+            if BITS == 2:
+                value = tl.where(
+                    code == 0,
+                    -1.5,
+                    tl.where(code == 1, -0.5, tl.where(code == 2, 0.5, 1.5)),
+                )
+            else:
+                value = tl.where(code != 0, 1.0, -1.0)
+            exponent = tl.load(
+                scales
+                + expert * stride_se
+                + offsets_m[:, None] * stride_sr
+                + group[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=127,
+            ).to(tl.int32)
+            weight = value.to(tl.float32) * tl.exp2(
+                (exponent - 127).to(tl.float32)
+            )
+            vector = tl.load(
+                x + selected_slot * stride_xe + offsets_k,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            accumulator += tl.sum(weight * vector[None, :], axis=1)
+        rounded = accumulator.to(tl.bfloat16)
+        if HAS_BIAS:
+            rounded = (
+                rounded
+                + tl.load(
+                    bias
+                    + expert * stride_be
+                    + offsets_m * stride_br,
+                    mask=mask_m,
+                    other=0.0,
+                )
+            ).to(tl.bfloat16)
+        score = tl.load(router_scores + selected_slot).to(tl.float32)
+        combined += rounded.to(tl.float32) * score
+    tl.store(out + offsets_m, combined, mask=mask_m)
 
 
 @triton.jit
@@ -1250,6 +1843,63 @@ def _multi_scaled_tensorcore_matvec_kernel(
 
 
 @triton.jit
+def _multi_matvec_kernel(
+    weight0,
+    weight1,
+    weight2,
+    x,
+    out,
+    rows0: tl.constexpr,
+    rows1: tl.constexpr,
+    rows2: tl.constexpr,
+    cols: tl.constexpr,
+    stride0_m: tl.constexpr,
+    stride1_m: tl.constexpr,
+    stride2_m: tl.constexpr,
+    BLOCKS0: tl.constexpr,
+    BLOCKS1: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+    in_matrix1 = pid >= BLOCKS0
+    in_matrix2 = pid >= BLOCKS0 + BLOCKS1
+    local_pid = tl.where(
+        in_matrix2,
+        pid - BLOCKS0 - BLOCKS1,
+        tl.where(in_matrix1, pid - BLOCKS0, pid),
+    )
+    rows = tl.where(in_matrix2, rows2, tl.where(in_matrix1, rows1, rows0))
+    row_base = tl.where(
+        in_matrix2,
+        rows0 + rows1,
+        tl.where(in_matrix1, rows0, 0),
+    )
+    stride_m = tl.where(
+        in_matrix2,
+        stride2_m,
+        tl.where(in_matrix1, stride1_m, stride0_m),
+    )
+    weight = tl.where(
+        in_matrix2,
+        weight2,
+        tl.where(in_matrix1, weight1, weight0),
+    )
+    offs_m = local_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_m = offs_m < rows
+    mask_n = offs_n < cols
+    w = tl.load(
+        weight + offs_m[:, None] * stride_m + offs_n[None, :],
+        mask=mask_m[:, None] & mask_n[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    xv = tl.load(x + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    acc = tl.sum(w * xv[None, :], axis=1)
+    tl.store(out + row_base + offs_m, acc, mask=mask_m)
+
+
+@triton.jit
 def _multi_matvec_nomask_n_kernel(
     weight0,
     weight1,
@@ -1367,8 +2017,8 @@ def _matvec_argmax_stage1_kernel(
     neg_inf = -3.4028234663852886e38
     vals = tl.where(mask_m, acc, neg_inf)
     max_val = tl.max(vals, axis=0)
-    idx_candidates = tl.where(vals == max_val, offs_m, 0)
-    max_idx = tl.max(idx_candidates, axis=0)
+    idx_candidates = tl.where(vals == max_val, offs_m, rows)
+    max_idx = tl.min(idx_candidates, axis=0)
     tl.store(partial_vals + pid, max_val)
     tl.store(partial_idxs + pid, max_idx)
 
@@ -1400,8 +2050,8 @@ def _matvec_argmax_stage1_nomask_n_kernel(
     neg_inf = -3.4028234663852886e38
     vals = tl.where(mask_m, acc, neg_inf)
     max_val = tl.max(vals, axis=0)
-    idx_candidates = tl.where(vals == max_val, offs_m, 0)
-    max_idx = tl.max(idx_candidates, axis=0)
+    idx_candidates = tl.where(vals == max_val, offs_m, rows)
+    max_idx = tl.min(idx_candidates, axis=0)
     tl.store(partial_vals + pid, max_val)
     tl.store(partial_idxs + pid, max_idx)
 
@@ -1586,10 +2236,10 @@ def _argmax_stage2_kernel(
     mask = offs < n
     neg_inf = -3.4028234663852886e38
     vals = tl.load(partial_vals + offs, mask=mask, other=neg_inf).to(tl.float32)
-    idxs = tl.load(partial_idxs + offs, mask=mask, other=0).to(tl.int64)
+    idxs = tl.load(partial_idxs + offs, mask=mask, other=n).to(tl.int64)
     max_val = tl.max(vals, axis=0)
-    idx_candidates = tl.where(vals == max_val, idxs, 0)
-    max_idx = tl.max(idx_candidates, axis=0)
+    idx_candidates = tl.where(vals == max_val, idxs, n)
+    max_idx = tl.min(idx_candidates, axis=0)
     tl.store(out_idx, max_idx)
     tl.store(out_val, max_val)
 
@@ -1809,6 +2459,76 @@ def _rope_qk_inplace_kernel(
 
 
 @triton.jit
+def _qk_head_rmsnorm_rope_inplace_kernel(
+    q,
+    k,
+    q_weight,
+    k_weight,
+    cos,
+    sin,
+    heads: tl.constexpr,
+    kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    eps: tl.constexpr,
+    HALF: tl.constexpr,
+    BLOCK_HALF: tl.constexpr,
+) -> None:
+    head = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_HALF)
+    mask = offs < HALF
+    cos_values = tl.load(cos + offs, mask=mask, other=0.0).to(tl.float32)
+    sin_values = tl.load(sin + offs, mask=mask, other=0.0).to(tl.float32)
+
+    q_mask = mask & (head < heads)
+    q_base = head * head_dim
+    q_first = tl.load(q + q_base + offs, mask=q_mask, other=0.0).to(tl.float32)
+    q_second = tl.load(q + q_base + HALF + offs, mask=q_mask, other=0.0).to(tl.float32)
+    q_w_first = tl.load(q_weight + offs, mask=mask, other=0.0).to(tl.float32)
+    q_w_second = tl.load(q_weight + HALF + offs, mask=mask, other=0.0).to(tl.float32)
+    q_inv_rms = tl.rsqrt(
+        (tl.sum(q_first * q_first, axis=0) + tl.sum(q_second * q_second, axis=0))
+        / head_dim
+        + eps
+    )
+    q_first *= q_inv_rms * q_w_first
+    q_second *= q_inv_rms * q_w_second
+    tl.store(
+        q + q_base + offs,
+        q_first * cos_values - q_second * sin_values,
+        mask=q_mask,
+    )
+    tl.store(
+        q + q_base + HALF + offs,
+        q_second * cos_values + q_first * sin_values,
+        mask=q_mask,
+    )
+
+    k_mask = mask & (head < kv_heads)
+    k_base = head * head_dim
+    k_first = tl.load(k + k_base + offs, mask=k_mask, other=0.0).to(tl.float32)
+    k_second = tl.load(k + k_base + HALF + offs, mask=k_mask, other=0.0).to(tl.float32)
+    k_w_first = tl.load(k_weight + offs, mask=mask, other=0.0).to(tl.float32)
+    k_w_second = tl.load(k_weight + HALF + offs, mask=mask, other=0.0).to(tl.float32)
+    k_inv_rms = tl.rsqrt(
+        (tl.sum(k_first * k_first, axis=0) + tl.sum(k_second * k_second, axis=0))
+        / head_dim
+        + eps
+    )
+    k_first *= k_inv_rms * k_w_first
+    k_second *= k_inv_rms * k_w_second
+    tl.store(
+        k + k_base + offs,
+        k_first * cos_values - k_second * sin_values,
+        mask=k_mask,
+    )
+    tl.store(
+        k + k_base + HALF + offs,
+        k_second * cos_values + k_first * sin_values,
+        mask=k_mask,
+    )
+
+
+@triton.jit
 def _silu_mul_kernel(
     gate,
     up,
@@ -1823,6 +2543,153 @@ def _silu_mul_kernel(
     uv = tl.load(up + offs, mask=mask, other=0.0).to(tl.float32)
     silu = gv / (1.0 + tl.exp(-gv))
     tl.store(out + offs, silu * uv, mask=mask)
+
+
+@triton.jit
+def _interleaved_swiglu_kernel(
+    gate_up,
+    out,
+    n: tl.constexpr,
+    ALPHA: tl.constexpr,
+    LIMIT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets < n
+    gate = tl.load(gate_up + offsets * 2, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(gate_up + offsets * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.minimum(gate, LIMIT)
+    up = tl.maximum(tl.minimum(up, LIMIT), -LIMIT)
+    activated = (up + 1.0) * gate / (1.0 + tl.exp(-gate * ALPHA))
+    tl.store(out + offsets, activated, mask=mask)
+
+
+@triton.jit
+def _weighted_expert_sum_kernel(
+    experts,
+    scores,
+    out,
+    width: tl.constexpr,
+    experts_count: tl.constexpr,
+    stride_expert: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets < width
+    result = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for expert in range(experts_count):
+        value = tl.load(
+            experts + expert * stride_expert + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        score = tl.load(scores + expert).to(tl.float32)
+        result += value * score
+    tl.store(out + offsets, result, mask=mask)
+
+
+@triton.jit
+def _moe_router_topk_kernel(
+    logits,
+    indices_out,
+    scores_out,
+    experts: tl.constexpr,
+    TOP_K: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < experts
+    values = tl.load(logits + offsets, mask=mask, other=-float("inf")).to(tl.float32)
+    remaining = values
+    selected_values = tl.zeros((TOP_K,), dtype=tl.float32)
+    selected_indices = tl.zeros((TOP_K,), dtype=tl.int32)
+    slots = tl.arange(0, TOP_K)
+    for slot in range(TOP_K):
+        index = tl.argmax(remaining, axis=0, tie_break_left=True)
+        value = tl.max(remaining, axis=0)
+        selected_values = tl.where(slots == slot, value, selected_values)
+        selected_indices = tl.where(slots == slot, index, selected_indices)
+        remaining = tl.where(offsets == index, -float("inf"), remaining)
+    maximum = tl.max(values, axis=0)
+    selected_exp = tl.exp(selected_values - maximum)
+    denominator = (
+        tl.sum(selected_exp, axis=0)
+        if RENORMALIZE
+        else tl.sum(tl.exp(values - maximum), axis=0)
+    )
+    tl.store(indices_out + slots, selected_indices)
+    tl.store(scores_out + slots, selected_exp / denominator)
+
+
+@triton.jit
+def _moe_router_matvec_topk_kernel(
+    weight,
+    hidden,
+    bias,
+    indices_out,
+    scores_out,
+    experts: tl.constexpr,
+    hidden_size: tl.constexpr,
+    stride_we: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    expert_offsets = tl.arange(0, BLOCK_E)
+    expert_mask = expert_offsets < experts
+    accumulator = tl.zeros((BLOCK_E,), dtype=tl.float32)
+    for start_k in range(0, hidden_size, BLOCK_K):
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offsets_k < hidden_size
+        weights = tl.load(
+            weight
+            + expert_offsets[:, None] * stride_we
+            + offsets_k[None, :],
+            mask=expert_mask[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        values = tl.load(
+            hidden + offsets_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += tl.sum(weights * values[None, :], axis=1)
+    # Match torch.mv(out=BF16) followed by an optional in-place BF16 bias.
+    rounded = accumulator.to(tl.bfloat16)
+    if HAS_BIAS:
+        bias_values = tl.load(
+            bias + expert_offsets,
+            mask=expert_mask,
+            other=0.0,
+        )
+        rounded = (rounded + bias_values).to(tl.bfloat16)
+    logits = tl.where(
+        expert_mask,
+        rounded.to(tl.float32),
+        -float("inf"),
+    )
+    remaining = logits
+    selected_values = tl.zeros((TOP_K,), dtype=tl.float32)
+    selected_indices = tl.zeros((TOP_K,), dtype=tl.int32)
+    slots = tl.arange(0, TOP_K)
+    for slot in range(TOP_K):
+        index = tl.argmax(remaining, axis=0, tie_break_left=True)
+        value = tl.max(remaining, axis=0)
+        selected_values = tl.where(slots == slot, value, selected_values)
+        selected_indices = tl.where(slots == slot, index, selected_indices)
+        remaining = tl.where(expert_offsets == index, -float("inf"), remaining)
+    maximum = tl.max(logits, axis=0)
+    selected_exp = tl.exp(selected_values - maximum)
+    denominator = (
+        tl.sum(selected_exp, axis=0)
+        if RENORMALIZE
+        else tl.sum(tl.exp(logits - maximum), axis=0)
+    )
+    tl.store(indices_out + slots, selected_indices)
+    tl.store(scores_out + slots, selected_exp / denominator)
 
 
 @triton.jit
@@ -2352,7 +3219,9 @@ def _qwen35_delta_recurrence_kernel(
         tl.load(a_ptr + value_head).to(tl.float32)
         + tl.load(dt_bias_ptr + value_head).to(tl.float32)
     )
-    softplus = tl.log(1.0 + tl.exp(a_value))
+    softplus = tl.maximum(a_value, 0.0) + tl.log(
+        1.0 + tl.exp(-tl.abs(a_value))
+    )
     g = -tl.exp(
         tl.load(a_log_ptr + value_head).to(tl.float32)
     ) * softplus
@@ -2506,12 +3375,34 @@ class TritonDecodeBackend:
         self._attention_partial_acc: torch.Tensor | None = None
         self._matvec_launch_plans: dict[Any, tuple[object, ...]] = {}
         self._multi_launch_plans: dict[tuple[int, ...], tuple[int, ...]] = {}
-        self._repeat_matvec_plans: dict[int, tuple[int, ...]] = {}
+        self._repeat_matvec_plans: dict[Any, tuple[int, ...]] = {}
         self._fused_gate_up_silu_plans: dict[Any, tuple[object, ...]] = {}
         self._fused_scaled_gate_up_silu_plans: dict[
             Any,
             tuple[object, ...],
         ] = {}
+        ternary_lut = []
+        for packed in range(256):
+            value = packed
+            expanded = 0
+            for digit in range(5):
+                expanded |= (value % 3) << (2 * digit)
+                value //= 3
+            ternary_lut.append(expanded)
+        self._ternary_digit_lut = torch.tensor(
+            ternary_lut,
+            device=device,
+            dtype=torch.int16,
+        )
+
+    @staticmethod
+    def _layout_key(tensor: torch.Tensor) -> tuple[Any, ...]:
+        return (
+            str(tensor.device),
+            str(tensor.dtype),
+            tuple(int(dim) for dim in tensor.shape),
+            tuple(int(stride) for stride in tensor.stride()),
+        )
 
     def qwen35_gated_deltanet(
         self,
@@ -2588,7 +3479,12 @@ class TritonDecodeBackend:
         num_warps: int | None = None,
         config_name: str | None = None,
     ) -> torch.Tensor:
-        cache_key = (id(weight), config_name, block_m, num_warps)
+        cache_key = (
+            self._layout_key(weight),
+            config_name,
+            block_m,
+            num_warps,
+        )
         plan = self._matvec_launch_plans.get(cache_key)
         if plan is None or block_m is not None or num_warps is not None:
             rows = int(weight.shape[0])
@@ -2606,6 +3502,9 @@ class TritonDecodeBackend:
             if config_name is not None and config_name.startswith("triton_loop_"):
                 is_loop = True
                 loop_block_n = int(config_name.split("_")[-1])
+            elif cols > 2048:
+                is_loop = True
+                loop_block_n = 512
             
             if is_loop:
                 kernel = _matvec_looped_kernel
@@ -2782,6 +3681,380 @@ class TritonDecodeBackend:
         )
         return out
 
+    def mxfp4_selected_tensorcore_matvec(
+        self,
+        blocks: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        expert_indices: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        block_m: int = 64,
+        block_n: int = 8,
+    ) -> torch.Tensor:
+        if blocks.ndim != 4 or scales.ndim != 3:
+            raise ValueError("MXFP4 expert blocks/scales must be rank 4/rank 3")
+        if blocks.shape[:-1] != scales.shape:
+            raise ValueError(
+                f"MXFP4 blocks/scales mismatch: {blocks.shape} vs {scales.shape}"
+            )
+        rows = int(blocks.shape[1])
+        cols = int(blocks.shape[2] * blocks.shape[3] * 2)
+        selected = int(expert_indices.numel())
+        if x.ndim == 1:
+            if int(x.numel()) != cols:
+                raise ValueError(
+                    f"MXFP4 vector has {x.numel()} values, expected {cols}"
+                )
+            stride_xe = 0
+        elif x.ndim == 2 and tuple(x.shape) == (selected, cols):
+            stride_xe = int(x.stride(0))
+        else:
+            raise ValueError(
+                f"MXFP4 input must be {(cols,)} or {(selected, cols)}, "
+                f"got {tuple(x.shape)}"
+            )
+        if tuple(out.shape) != (selected, rows):
+            raise ValueError(
+                f"MXFP4 output must be {(selected, rows)}, got {tuple(out.shape)}"
+            )
+        block_k = next(
+            (candidate for candidate in (256, 128, 64, 32) if cols % candidate == 0),
+            32,
+        )
+        _mxfp4_selected_tensorcore_matvec_kernel[
+            (triton.cdiv(rows, block_m), selected)
+        ](
+            blocks,
+            scales,
+            x,
+            expert_indices,
+            out,
+            rows=rows,
+            cols=cols,
+            stride_we=int(blocks.stride(0)),
+            stride_wr=int(blocks.stride(1)),
+            stride_se=int(scales.stride(0)),
+            stride_sr=int(scales.stride(1)),
+            stride_xe=stride_xe,
+            stride_oe=int(out.stride(0)),
+            stride_or=int(out.stride(1)),
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            num_warps=8,
+        )
+        return out
+
+    def mxfp_lowbit_selected_tensorcore_matvec(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        expert_indices: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        bits: int,
+        block_m: int = 0,
+        block_n: int = 0,
+    ) -> torch.Tensor:
+        if bits not in {1, 2}:
+            raise ValueError("packed expert precision must be Q1 or Q2")
+        if packed_weight.ndim != 4 or scales.ndim != 3:
+            raise ValueError("low-bit expert weights/scales must be rank 4/rank 3")
+        if tuple(packed_weight.shape[:3]) != tuple(scales.shape):
+            raise ValueError(
+                f"low-bit weights/scales mismatch: {packed_weight.shape} vs {scales.shape}"
+            )
+        bytes_per_group = 4 if bits == 1 else 8
+        if int(packed_weight.shape[3]) != bytes_per_group:
+            raise ValueError(
+                f"Q{bits} group must use {bytes_per_group} bytes, got "
+                f"{packed_weight.shape[3]}"
+            )
+        rows = int(packed_weight.shape[1])
+        cols = int(scales.shape[2] * 32)
+        selected = int(expert_indices.numel())
+        if block_m <= 0:
+            block_m = 128 if rows >= 4096 else 64
+        if block_n <= 0:
+            block_n = 4 if rows >= 4096 else 8
+        if x.ndim == 1:
+            if int(x.numel()) != cols:
+                raise ValueError(
+                    f"Q{bits} vector has {x.numel()} values, expected {cols}"
+                )
+            stride_xe = 0
+        elif x.ndim == 2 and tuple(x.shape) == (selected, cols):
+            stride_xe = int(x.stride(0))
+        else:
+            raise ValueError(
+                f"Q{bits} input must be {(cols,)} or {(selected, cols)}, "
+                f"got {tuple(x.shape)}"
+            )
+        if tuple(out.shape) != (selected, rows):
+            raise ValueError(
+                f"Q{bits} output must be {(selected, rows)}, got {tuple(out.shape)}"
+            )
+        block_k = next(
+            (candidate for candidate in (256, 128, 64, 32) if cols % candidate == 0),
+            32,
+        )
+        _mxfp_lowbit_selected_tensorcore_matvec_kernel[
+            (triton.cdiv(rows, block_m), selected)
+        ](
+            packed_weight,
+            scales,
+            x,
+            expert_indices,
+            out,
+            rows=rows,
+            cols=cols,
+            stride_we=int(packed_weight.stride(0)),
+            stride_wr=int(packed_weight.stride(1)),
+            stride_se=int(scales.stride(0)),
+            stride_sr=int(scales.stride(1)),
+            stride_xe=stride_xe,
+            stride_oe=int(out.stride(0)),
+            stride_or=int(out.stride(1)),
+            BITS=bits,
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            num_warps=8,
+        )
+        return out
+
+    def mxfp_ternary_selected_tensorcore_matvec(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        expert_indices: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        block_m: int = 0,
+        block_n: int = 0,
+    ) -> torch.Tensor:
+        if packed_weight.ndim != 3 or scales.ndim != 3:
+            raise ValueError("ternary expert weights/scales must be rank 3/rank 3")
+        experts, rows, groups = map(int, scales.shape)
+        cols = groups * 32
+        ternary_bytes = (cols + 4) // 5
+        magnitude_bytes = (groups * 3 + 7) // 8
+        if tuple(packed_weight.shape) != (
+            experts,
+            rows,
+            ternary_bytes + magnitude_bytes,
+        ):
+            raise ValueError(
+                "ternary weight shape mismatch: "
+                f"got {tuple(packed_weight.shape)}, expected "
+                f"{(experts, rows, ternary_bytes + magnitude_bytes)}"
+            )
+        selected = int(expert_indices.numel())
+        if block_m <= 0:
+            block_m = 128 if rows >= 4096 else 64
+        if block_n <= 0:
+            block_n = 4 if rows >= 4096 else 8
+        if x.ndim == 1 and int(x.numel()) == cols:
+            stride_xe = 0
+        elif x.ndim == 2 and tuple(x.shape) == (selected, cols):
+            stride_xe = int(x.stride(0))
+        else:
+            raise ValueError(
+                f"ternary input must be {(cols,)} or {(selected, cols)}, got {tuple(x.shape)}"
+            )
+        if tuple(out.shape) != (selected, rows):
+            raise ValueError(
+                f"ternary output must be {(selected, rows)}, got {tuple(out.shape)}"
+            )
+        block_k = next(
+            (candidate for candidate in (256, 128, 64, 32) if cols % candidate == 0),
+            32,
+        )
+        _mxfp_ternary_selected_tensorcore_matvec_kernel[
+            (triton.cdiv(rows, block_m), selected)
+        ](
+            packed_weight,
+            scales,
+            self._ternary_digit_lut,
+            x,
+            expert_indices,
+            out,
+            rows=rows,
+            cols=cols,
+            ternary_bytes=ternary_bytes,
+            row_bytes=ternary_bytes + magnitude_bytes,
+            stride_we=int(packed_weight.stride(0)),
+            stride_wr=int(packed_weight.stride(1)),
+            stride_se=int(scales.stride(0)),
+            stride_sr=int(scales.stride(1)),
+            stride_xe=stride_xe,
+            stride_oe=int(out.stride(0)),
+            stride_or=int(out.stride(1)),
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            num_warps=8,
+        )
+        return out
+
+    def mxfp_lowbit_selected_matvec(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        expert_indices: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        bits: int,
+        block_m: int = 0,
+        block_k: int = 0,
+    ) -> torch.Tensor:
+        if bits not in {1, 2} or packed_weight.ndim != 4 or scales.ndim != 3:
+            raise ValueError("low-bit expert weights must be packed Q1 or Q2")
+        rows = int(packed_weight.shape[1])
+        cols = int(scales.shape[2] * 32)
+        selected = int(expert_indices.numel())
+        if block_m <= 0:
+            block_m = 8 if rows >= 1024 else 4
+        if block_k <= 0:
+            block_k = min(1024, 1 << (max(32, cols) - 1).bit_length())
+        stride_xe = 0 if x.ndim == 1 else int(x.stride(0))
+        _mxfp_lowbit_selected_matvec_kernel[
+            (triton.cdiv(rows, block_m), selected)
+        ](
+            packed_weight,
+            scales,
+            x,
+            expert_indices,
+            out,
+            rows=rows,
+            cols=cols,
+            stride_we=int(packed_weight.stride(0)),
+            stride_wr=int(packed_weight.stride(1)),
+            stride_se=int(scales.stride(0)),
+            stride_sr=int(scales.stride(1)),
+            stride_xe=stride_xe,
+            stride_oe=int(out.stride(0)),
+            stride_or=int(out.stride(1)),
+            BITS=bits,
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            num_warps=8,
+        )
+        return out
+
+    def mxfp_lowbit_selected_swiglu(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        expert_indices: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        bits: int,
+        alpha: float,
+        limit: float,
+        bias: torch.Tensor | None = None,
+        block_m: int = 4,
+        block_k: int = 0,
+        num_warps: int = 8,
+    ) -> torch.Tensor:
+        if bits not in {1, 2} or packed_weight.ndim != 4 or scales.ndim != 3:
+            raise ValueError("fused SwiGLU requires packed Q1 or Q2 experts")
+        physical_rows = int(packed_weight.shape[1])
+        if physical_rows % 2:
+            raise ValueError("interleaved gate/up rows must be even")
+        activation_rows = physical_rows // 2
+        cols = int(scales.shape[2] * 32)
+        selected = int(expert_indices.numel())
+        if tuple(out.shape) != (selected, activation_rows):
+            raise ValueError("fused SwiGLU output shape mismatch")
+        stride_xe = 0 if x.ndim == 1 else int(x.stride(0))
+        if block_k <= 0:
+            block_k = min(1024, 1 << (max(32, cols) - 1).bit_length())
+        _mxfp_lowbit_selected_swiglu_kernel[
+            (triton.cdiv(activation_rows, block_m), selected)
+        ](
+            packed_weight,
+            scales,
+            x,
+            expert_indices,
+            bias if bias is not None else packed_weight,
+            out,
+            activation_rows=activation_rows,
+            cols=cols,
+            stride_we=int(packed_weight.stride(0)),
+            stride_wr=int(packed_weight.stride(1)),
+            stride_se=int(scales.stride(0)),
+            stride_sr=int(scales.stride(1)),
+            stride_be=int(bias.stride(0)) if bias is not None else 0,
+            stride_br=int(bias.stride(1)) if bias is not None else 0,
+            stride_xe=stride_xe,
+            stride_oe=int(out.stride(0)),
+            stride_or=int(out.stride(1)),
+            BITS=bits,
+            HAS_BIAS=bias is not None,
+            ALPHA=float(alpha),
+            LIMIT=float(limit),
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+        )
+        return out
+
+    def mxfp_lowbit_weighted_down(
+        self,
+        packed_weight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        expert_indices: torch.Tensor,
+        router_scores: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        bits: int,
+        bias: torch.Tensor | None = None,
+        block_m: int = 4,
+        block_k: int = 0,
+        num_warps: int = 8,
+    ) -> torch.Tensor:
+        if bits not in {1, 2} or packed_weight.ndim != 4 or scales.ndim != 3:
+            raise ValueError("fused down requires packed Q1 or Q2 experts")
+        rows = int(packed_weight.shape[1])
+        cols = int(scales.shape[2] * 32)
+        selected = int(expert_indices.numel())
+        if tuple(x.shape) != (selected, cols) or int(out.numel()) != rows:
+            raise ValueError("fused weighted-down tensor shape mismatch")
+        if block_k <= 0:
+            block_k = min(1024, 1 << (max(32, cols) - 1).bit_length())
+        _mxfp_lowbit_weighted_down_kernel[(triton.cdiv(rows, block_m),)](
+            packed_weight,
+            scales,
+            x,
+            expert_indices,
+            router_scores,
+            bias if bias is not None else packed_weight,
+            out,
+            rows=rows,
+            cols=cols,
+            stride_we=int(packed_weight.stride(0)),
+            stride_wr=int(packed_weight.stride(1)),
+            stride_se=int(scales.stride(0)),
+            stride_sr=int(scales.stride(1)),
+            stride_xe=int(x.stride(0)),
+            stride_be=int(bias.stride(0)) if bias is not None else 0,
+            stride_br=int(bias.stride(1)) if bias is not None else 0,
+            BITS=bits,
+            HAS_BIAS=bias is not None,
+            TOP_K=selected,
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+        )
+        return out
+
     def fused_gate_up_silu(
         self,
         gate_weight: torch.Tensor,
@@ -2792,7 +4065,12 @@ class TritonDecodeBackend:
         block_m: int | None = None,
         num_warps: int | None = None,
     ) -> torch.Tensor:
-        cache_key = (id(gate_weight), id(up_weight), block_m, num_warps)
+        cache_key = (
+            self._layout_key(gate_weight),
+            self._layout_key(up_weight),
+            block_m,
+            num_warps,
+        )
         plan = self._fused_gate_up_silu_plans.get(cache_key)
         if plan is None or block_m is not None or num_warps is not None:
             rows = int(gate_weight.shape[0])
@@ -2853,10 +4131,10 @@ class TritonDecodeBackend:
                 "fused scaled gate/up requires one scale per output row"
             )
         cache_key = (
-            id(gate_weight),
-            id(gate_scales),
-            id(up_weight),
-            id(up_scales),
+            self._layout_key(gate_weight),
+            self._layout_key(gate_scales),
+            self._layout_key(up_weight),
+            self._layout_key(up_scales),
             block_m,
             num_warps,
         )
@@ -3058,6 +4336,9 @@ class TritonDecodeBackend:
         if config_name is not None and config_name.startswith("triton_loop_"):
             is_loop = True
             loop_block_n = int(config_name.split("_")[-1])
+        elif cols > 2048:
+            is_loop = True
+            loop_block_n = 512
 
         if is_loop:
             kernel = _scaled_matvec_looped_kernel
@@ -3104,7 +4385,7 @@ class TritonDecodeBackend:
             block_n = 256
             block_m = 16
             num_warps = 4
-        elif cols > 4096:
+        elif cols >= 2048:
             kernel = _int4_scaled_matvec_looped_kernel
             block_n = int(
                 os.environ.get("THINTENSOR_INT4_DOWN_BLOCK_N", "256")
@@ -3360,19 +4641,13 @@ class TritonDecodeBackend:
             raise ValueError("multi_matvec supports exactly two or three matrices")
         weight0, weight1 = weights[:2]
         weight2 = weights[2] if len(weights) == 3 else weight1
-        cache_key = tuple(id(weight) for weight in weights) + (block_m, num_warps)
+        cache_key = tuple(self._layout_key(weight) for weight in weights) + (
+            block_m,
+            num_warps,
+        )
         plan = self._multi_launch_plans.get(cache_key)
         if plan is None:
             cols = int(weight0.shape[1])
-            if triton.next_power_of_2(cols) != cols:
-                # Correct fallback for any non-power-of-two hidden size.
-                # Keep correctness by dispatching normal matvecs into slices of the fused output.
-                offset = 0
-                for weight in weights:
-                    rows_i = int(weight.shape[0])
-                    self.matvec(weight, x, out[offset : offset + rows_i])
-                    offset += rows_i
-                return out
             if any(int(weight.shape[1]) != cols for weight in weights):
                 raise ValueError("multi_matvec matrices must have the same column count")
             rows0 = int(weight0.shape[0])
@@ -3395,7 +4670,13 @@ class TritonDecodeBackend:
             )
             self._multi_launch_plans[cache_key] = plan
         cols, rows0, rows1, rows2, blocks0, blocks1, blocks2, stride0, stride1, stride2 = plan
-        _multi_matvec_nomask_n_kernel[(blocks0 + blocks1 + blocks2,)](
+        block_n = triton.next_power_of_2(cols)
+        kernel = (
+            _multi_matvec_nomask_n_kernel
+            if block_n == cols
+            else _multi_matvec_kernel
+        )
+        kernel[(blocks0 + blocks1 + blocks2,)](
             weight0,
             weight1,
             weight2,
@@ -3411,7 +4692,7 @@ class TritonDecodeBackend:
             BLOCKS0=blocks0,
             BLOCKS1=blocks1,
             BLOCK_M=block_m,
-            BLOCK_N=cols,
+            BLOCK_N=block_n,
             num_warps=num_warps,
         )
         return out
@@ -3541,7 +4822,8 @@ class TritonDecodeBackend:
         kv_heads: int,
         head_dim: int,
     ) -> torch.Tensor:
-        plan = self._repeat_matvec_plans.get(id(weight))
+        cache_key = self._layout_key(weight)
+        plan = self._repeat_matvec_plans.get(cache_key)
         if plan is None:
             rows = int(weight.shape[0])
             cols = int(weight.shape[1])
@@ -3558,7 +4840,7 @@ class TritonDecodeBackend:
                 int(weight.stride(0)),
                 int(weight.stride(1)),
             )
-            self._repeat_matvec_plans[id(weight)] = plan
+            self._repeat_matvec_plans[cache_key] = plan
         rows, cols, block_n, block_m, num_warps, stride0, stride1 = plan
         _repeat_kv_matvec_nomask_n_kernel[(triton.cdiv(rows, block_m),)](
             weight,
@@ -3586,6 +4868,7 @@ class TritonDecodeBackend:
         heads: int,
         kv_heads: int,
         head_dim: int,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tokens = int(keys.shape[1])
         if tokens <= 0:
@@ -3607,6 +4890,7 @@ class TritonDecodeBackend:
             keys,
             values,
             out,
+            sinks if sinks is not None else query,
             tokens,
             int(keys.stride(0)),
             int(keys.stride(1)),
@@ -3621,6 +4905,7 @@ class TritonDecodeBackend:
             token_bucket=token_bucket,
             block_t=block_t,
             block_d=block_d,
+            HAS_SINKS=sinks is not None,
             num_warps=num_warps,
         )
         return out
@@ -4061,6 +5346,41 @@ class TritonDecodeBackend:
         )
         return q, k
 
+    def qk_head_rmsnorm_rope_inplace(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        heads: int,
+        kv_heads: int,
+        head_dim: int,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if head_dim % 2:
+            raise ValueError(f"RoPE head_dim must be even, got {head_dim}")
+        if q_weight.numel() != head_dim or k_weight.numel() != head_dim:
+            raise ValueError("fused Q/K RMSNorm requires one weight per head channel")
+        half = head_dim // 2
+        _qk_head_rmsnorm_rope_inplace_kernel[(max(heads, kv_heads),)](
+            q,
+            k,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            heads=heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            eps=eps,
+            HALF=half,
+            BLOCK_HALF=triton.next_power_of_2(half),
+            num_warps=1,
+        )
+        return q, k
+
     def silu_mul(self, gate: torch.Tensor, up: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         n = gate.numel()
         block = 1024
@@ -4073,6 +5393,104 @@ class TritonDecodeBackend:
             num_warps=4,
         )
         return out
+
+    def interleaved_swiglu(
+        self,
+        gate_up: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        alpha: float,
+        limit: float,
+    ) -> torch.Tensor:
+        n = int(out.numel())
+        _interleaved_swiglu_kernel[(triton.cdiv(n, 1024),)](
+            gate_up,
+            out,
+            n=n,
+            ALPHA=float(alpha),
+            LIMIT=float(limit),
+            BLOCK_N=1024,
+            num_warps=4,
+        )
+        return out
+
+    def weighted_expert_sum(
+        self,
+        experts: torch.Tensor,
+        scores: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        width = int(experts.shape[1])
+        _weighted_expert_sum_kernel[(triton.cdiv(width, 256),)](
+            experts,
+            scores,
+            out,
+            width=width,
+            experts_count=int(experts.shape[0]),
+            stride_expert=int(experts.stride(0)),
+            BLOCK_N=256,
+            num_warps=4,
+        )
+        return out
+
+    def moe_router_topk(
+        self,
+        logits: torch.Tensor,
+        indices_out: torch.Tensor,
+        scores_out: torch.Tensor,
+        *,
+        renormalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        experts = int(logits.numel())
+        top_k = int(indices_out.numel())
+        block = triton.next_power_of_2(experts)
+        _moe_router_topk_kernel[(1,)](
+            logits,
+            indices_out,
+            scores_out,
+            experts=experts,
+            TOP_K=top_k,
+            RENORMALIZE=bool(renormalize),
+            BLOCK=block,
+            num_warps=1 if block <= 32 else 4,
+        )
+        return indices_out, scores_out
+
+    def moe_router_matvec_topk(
+        self,
+        weight: torch.Tensor,
+        hidden: torch.Tensor,
+        indices_out: torch.Tensor,
+        scores_out: torch.Tensor,
+        *,
+        bias: torch.Tensor | None = None,
+        renormalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        experts, hidden_size = map(int, weight.shape)
+        if hidden.ndim != 1 or int(hidden.numel()) != hidden_size:
+            raise ValueError("router hidden vector does not match weight shape")
+        if experts > 128:
+            raise ValueError("fused router supports at most 128 experts")
+        if bias is not None and int(bias.numel()) != experts:
+            raise ValueError("router bias does not match expert count")
+        block_e = triton.next_power_of_2(experts)
+        _moe_router_matvec_topk_kernel[(1,)](
+            weight,
+            hidden,
+            bias if bias is not None else weight,
+            indices_out,
+            scores_out,
+            experts=experts,
+            hidden_size=hidden_size,
+            stride_we=int(weight.stride(0)),
+            HAS_BIAS=bias is not None,
+            TOP_K=int(indices_out.numel()),
+            RENORMALIZE=bool(renormalize),
+            BLOCK_E=block_e,
+            BLOCK_K=128,
+            num_warps=4 if block_e >= 32 else 2,
+        )
+        return indices_out, scores_out
 
     def add(self, left: torch.Tensor, right: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         n = left.numel()

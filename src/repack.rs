@@ -171,15 +171,13 @@ fn add_fused_group(
         .iter()
         .map(|suffix| format!("model.layers.{layer}.{suffix}"))
         .collect();
-    let child_indexes: Vec<_> = child_ids
+    let child_indexes: Option<Vec<_>> = child_ids
         .iter()
-        .map(|id| {
-            page_indexes
-                .get(id)
-                .copied()
-                .ok_or_else(|| anyhow!("cannot fuse missing page {id}"))
-        })
-        .collect::<Result<_>>()?;
+        .map(|id| page_indexes.get(id).copied())
+        .collect();
+    let Some(child_indexes) = child_indexes else {
+        return Ok(());
+    };
     let first = &manifest.pages[child_indexes[0]];
     if first.shape.len() != 2 {
         bail!("cannot fuse non-matrix page {}", first.id);

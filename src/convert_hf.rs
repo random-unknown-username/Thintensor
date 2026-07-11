@@ -52,6 +52,7 @@ pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
     let mut warnings = Vec::new();
     let raw_tensors = collect_tensors(&safetensor_paths)?;
     let (tensors, excluded_tensors) = canonical_text_tensors(&source_config, raw_tensors)?;
+    let tensors = canonical_common_tensors(tensors)?;
     if excluded_tensors > 0 {
         warnings.push(format!(
             "excluded {excluded_tensors} non-text vision/MTP tensors from the native text archive"
@@ -63,6 +64,7 @@ pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
     let execution_tape = build_execution_tape(layers, &tensors, &config, &mut warnings)?;
     warn_unknown_tensors(&tensors, layers, &execution_tape, &mut warnings);
     let archive_pages = archive_pages(&tensors, &execution_tape);
+    let memory_plan = build_memory_plan(&config, &tensors, &execution_tape);
 
     let mut manifest = Manifest {
         format: FORMAT_NAME.to_string(),
@@ -70,7 +72,7 @@ pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
         model,
         execution_tape,
         pages,
-        memory_plan: build_memory_plan(&config, &tensors),
+        memory_plan,
     };
     add_tokenizer_hashes(&mut warnings, &mut manifest.model, &options)?;
 
@@ -100,6 +102,15 @@ fn effective_text_config(source: &Value) -> Value {
     if let Some(model_type) = source.get("model_type") {
         config.insert("model_type".to_string(), model_type.clone());
     }
+    let skipped_layers = cross_attention_layers(source).len();
+    if skipped_layers > 0
+        && let Some(layer_count) = optional_u64(&Value::Object(config.clone()), "num_hidden_layers")
+    {
+        config.insert(
+            "num_hidden_layers".to_string(),
+            Value::from(layer_count.saturating_sub(skipped_layers as u64)),
+        );
+    }
     Value::Object(config)
 }
 
@@ -110,23 +121,136 @@ fn canonical_text_tensors(
     if source_config.get("text_config").is_none() {
         return Ok((tensors, 0));
     }
-    const PREFIX: &str = "model.language_model.";
+    const PREFIXES: [&str; 2] = ["model.language_model.", "language_model."];
+    let cross_layers = cross_attention_layers(source_config);
     let mut canonical = BTreeMap::new();
     let mut excluded = 0;
     for (name, mut page) in tensors {
-        let Some(suffix) = name.strip_prefix(PREFIX) else {
+        let Some(suffix) = PREFIXES.iter().find_map(|prefix| name.strip_prefix(prefix)) else {
             excluded += 1;
             continue;
         };
-        page.id = format!("model.{suffix}");
+        if is_text_adapter_tensor(suffix) {
+            excluded += 1;
+            continue;
+        }
+        let Some(page_id) = canonical_text_page_id(suffix, &cross_layers) else {
+            excluded += 1;
+            continue;
+        };
+        page.id = page_id;
         if canonical.insert(page.id.clone(), page).is_some() {
             bail!("canonical text tensor name collision for {name}");
         }
     }
     if canonical.is_empty() {
-        bail!("text_config exists but no {PREFIX} tensors were found");
+        bail!(
+            "text_config exists but no supported text tensor prefix was found ({})",
+            PREFIXES.join(", ")
+        );
     }
     Ok((canonical, excluded))
+}
+
+fn canonical_common_tensors(
+    tensors: BTreeMap<String, TensorPage>,
+) -> Result<BTreeMap<String, TensorPage>> {
+    let mut canonical = BTreeMap::new();
+    for (source_name, mut page) in tensors {
+        let page_id = canonical_common_page_id(&source_name);
+        page.id = page_id;
+        if canonical.insert(page.id.clone(), page).is_some() {
+            bail!(
+                "canonical tensor name collision for {source_name}; role adapters must be unambiguous"
+            );
+        }
+    }
+    Ok(canonical)
+}
+
+fn canonical_common_page_id(name: &str) -> String {
+    let globals = [
+        ("transformer.wte.weight", EMBED),
+        ("model.decoder.embed_tokens.weight", EMBED),
+        ("transformer.ln_f.weight", FINAL_NORM),
+        ("model.decoder.final_layer_norm.weight", FINAL_NORM),
+        ("output.weight", LM_HEAD),
+    ];
+    if let Some((_, canonical)) = globals.iter().find(|(source, _)| name == *source) {
+        return (*canonical).to_string();
+    }
+    let layer_prefixes = ["transformer.h.", "model.decoder.layers."];
+    let Some(rest) = layer_prefixes
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+    else {
+        return name.to_string();
+    };
+    let Some((layer, suffix)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    let suffix = match suffix {
+        "ln_1.weight" => "input_layernorm.weight",
+        "ln_1.bias" => "input_layernorm.bias",
+        "ln_2.weight" => "post_attention_layernorm.weight",
+        "ln_2.bias" => "post_attention_layernorm.bias",
+        "attn.c_attn.weight" => "self_attn.qkv_proj.weight",
+        "attn.c_attn.bias" => "self_attn.qkv_proj.bias",
+        "attn.c_proj.weight" => "self_attn.o_proj.weight",
+        "attn.c_proj.bias" => "self_attn.o_proj.bias",
+        other => other,
+    };
+    format!("model.layers.{layer}.{suffix}")
+}
+
+fn cross_attention_layers(source_config: &Value) -> BTreeSet<u32> {
+    source_config
+        .get("text_config")
+        .and_then(|text| text.get("cross_attention_layers"))
+        .and_then(Value::as_array)
+        .map(|layers| {
+            layers
+                .iter()
+                .filter_map(Value::as_u64)
+                .filter_map(|layer| u32::try_from(layer).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn canonical_text_page_id(suffix: &str, cross_layers: &BTreeSet<u32>) -> Option<String> {
+    if suffix == "lm_head.weight" {
+        return Some(suffix.to_string());
+    }
+    let normalized = if suffix.starts_with("model.") {
+        suffix.to_string()
+    } else {
+        format!("model.{suffix}")
+    };
+    let Some(rest) = normalized.strip_prefix("model.layers.") else {
+        return Some(normalized);
+    };
+    let Some((layer_text, layer_suffix)) = rest.split_once('.') else {
+        return Some(normalized);
+    };
+    let Ok(layer) = layer_text.parse::<u32>() else {
+        return Some(normalized);
+    };
+    if cross_layers.contains(&layer) {
+        return None;
+    }
+    let skipped_before = cross_layers
+        .iter()
+        .filter(|skipped| **skipped < layer)
+        .count() as u32;
+    let compact_layer = layer.saturating_sub(skipped_before);
+    Some(format!("model.layers.{compact_layer}.{layer_suffix}"))
+}
+
+fn is_text_adapter_tensor(suffix: &str) -> bool {
+    suffix.contains(".cross_attn.")
+        || suffix.contains(".cross_attn_attn_gate")
+        || suffix.contains(".cross_attn_mlp_gate")
 }
 
 fn collect_safetensors(hf_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -259,9 +383,10 @@ fn build_model_spec(
     let attention_sinks = tensors
         .keys()
         .any(|name| name.ends_with(".self_attn.sinks"));
+    let norm_operator = norm_operator_from_config(config);
     let mut required_operators = vec![
         "embedding".to_string(),
-        "rms_norm".to_string(),
+        norm_operator.to_string(),
         "qkv_projection".to_string(),
         "rope".to_string(),
         format!("{attention_kind}_attention"),
@@ -284,15 +409,31 @@ fn build_model_spec(
             "gated_full_attention".to_string(),
         ]);
     }
-    if config
-        .get("model_type")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.starts_with("gemma4"))
-    {
+    let has_per_layer_semantics = [
+        "hidden_size_per_layer_input",
+        "vocab_size_per_layer_input",
+        "num_kv_shared_layers",
+        "global_head_dim",
+    ]
+    .iter()
+    .any(|field| optional_u64(config, field).is_some_and(|value| value > 0));
+    if has_per_layer_semantics {
         required_operators.extend([
             "per_layer_embeddings".to_string(),
             "variable_head_dim_attention".to_string(),
             "shared_kv_attention".to_string(),
+            "post_attention_norm".to_string(),
+            "post_feedforward_norm".to_string(),
+        ]);
+    }
+    let has_dual_post_norm = tensors
+        .keys()
+        .any(|name| name.ends_with("pre_feedforward_layernorm.weight"))
+        && tensors
+            .keys()
+            .any(|name| name.ends_with("post_feedforward_layernorm.weight"));
+    if has_dual_post_norm {
+        required_operators.extend([
             "post_attention_norm".to_string(),
             "post_feedforward_norm".to_string(),
         ]);
@@ -338,7 +479,8 @@ fn build_model_spec(
         kv_heads,
         head_dim: optional_u64(config, "head_dim"),
         dtype,
-        intermediate_size: optional_u64(config, "intermediate_size"),
+        intermediate_size: optional_u64(config, "intermediate_size")
+            .or_else(|| infer_intermediate_size(tensors)),
         rms_norm_eps: optional_f64(config, "rms_norm_eps").or_else(|| {
             (config.get("model_type").and_then(Value::as_str) == Some("olmoe")).then_some(1e-5)
         }),
@@ -793,6 +935,46 @@ fn build_execution_tape(
             }
             stages.push(stage(format!("layer_{layer}_attn_qkv"), qkv_refs));
             stages.push(stage(format!("layer_{layer}_rope"), Vec::new()));
+            let hidden_size = optional_u64(config, "hidden_size")
+                .or_else(|| infer_hidden_size(tensors))
+                .unwrap_or(1);
+            let heads = optional_u64(config, "num_attention_heads")
+                .or_else(|| infer_attention_heads(config, hidden_size).map(u64::from))
+                .unwrap_or(1);
+            let kv_heads = optional_u64(config, "num_key_value_heads")
+                .or_else(|| infer_kv_heads(config, tensors).map(u64::from))
+                .unwrap_or(heads);
+            let head_dim = optional_u64(config, "head_dim")
+                .unwrap_or_else(|| hidden_size.saturating_div(heads).max(1));
+            let attention_operator = if kv_heads == heads {
+                "mha_attention"
+            } else if kv_heads == 1 {
+                "mqa_attention"
+            } else {
+                "gqa_attention"
+            };
+            let mut params = BTreeMap::from([
+                ("causal".to_string(), Value::Bool(true)),
+                ("heads".to_string(), Value::from(heads)),
+                ("kv_heads".to_string(), Value::from(kv_heads)),
+                ("head_dim".to_string(), Value::from(head_dim)),
+            ]);
+            let layer_type = config
+                .get("layer_types")
+                .and_then(Value::as_array)
+                .and_then(|values| values.get(layer as usize))
+                .and_then(Value::as_str);
+            if layer_type.is_some_and(|kind| kind.contains("sliding"))
+                && let Some(window) = optional_u64(config, "sliding_window")
+            {
+                params.insert("window".to_string(), Value::from(window));
+            }
+            stages.push(operator_stage(
+                format!("layer_{layer}_attention"),
+                attention_operator,
+                params,
+                Vec::new(),
+            ));
         }
         if !is_linear_attention {
             let mut o_refs = o_projection_refs;
@@ -931,6 +1113,23 @@ fn build_execution_tape(
         warnings.push("lm_head.weight missing; continuing without lm_head stage".to_string());
     }
 
+    let norm_operator = norm_operator_from_config(config);
+    let norm_eps = optional_f64(config, "rms_norm_eps")
+        .or_else(|| optional_f64(config, "layer_norm_eps"))
+        .or_else(|| {
+            (config.get("model_type").and_then(Value::as_str) == Some("olmoe")).then_some(1e-5)
+        });
+    for stage in &mut stages {
+        if stage.operator == "rms_norm" {
+            stage.operator = norm_operator.to_string();
+            if let Some(eps) = norm_eps {
+                stage
+                    .operator_params
+                    .insert("eps".to_string(), Value::from(eps));
+            }
+        }
+    }
+
     Ok(stages)
 }
 
@@ -989,19 +1188,37 @@ fn warn_unknown_tensors(
     }
 }
 
-fn build_memory_plan(config: &Value, tensors: &BTreeMap<String, TensorPage>) -> MemoryPlan {
-    let weights_bytes = tensors.values().map(|tensor| tensor.size).sum::<u64>();
+fn build_memory_plan(
+    config: &Value,
+    tensors: &BTreeMap<String, TensorPage>,
+    execution_tape: &[ExecutionStage],
+) -> MemoryPlan {
+    let weights_bytes = unique_tensor_bytes(tensors.values());
     let hidden_size = optional_u64(config, "hidden_size")
         .or_else(|| infer_hidden_size(tensors))
         .unwrap_or(4096);
-    let intermediate_size = optional_u64(config, "intermediate_size").unwrap_or(hidden_size * 4);
-    let scratch_bytes = (64 * 1024 * 1024).max(
-        hidden_size
-            .saturating_mul(intermediate_size)
-            .saturating_mul(2),
+    let intermediate_size = optional_u64(config, "intermediate_size")
+        .or_else(|| infer_intermediate_size(tensors))
+        .unwrap_or(hidden_size.saturating_mul(4));
+    let scratch_bytes = estimate_live_runtime_bytes(config, hidden_size, intermediate_size);
+
+    // Globals (especially embeddings and the execution head) stay exact and hot. Layer
+    // stages may stream independently, so minimum VRAM is the hot set plus the largest
+    // stage working set rather than the size of every model weight.
+    let global_bytes = unique_tensor_bytes(
+        tensors
+            .values()
+            .filter(|tensor| layer_from_tensor(&tensor.id).is_none()),
     );
-    let min_vram_bytes = weights_bytes.saturating_add(scratch_bytes);
-    let recommended_vram_bytes = min_vram_bytes.max(8 * 1024 * 1024 * 1024);
+    let largest_stage_bytes = execution_tape
+        .iter()
+        .map(|stage| unique_tensor_bytes(stage.page_refs.iter().filter_map(|id| tensors.get(id))))
+        .max()
+        .unwrap_or(0);
+    let min_vram_bytes = global_bytes
+        .saturating_add(largest_stage_bytes)
+        .saturating_add(scratch_bytes);
+    let recommended_vram_bytes = weights_bytes.saturating_add(scratch_bytes);
 
     MemoryPlan {
         scratch_bytes,
@@ -1013,6 +1230,98 @@ fn build_memory_plan(config: &Value, tensors: &BTreeMap<String, TensorPage>) -> 
             old_tokens_codec: "q4".to_string(),
         },
     }
+}
+
+fn unique_tensor_bytes<'a>(tensors: impl IntoIterator<Item = &'a TensorPage>) -> u64 {
+    let mut seen = BTreeSet::new();
+    tensors.into_iter().fold(0_u64, |total, tensor| {
+        if seen.insert((tensor.size, tensor.checksum)) {
+            total.saturating_add(tensor.size)
+        } else {
+            total
+        }
+    })
+}
+
+fn estimate_live_runtime_bytes(config: &Value, hidden_size: u64, intermediate_size: u64) -> u64 {
+    let heads = optional_u64(config, "num_attention_heads")
+        .unwrap_or(1)
+        .max(1);
+    let kv_heads = optional_u64(config, "num_key_value_heads")
+        .unwrap_or(heads)
+        .max(1);
+    let head_dim = optional_u64(config, "head_dim")
+        .unwrap_or_else(|| hidden_size.saturating_div(heads).max(1));
+    let qkv_elements =
+        hidden_size.saturating_add(2_u64.saturating_mul(kv_heads).saturating_mul(head_dim));
+    let attention_elements = qkv_elements.saturating_add(3_u64.saturating_mul(hidden_size));
+
+    let top_k = optional_u64(config, "num_experts_per_token")
+        .or_else(|| optional_u64(config, "experts_per_token"))
+        .or_else(|| optional_u64(config, "num_experts_per_tok"))
+        .or_else(|| optional_u64(config, "num_selected_experts"))
+        .unwrap_or(1)
+        .max(1);
+    let experts = optional_u64(config, "num_local_experts")
+        .or_else(|| optional_u64(config, "num_experts"))
+        .or_else(|| optional_u64(config, "n_routed_experts"))
+        .unwrap_or(0);
+    let mlp_elements = if experts > 0 {
+        top_k
+            .saturating_mul(
+                3_u64
+                    .saturating_mul(intermediate_size)
+                    .saturating_add(hidden_size),
+            )
+            .saturating_add(2_u64.saturating_mul(hidden_size))
+            .saturating_add(experts)
+    } else {
+        3_u64
+            .saturating_mul(intermediate_size)
+            .saturating_add(2_u64.saturating_mul(hidden_size))
+    };
+
+    let linear_layers = config
+        .get("layer_types")
+        .and_then(Value::as_array)
+        .map(|types| {
+            types
+                .iter()
+                .filter(|kind| kind.as_str() == Some("linear_attention"))
+                .count() as u64
+        })
+        .unwrap_or(0);
+    let key_heads = optional_u64(config, "linear_num_key_heads").unwrap_or(0);
+    let value_heads = optional_u64(config, "linear_num_value_heads").unwrap_or(0);
+    let key_dim = optional_u64(config, "linear_key_head_dim").unwrap_or(0);
+    let value_dim = optional_u64(config, "linear_value_head_dim").unwrap_or(0);
+    let conv_kernel = optional_u64(config, "linear_conv_kernel_dim").unwrap_or(0);
+    let conv_dim = 2_u64
+        .saturating_mul(key_heads)
+        .saturating_mul(key_dim)
+        .saturating_add(value_heads.saturating_mul(value_dim));
+    let linear_state_bytes = linear_layers
+        .saturating_mul(conv_dim.saturating_mul(conv_kernel).saturating_mul(2))
+        .saturating_add(
+            linear_layers
+                .saturating_mul(value_heads)
+                .saturating_mul(key_dim)
+                .saturating_mul(value_dim)
+                .saturating_mul(4),
+        );
+
+    let workspace_bytes = attention_elements
+        .max(mlp_elements)
+        .saturating_mul(2)
+        .saturating_add(linear_state_bytes);
+    align_up(workspace_bytes.max(64 * 1024 * 1024), 2 * 1024 * 1024)
+}
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    value
+        .saturating_add(alignment.saturating_sub(1))
+        .saturating_div(alignment)
+        .saturating_mul(alignment)
 }
 
 fn archive_pages(
@@ -1096,6 +1405,30 @@ fn infer_hidden_size(tensors: &BTreeMap<String, TensorPage>) -> Option<u64> {
         })
 }
 
+fn infer_intermediate_size(tensors: &BTreeMap<String, TensorPage>) -> Option<u64> {
+    for (id, divisor, dimension) in [
+        (layer_tensor(0, "mlp.gate_proj.weight"), 1, 0),
+        (layer_tensor(0, "mlp.gate_up_proj.weight"), 2, 0),
+        (layer_tensor(0, "mlp.experts.gate_up_proj_blocks"), 2, 1),
+        (layer_tensor(0, "mlp.experts.0.gate_proj.weight"), 1, 0),
+        (
+            layer_tensor(0, "block_sparse_moe.experts.0.w1.weight"),
+            1,
+            0,
+        ),
+    ] {
+        if let Some(size) = tensors
+            .get(&id)
+            .and_then(|tensor| tensor.shape.get(dimension))
+            .copied()
+            && size % divisor == 0
+        {
+            return Some(size / divisor);
+        }
+    }
+    None
+}
+
 fn infer_attention_heads(config: &Value, hidden_size: u64) -> Option<u32> {
     let head_dim = optional_u64(config, "head_dim")?;
     if head_dim == 0 || !hidden_size.is_multiple_of(head_dim) {
@@ -1118,9 +1451,69 @@ fn infer_kv_heads(config: &Value, tensors: &BTreeMap<String, TensorPage>) -> Opt
 }
 
 fn stage(stage: impl Into<String>, page_refs: Vec<String>) -> ExecutionStage {
+    let stage = stage.into();
+    ExecutionStage {
+        operator: operator_from_stage(&stage).to_string(),
+        operator_params: BTreeMap::new(),
+        stage,
+        page_refs,
+    }
+}
+
+fn operator_stage(
+    stage: impl Into<String>,
+    operator: impl Into<String>,
+    operator_params: BTreeMap<String, Value>,
+    page_refs: Vec<String>,
+) -> ExecutionStage {
     ExecutionStage {
         stage: stage.into(),
+        operator: operator.into(),
+        operator_params,
         page_refs,
+    }
+}
+
+fn operator_from_stage(stage: &str) -> &'static str {
+    if stage == "embed" {
+        "embedding"
+    } else if stage == "lm_head" {
+        "lm_head"
+    } else if stage.contains("linear_attention") {
+        "gated_delta_net"
+    } else if stage.ends_with("_attn_qkv") {
+        "qkv_projection"
+    } else if stage.ends_with("_rope") {
+        "rope"
+    } else if stage.ends_with("_attn_out") {
+        "o_projection"
+    } else if stage.ends_with("_moe_router") {
+        "topk_router"
+    } else if stage.ends_with("_moe_gate_up")
+        || stage.ends_with("_moe_down")
+        || stage.ends_with("_moe_experts")
+    {
+        "sparse_experts"
+    } else if stage.ends_with("_mlp_gate_up") {
+        "gated_activation"
+    } else if stage.ends_with("_mlp_down") {
+        "down_projection"
+    } else if stage.contains("norm") {
+        "rms_norm"
+    } else if stage.contains("per_layer") {
+        "per_layer_embeddings"
+    } else {
+        "unknown"
+    }
+}
+
+fn norm_operator_from_config(config: &Value) -> &'static str {
+    if optional_f64(config, "rms_norm_eps").is_none()
+        && optional_f64(config, "layer_norm_eps").is_some()
+    {
+        "layer_norm"
+    } else {
+        "rms_norm"
     }
 }
 
@@ -1154,21 +1547,23 @@ fn op_from_tensor(name: &str) -> &str {
         "final_norm"
     } else if name == LM_HEAD {
         "lm_head"
-    } else if name.ends_with("input_layernorm.weight") {
+    } else if name.contains("input_layernorm.") || name.contains(".ln_1.") {
         "input_layernorm"
-    } else if name.ends_with("q_proj.weight") {
+    } else if name.contains("self_attn.qkv_proj.") || name.contains(".attn.c_attn.") {
+        "attn_qkv_proj"
+    } else if name.contains("self_attn.q_proj.") {
         "attn_q_proj"
-    } else if name.ends_with("k_proj.weight") {
+    } else if name.contains("self_attn.k_proj.") {
         "attn_k_proj"
-    } else if name.ends_with("v_proj.weight") {
+    } else if name.contains("self_attn.v_proj.") {
         "attn_v_proj"
-    } else if name.ends_with("o_proj.weight") {
+    } else if name.contains("self_attn.o_proj.") || name.contains(".attn.c_proj.") {
         "attn_o_proj"
     } else if name.ends_with("q_norm.weight") {
         "attn_q_norm"
     } else if name.ends_with("k_norm.weight") {
         "attn_k_norm"
-    } else if name.ends_with("post_attention_layernorm.weight") {
+    } else if name.contains("post_attention_layernorm.") || name.contains(".ln_2.") {
         "post_attention_layernorm"
     } else if name.ends_with("pre_feedforward_layernorm.weight") {
         "pre_feedforward_layernorm"
@@ -1200,8 +1595,7 @@ fn op_from_tensor(name: &str) -> &str {
         "linear_attn_output_projection"
     } else if name.ends_with("self_attn.sinks") {
         "attention_sinks"
-    } else if name.ends_with("mlp.router.weight") || name.ends_with("block_sparse_moe.gate.weight")
-    {
+    } else if name.contains("mlp.router.") || name.contains("block_sparse_moe.gate.") {
         "moe_router"
     } else if name.contains(".mlp.experts.gate_up_proj")
         || name.contains(".block_sparse_moe.experts.") && name.contains(".w1.")
@@ -1212,11 +1606,13 @@ fn op_from_tensor(name: &str) -> &str {
         || name.contains(".block_sparse_moe.experts.") && name.contains(".w2.")
     {
         "moe_down"
-    } else if name.ends_with("gate_proj.weight") {
+    } else if name.contains("mlp.gate_up_proj.") {
+        "mlp_gate_up_proj"
+    } else if name.contains("mlp.gate_proj.") {
         "mlp_gate_proj"
-    } else if name.ends_with("up_proj.weight") {
+    } else if name.contains("mlp.up_proj.") {
         "mlp_up_proj"
-    } else if name.ends_with("down_proj.weight") {
+    } else if name.contains("mlp.down_proj.") {
         "mlp_down_proj"
     } else {
         "unknown"
@@ -1273,7 +1669,32 @@ fn required_u32(config: &Value, key: &str) -> Result<u32> {
 }
 
 fn optional_u64(config: &Value, key: &str) -> Option<u64> {
-    config.get(key).and_then(Value::as_u64)
+    let aliases: &[&str] = match key {
+        "hidden_size" => &["hidden_size", "n_embd", "d_model"],
+        "intermediate_size" => &[
+            "intermediate_size",
+            "ffn_dim",
+            "ffn_hidden_size",
+            "n_inner",
+            "d_ff",
+            "moe_intermediate_size",
+            "expert_intermediate_size",
+        ],
+        "num_hidden_layers" => &["num_hidden_layers", "n_layer", "num_layers"],
+        "num_attention_heads" => &["num_attention_heads", "n_head", "num_heads"],
+        "num_key_value_heads" => &["num_key_value_heads", "num_kv_heads", "n_head_kv"],
+        "vocab_size" => &["vocab_size", "n_vocab", "padded_vocab_size"],
+        "max_position_embeddings" => &[
+            "max_position_embeddings",
+            "n_positions",
+            "max_seq_len",
+            "seq_length",
+        ],
+        _ => return config.get(key).and_then(Value::as_u64),
+    };
+    aliases
+        .iter()
+        .find_map(|alias| config.get(*alias).and_then(Value::as_u64))
 }
 
 fn optional_u32(config: &Value, key: &str) -> Option<u32> {
@@ -1281,7 +1702,13 @@ fn optional_u32(config: &Value, key: &str) -> Option<u32> {
 }
 
 fn optional_f64(config: &Value, key: &str) -> Option<f64> {
-    config.get(key).and_then(Value::as_f64)
+    match key {
+        "layer_norm_eps" => config
+            .get("layer_norm_eps")
+            .or_else(|| config.get("layer_norm_epsilon"))
+            .and_then(Value::as_f64),
+        _ => config.get(key).and_then(Value::as_f64),
+    }
 }
 
 fn optional_string(config: &Value, key: &str) -> Option<String> {

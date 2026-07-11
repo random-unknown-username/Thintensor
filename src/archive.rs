@@ -273,7 +273,15 @@ pub fn write_archive_pages(
         archive_hash: [0_u8; 32],
     };
 
-    let mut file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("thintensor"),
+        std::process::id(),
+    ));
+    let mut file =
+        File::create(&temporary).with_context(|| format!("create {}", temporary.display()))?;
     write_header(&mut file, &header)?;
     file.write_all(&manifest_bytes).context("write manifest")?;
     for record in &records {
@@ -283,6 +291,15 @@ pub fn write_archive_pages(
         write_page_source(&mut file, page).with_context(|| format!("write page {}", page.id))?;
     }
     file.flush().context("flush archive")?;
+    file.sync_all().context("sync archive")?;
+    drop(file);
+    fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "atomically replace {} with {}",
+            path.display(),
+            temporary.display()
+        )
+    })?;
 
     Ok(())
 }

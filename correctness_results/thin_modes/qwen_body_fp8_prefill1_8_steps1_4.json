@@ -1,0 +1,308 @@
+{
+  "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b.thin",
+  "candidate": "ThinTensor selected runtime flags",
+  "candidate_flags": {
+    "down_fp8_layers": null,
+    "down_proj_fp8": true,
+    "fp8_layers": null,
+    "fused_residual_norm": true,
+    "fused_rope": true,
+    "fused_scaled_mlp": true,
+    "gate_up_fp8": true,
+    "mlp_fp8": false,
+    "o_fp8_layers": null,
+    "o_proj_fp8": true,
+    "pinned_staging": false,
+    "qkv_fp8": true,
+    "qkv_fp8_layers": null
+  },
+  "minimum_cosine_similarity": 0.9979195594787598,
+  "minimum_generated_token_match_rate": 1.0,
+  "minimum_top5_overlap": 0.8,
+  "record_count": 4,
+  "records": [
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b.thin",
+      "candidate_tokens": [
+        108832,
+        13331,
+        13331,
+        13331
+      ],
+      "candidate_top5": [
+        {
+          "logit": 10.0,
+          "token_id": 108832
+        },
+        {
+          "logit": 8.75,
+          "token_id": 9419
+        },
+        {
+          "logit": 8.5,
+          "token_id": 130199
+        },
+        {
+          "logit": 8.125,
+          "token_id": 26357
+        },
+        {
+          "logit": 8.0625,
+          "token_id": 110931
+        }
+      ],
+      "cosine_similarity": 0.9979195594787598,
+      "decode_step": 1,
+      "generated_token_match_rate": 1.0,
+      "kv_tokens_attended": 1,
+      "kv_tokens_expected": 1,
+      "max_abs_logit_error": 0.640625,
+      "mean_abs_logit_error": 0.09287405014038086,
+      "prefill_length": 1,
+      "prompt": "Hello",
+      "reference_tokens": [
+        108832,
+        13331,
+        13331,
+        13331
+      ],
+      "reference_top5": [
+        {
+          "logit": 9.75,
+          "token_id": 108832
+        },
+        {
+          "logit": 8.6875,
+          "token_id": 9419
+        },
+        {
+          "logit": 8.625,
+          "token_id": 130199
+        },
+        {
+          "logit": 8.1875,
+          "token_id": 110931
+        },
+        {
+          "logit": 8.1875,
+          "token_id": 26357
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b.thin",
+      "candidate_tokens": [
+        108832,
+        13331,
+        13331,
+        13331
+      ],
+      "candidate_top5": [
+        {
+          "logit": 8.375,
+          "token_id": 13331
+        },
+        {
+          "logit": 7.5,
+          "token_id": 129366
+        },
+        {
+          "logit": 7.28125,
+          "token_id": 74880
+        },
+        {
+          "logit": 7.21875,
+          "token_id": 30999
+        },
+        {
+          "logit": 7.03125,
+          "token_id": 20498
+        }
+      ],
+      "cosine_similarity": 0.99837327003479,
+      "decode_step": 4,
+      "generated_token_match_rate": 1.0,
+      "kv_tokens_attended": 4,
+      "kv_tokens_expected": 4,
+      "max_abs_logit_error": 0.4296875,
+      "mean_abs_logit_error": 0.07001642137765884,
+      "prefill_length": 1,
+      "prompt": "Hello",
+      "reference_tokens": [
+        108832,
+        13331,
+        13331,
+        13331
+      ],
+      "reference_top5": [
+        {
+          "logit": 8.3125,
+          "token_id": 13331
+        },
+        {
+          "logit": 7.46875,
+          "token_id": 129366
+        },
+        {
+          "logit": 7.15625,
+          "token_id": 30999
+        },
+        {
+          "logit": 7.09375,
+          "token_id": 74880
+        },
+        {
+          "logit": 6.875,
+          "token_id": 20498
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b.thin",
+      "candidate_tokens": [
+        20293,
+        14237,
+        14237,
+        14237
+      ],
+      "candidate_top5": [
+        {
+          "logit": 6.65625,
+          "token_id": 20293
+        },
+        {
+          "logit": 6.375,
+          "token_id": 154831
+        },
+        {
+          "logit": 6.25,
+          "token_id": 97211
+        },
+        {
+          "logit": 5.96875,
+          "token_id": 7309
+        },
+        {
+          "logit": 5.90625,
+          "token_id": 21073
+        }
+      ],
+      "cosine_similarity": 0.9988592267036438,
+      "decode_step": 1,
+      "generated_token_match_rate": 1.0,
+      "kv_tokens_attended": 8,
+      "kv_tokens_expected": 8,
+      "max_abs_logit_error": 0.3125,
+      "mean_abs_logit_error": 0.050410568714141846,
+      "prefill_length": 8,
+      "prompt": "Hello",
+      "reference_tokens": [
+        20293,
+        14237,
+        14237,
+        14237
+      ],
+      "reference_top5": [
+        {
+          "logit": 6.75,
+          "token_id": 20293
+        },
+        {
+          "logit": 6.40625,
+          "token_id": 154831
+        },
+        {
+          "logit": 6.1875,
+          "token_id": 97211
+        },
+        {
+          "logit": 5.96875,
+          "token_id": 7309
+        },
+        {
+          "logit": 5.90625,
+          "token_id": 148666
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 0.8
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b.thin",
+      "candidate_tokens": [
+        20293,
+        14237,
+        14237,
+        14237
+      ],
+      "candidate_top5": [
+        {
+          "logit": 7.875,
+          "token_id": 14237
+        },
+        {
+          "logit": 7.625,
+          "token_id": 18477
+        },
+        {
+          "logit": 7.46875,
+          "token_id": 1537
+        },
+        {
+          "logit": 7.40625,
+          "token_id": 101728
+        },
+        {
+          "logit": 7.21875,
+          "token_id": 118941
+        }
+      ],
+      "cosine_similarity": 0.9992880821228027,
+      "decode_step": 4,
+      "generated_token_match_rate": 1.0,
+      "kv_tokens_attended": 11,
+      "kv_tokens_expected": 11,
+      "max_abs_logit_error": 0.28125,
+      "mean_abs_logit_error": 0.046170152723789215,
+      "prefill_length": 8,
+      "prompt": "Hello",
+      "reference_tokens": [
+        20293,
+        14237,
+        14237,
+        14237
+      ],
+      "reference_top5": [
+        {
+          "logit": 7.78125,
+          "token_id": 14237
+        },
+        {
+          "logit": 7.59375,
+          "token_id": 18477
+        },
+        {
+          "logit": 7.4375,
+          "token_id": 1537
+        },
+        {
+          "logit": 7.4375,
+          "token_id": 101728
+        },
+        {
+          "logit": 7.25,
+          "token_id": 118941
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 1.0
+    }
+  ],
+  "reference": "ThinTensor BF16 streamed weights",
+  "tokenizer": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B",
+  "top1_same_all_records": true
+}
