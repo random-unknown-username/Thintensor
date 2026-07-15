@@ -32,6 +32,7 @@ from compare_q8_baseline import (  # noqa: E402
 )
 from stress_validate_thin import build_cases, make_cache  # noqa: E402
 from thinruntime.gpu_runtime import (  # noqa: E402
+    ThinGpuPagePool,
     ThinGpuCausalLMRuntime,
     ThinGpuWeights,
 )
@@ -43,7 +44,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--archive", default="SmolLM3-3B.thin")
     parser.add_argument("--q8-gguf", required=True)
     parser.add_argument("--llama-server", required=True)
+    parser.add_argument(
+        "--llama-device",
+        help="Optional llama.cpp device selector such as Vulkan1 or CUDA0",
+    )
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument(
+        "--reference-source", choices=["hf", "thin"], default="hf"
+    )
+    parser.add_argument(
+        "--reference-device",
+        default="cuda",
+        help="Device for the full-vocabulary reference trajectory (for example cpu or cuda)",
+    )
+    parser.add_argument("--reference-budget", default="5GiB")
+    parser.add_argument("--llamacpp-label", default="llamacpp_q8_0")
+    parser.add_argument("--only-reference-and-llamacpp", action="store_true")
     parser.add_argument("--cases", default="")
     parser.add_argument(
         "--out",
@@ -55,7 +71,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    device = torch.device("cuda")
+    device = torch.device(args.reference_device)
     dtype = torch.bfloat16
     tokenizer = AutoTokenizer.from_pretrained(
         args.hf_model,
@@ -63,22 +79,29 @@ def main() -> None:
     )
     cases = select_cases(build_cases(tokenizer), args.cases)
 
-    print("full-logit comparison: HF BF16 reference", file=sys.stderr)
-    hf_model = load_hf(args.hf_model, device, dtype, int8=False)
-    references: dict[str, dict[str, Any]] = {}
-    for case in cases:
-        print(f"  HF {case.name}", file=sys.stderr)
-        references[case.name] = run_hf_case(
-            hf_model,
-            case,
-            device,
-            teacher_tokens=None,
+    if args.reference_source == "thin":
+        references = load_thin_references(
+            args.archive, cases, device, dtype, parse_bytes(args.reference_budget)
         )
-    del hf_model
-    recover_cuda()
+        reference_label = "thin_bf16_source"
+    else:
+        print("full-logit comparison: HF BF16 reference", file=sys.stderr)
+        hf_model = load_hf(args.hf_model, device, dtype, int8=False)
+        references = {}
+        for case in cases:
+            print(f"  HF {case.name}", file=sys.stderr)
+            references[case.name] = run_hf_case(
+                hf_model, case, device, teacher_tokens=None
+            )
+        del hf_model
+        recover_cuda()
+        reference_label = "hf_bf16"
 
     mode_reports = [
-        exact_reference_report(cases),
+        exact_reference_report(cases, reference_label),
+    ]
+    if not args.only_reference_and_llamacpp:
+        mode_reports.extend([
         run_thin_mode(
             "thin_bf16",
             args.archive,
@@ -103,7 +126,7 @@ def main() -> None:
             device,
             dtype,
         ),
-    ]
+        ])
 
     print("full-logit comparison: llama.cpp Q8_0", file=sys.stderr)
     server = start_server(args)
@@ -118,6 +141,7 @@ def main() -> None:
                         cases[0].checkpoints[0]
                     ].numel()
                 ),
+                mode_label=args.llamacpp_label,
             )
         )
     finally:
@@ -222,7 +246,92 @@ def run_thin_mode(
     return report
 
 
-def exact_reference_report(cases: list[Any]) -> dict[str, Any]:
+def load_thin_references(
+    archive: str,
+    cases: list[Any],
+    device: torch.device,
+    dtype: torch.dtype,
+    budget: int,
+) -> dict[str, dict[str, Any]]:
+    print("full-logit comparison: streamed BF16 source reference", file=sys.stderr)
+    weights = ThinGpuPagePool(
+        archive,
+        device=str(device),
+        dtype=dtype,
+        vram_budget_bytes=budget,
+        prefetch_distance=0,
+        cpu_offload=False,
+        pin_cpu_pages=False,
+    )
+    weights.warm_start()
+    model = weights.manifest["model"]
+    runtime = ThinGpuCausalLMRuntime(
+        weights,
+        kv_cache=make_cache(model, device, dtype),
+        kernel_backend="triton",
+        attention_mode="causal_kv",
+        attention_backend="torch",
+        lm_head_backend="triton",
+    )
+    references: dict[str, dict[str, Any]] = {}
+    try:
+        for case in cases:
+            print(f"  BF16 source {case.name}", file=sys.stderr)
+            references[case.name] = run_thin_reference_case(
+                runtime, model, case, device, dtype
+            )
+    finally:
+        weights.close()
+        del runtime
+        del weights
+        recover_cuda()
+    return references
+
+
+def run_thin_reference_case(
+    runtime: ThinGpuCausalLMRuntime,
+    model: dict[str, Any],
+    case: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    runtime.kv_cache = make_cache(model, device, dtype)
+    runtime._rope_cos_sin_cache.clear()
+    with torch.inference_mode():
+        hidden = None
+        for position in range(int(case.input_ids.shape[1])):
+            hidden = runtime.forward_token(
+                case.input_ids[0, position].to(device), token_index=position
+            )
+        assert hidden is not None
+        captured: dict[int, torch.Tensor] = {}
+        tokens: list[int] = []
+        for step in range(1, case.steps + 1):
+            logits = runtime.logits(hidden).float()
+            if step in case.checkpoints:
+                captured[step] = logits.detach().cpu()
+            token = int(torch.argmax(logits))
+            tokens.append(token)
+            if step < case.steps:
+                hidden = runtime.forward_token(
+                    torch.tensor(token, device=device, dtype=torch.long),
+                    token_index=int(case.input_ids.shape[1]) + step - 1,
+                )
+    return {"logits": captured, "tokens": tokens}
+
+
+def parse_bytes(value: str) -> int:
+    text = value.strip().upper()
+    for suffix, multiplier in (
+        ("GIB", 1024**3), ("MIB", 1024**2), ("GB", 1000**3),
+        ("MB", 1000**2), ("B", 1),
+    ):
+        if text.endswith(suffix):
+            return int(float(text[: -len(suffix)]) * multiplier)
+    return int(text)
+
+
+def exact_reference_report(cases: list[Any], label: str = "hf_bf16") -> dict[str, Any]:
     records = []
     for case in cases:
         comparisons = [
@@ -240,7 +349,7 @@ def exact_reference_report(cases: list[Any]) -> dict[str, Any]:
             for step in case.checkpoints
         ]
         records.append(case_record(case, comparisons))
-    return aggregate("hf_bf16", records)
+    return aggregate(label, records)
 
 
 def run_q8_mode(
@@ -249,6 +358,7 @@ def run_q8_mode(
     references: dict[str, dict[str, Any]],
     *,
     vocab_size: int,
+    mode_label: str = "llamacpp_q8_0",
 ) -> dict[str, Any]:
     records = []
     for case in cases:
@@ -277,7 +387,7 @@ def run_q8_mode(
                 )
             )
         records.append(case_record(case, comparisons))
-    return aggregate("llamacpp_q8_0", records)
+    return aggregate(mode_label, records)
 
 
 def request_full_logprobs(
@@ -375,6 +485,8 @@ def full_distribution_metrics(
         ),
         "raw_logit_cosine": raw_cosine,
         "top1_same": int(ref_top[0]) == int(candidate_top[0]),
+        "top5_exact_order": [int(value) for value in ref_top]
+        == [int(value) for value in candidate_top],
         "top5_overlap": len(
             {int(value) for value in ref_top}
             & {int(value) for value in candidate_top}
@@ -468,7 +580,11 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen[str]:
         "-m",
         args.q8_gguf,
         "-ngl",
-        "99",
+        "auto",
+        "-fitt",
+        "512",
+        "-fitc",
+        "2048",
         "-c",
         "2048",
         "-np",
@@ -479,6 +595,8 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen[str]:
         str(args.port),
         "--no-webui",
     ]
+    if args.llama_device:
+        command.extend(["-dev", args.llama_device])
     process = subprocess.Popen(
         command,
         env=env,

@@ -74,7 +74,11 @@ def is_body_weight(page: Mapping[str, Any]) -> bool:
     }:
         return False
     shape = page.get("shape") or ()
-    return len(shape) >= 2 and not _is_auxiliary_quant_page(page)
+    # Runtime FP8/INT4 codecs and their matvec kernels consume 2-D matrices.
+    # Recurrent architectures also expose higher-rank depthwise-convolution
+    # weights under a body operator role; those must remain in their source
+    # layout instead of being flattened implicitly by the matrix codec.
+    return len(shape) == 2 and not _is_auxiliary_quant_page(page)
 
 
 def is_expert_weight(page: Mapping[str, Any]) -> bool:

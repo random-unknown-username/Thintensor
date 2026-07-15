@@ -91,6 +91,8 @@ def plan_auto_fit(
     mode: str = "on",
     dtype_bytes: int = 2,
     int4_group_size: int | None = None,
+    cpu_embed: bool = False,
+    lm_head_fp8: bool = False,
 ) -> AutoFitPlan:
     """Build a deterministic fit plan without loading model tensors.
 
@@ -156,6 +158,19 @@ def plan_auto_fit(
         heads = int(model.get("heads") or 1)
         hidden = int(model["hidden_size"])
         head_dim = int(model.get("head_dim") or hidden // heads)
+
+        if cpu_embed or lm_head_fp8:
+            adjusted = 0
+            for page in pages:
+                page_id = str(page.get("id") or "")
+                if page_id == "model.embed_tokens.weight" and cpu_embed:
+                    continue
+                p_bytes = _resident_page_bytes(page, dtype_bytes)
+                if page_id == "lm_head.weight" and lm_head_fp8:
+                    p_bytes = _fp8_bytes(p_bytes, dtype_bytes, hidden)
+                adjusted += p_bytes
+            source_bytes = adjusted
+            physical_source_bytes = source_bytes
         kv_bytes = (
             2 * layers * kv_heads * head_dim * context_tokens * dtype_bytes
         )
@@ -561,6 +576,9 @@ def plan_auto_fit(
                         selected_fp8.remove(layer)
                     selected_int4.append(layer)
 
+            selected_lowbit_bits = 0
+            selected_lowbit_layers: list[int] = []
+
             selected_fp8 = sorted(set(selected_fp8))
             selected_int4 = sorted(set(selected_int4))
             if is_moe and not packed_mxfp4_experts:
@@ -864,6 +882,20 @@ def _bytes_by_layer(
         key = int(layer)
         result[key] = result.get(key, 0) + _resident_page_bytes(page, dtype_bytes)
     return result
+
+
+def _q2_bytes(source_bytes: int, dtype_bytes: int) -> int:
+    elements = source_bytes // max(dtype_bytes, 1)
+    packed = (elements * 2 + 7) // 8
+    scale = (elements + 31) // 32
+    return packed + scale
+
+
+def _q1_bytes(source_bytes: int, dtype_bytes: int) -> int:
+    elements = source_bytes // max(dtype_bytes, 1)
+    packed = (elements * 1 + 7) // 8
+    scale = (elements + 31) // 32
+    return packed + scale
 
 
 def _int4_bytes(source_bytes: int, *, dtype_bytes: int, group_size: int) -> int:

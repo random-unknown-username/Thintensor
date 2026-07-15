@@ -1,0 +1,34 @@
+{
+  "model": "Qwen/Qwen3.5-9B",
+  "shape": "10 warmup plus 200 measured causal decode tokens",
+  "thin": {
+    "artifact": "benchmark_results/qwen35_fresh_b9986_optimized_200_10.json",
+    "profile": "recurrent-mxfp4-mlp-int4g512-attention-full-resident",
+    "steady_tokens_per_s": 43.283163027500194,
+    "ms_per_token": 23.1197265625,
+    "attention_backend": "triton_fused",
+    "lm_head_backend": "triton_loop_512",
+    "peak_gpu_temperature_c": 64,
+    "resident_weight_bytes": 4647777280,
+    "peak_gpu_allocated_bytes": 5732285952,
+    "peak_gpu_reserved_bytes": 5746196480,
+    "not_hf_equivalent": false,
+    "kv_tokens_attended": 200,
+    "full_vocab_factual_min_cosine": 0.9733335375785828,
+    "full_vocab_factual_min_top5_overlap": 0.8,
+    "full_vocab_factual_top1_all_same": true,
+    "quality_artifact": "correctness_results/thin_modes/qwen35_fresh_optimized_group512_factual_prefill5.json"
+  },
+  "llamacpp_q4_k_m": {
+    "artifact": "benchmark_results/qwen35_fresh_llamacpp_b9986_q4km_200_3.json",
+    "mean_tokens_per_s": 42.830170,
+    "samples_tokens_per_s": [53.1848, 41.5511, 33.7546],
+    "full_vocab_factual_min_centered_cosine": 0.8949081897735596,
+    "full_vocab_factual_min_top5_overlap": 0.4,
+    "full_vocab_factual_top1_all_same": true,
+    "quality_artifact": "correctness_results/qwen35_fresh_q4km_b9986_vs_source.json"
+  },
+  "thin_over_q4_speed_ratio": 1.010576507,
+  "thin_speed_advantage_percent": 1.0576507,
+  "thin_cosine_advantage": 0.078425348
+}

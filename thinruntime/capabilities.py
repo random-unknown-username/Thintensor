@@ -451,8 +451,10 @@ def _cross_attention_layers(config: dict[str, Any]) -> set[int]:
     for layer in layers:
         try:
             result.add(int(layer))
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"cross_attention_layers contains invalid layer id {layer!r}"
+            ) from exc
     return result
 
 

@@ -55,48 +55,98 @@ class RuntimeExecutor:
     name: str
     layer_schemas: tuple[str, ...]
     required_operators: tuple[str, ...]
+    layers: tuple["RuntimeLayerGraph", ...]
+
+
+@dataclass(frozen=True)
+class RuntimeLayerGraph:
+    """Executable semantic blocks for one decoder layer."""
+
+    layer: int
+    schema: str
+    normalization: str
+    sequence: str
+    feedforward: str
+    operators: tuple[str, ...]
 
 
 def select_runtime_executor(
     layer_schemas: Iterable[str],
     required_operators: Iterable[str],
+    layer_operators: Iterable[Iterable[str]] | None = None,
 ) -> RuntimeExecutor:
-    """Select a native executor from semantic schemas, never family names."""
-    schemas = tuple(dict.fromkeys(map(str, layer_schemas)))
+    """Compile a native per-layer graph from semantic operator contracts."""
+    schema_sequence = tuple(map(str, layer_schemas))
+    schemas = tuple(dict.fromkeys(schema_sequence))
     operators = frozenset(map(str, required_operators))
-    if {"per_layer_embeddings", "shared_kv_attention"} & operators:
-        return RuntimeExecutor(
-            "shared_kv_decoder",
-            schemas,
-            ("per_layer_embeddings", "shared_kv_attention"),
-        )
-    if "gated_delta_net" in operators:
-        return RuntimeExecutor(
-            "recurrent_hybrid_decoder",
-            schemas,
-            ("gated_delta_net", "recurrent_state_cache"),
-        )
-    moe = tuple(schema for schema in schemas if schema.endswith("_moe"))
-    dense = tuple(schema for schema in schemas if not schema.endswith("_moe"))
-    if moe and dense:
-        raise ValueError(
-            "native per-layer graph execution is missing for heterogeneous "
-            f"dense/MoE schemas: {', '.join(schemas)}"
-        )
-    if moe:
-        return RuntimeExecutor(
-            "sparse_moe_decoder",
-            schemas,
-            ("topk_router", "sparse_experts", "expert_weighted_sum"),
-        )
+    per_layer = tuple(
+        tuple(map(str, values)) for values in (layer_operators or ())
+    )
     if not schemas:
         raise ValueError("execution plan contains no decoder layer schemas")
-    if any("fused_" in schema for schema in schemas) or {
-        "post_attention_norm",
-        "post_feedforward_norm",
-    }.issubset(operators):
-        return RuntimeExecutor("generic_dense_decoder", schemas, ())
-    return RuntimeExecutor("optimized_dense_decoder", schemas, ())
+    if not per_layer:
+        # Compatibility for callers that only need selection metadata.
+        per_layer = tuple(tuple(operators) for _ in schemas)
+    graphs = []
+    for layer, layer_ops in enumerate(per_layer):
+        contract = frozenset(layer_ops)
+        normalization = next(
+            (name for name in ("rms_norm", "layer_norm") if name in contract),
+            None,
+        )
+        if normalization is None:
+            raise ValueError(
+                f"layer {layer} declares no supported normalization operator"
+            )
+        if "shared_kv_attention" in contract:
+            sequence = "shared_kv_attention"
+        elif "gated_delta_net" in contract:
+            sequence = "gated_delta_net"
+        elif "per_layer_attention_window" in contract:
+            sequence = "sliding_causal_attention"
+        else:
+            sequence = next(
+                (
+                    name
+                    for name in (
+                        "mha_attention",
+                        "mqa_attention",
+                        "gqa_attention",
+                        "variable_head_dim_attention",
+                    )
+                    if name in contract
+                ),
+                None,
+            )
+            if sequence is None:
+                raise ValueError(
+                    f"layer {layer} declares no supported sequence operator"
+                )
+        if "sparse_experts" in contract:
+            feedforward = "sparse_moe"
+        elif "gated_activation" in contract and "down_projection" in contract:
+            feedforward = "gated_mlp"
+        else:
+            raise ValueError(
+                f"layer {layer} declares no complete feed-forward operator contract"
+            )
+        schema = schema_sequence[min(layer, len(schema_sequence) - 1)]
+        graphs.append(
+            RuntimeLayerGraph(
+                layer=layer,
+                schema=schema,
+                normalization=normalization,
+                sequence=sequence,
+                feedforward=feedforward,
+                operators=layer_ops,
+            )
+        )
+    return RuntimeExecutor(
+        "operator_graph_decoder",
+        schemas,
+        tuple(sorted(operators)),
+        tuple(graphs),
+    )
 
 
 def unsupported_operators(required: Iterable[str]) -> tuple[str, ...]:

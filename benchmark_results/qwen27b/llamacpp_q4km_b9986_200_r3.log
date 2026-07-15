@@ -1,0 +1,6 @@
+load_backend: loaded RPC backend from /home/satvik/Projects/thintensor-qwen27b-work/llama/llama-b9986/libggml-rpc.so
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon 780M Graphics (RADV PHOENIX) (radv) | uma: 1 | fp16: dot2 | bf16: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+ggml_vulkan: 1 = NVIDIA GeForce RTX 5050 Laptop GPU (NVIDIA) | uma: 0 | fp16: 1 | bf16: 1 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: NV_coopmat2
+load_backend: loaded Vulkan backend from /home/satvik/Projects/thintensor-qwen27b-work/llama/llama-b9986/libggml-vulkan.so
+load_backend: loaded CPU backend from /home/satvik/Projects/thintensor-qwen27b-work/llama/llama-b9986/libggml-cpu-zen4.so

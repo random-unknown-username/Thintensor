@@ -1,0 +1,798 @@
+{
+  "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b-fresh.thin",
+  "candidate": "ThinTensor selected runtime flags",
+  "candidate_flags": {
+    "dense_int4": true,
+    "dense_int4_group_size": 512,
+    "dense_int4_layers": "0:32",
+    "down_fp8_layers": null,
+    "down_proj_fp8": false,
+    "embed_fp8": true,
+    "fp8_layers": null,
+    "fused_residual_norm": true,
+    "fused_rope": true,
+    "fused_scaled_mlp": false,
+    "gate_up_fp8": false,
+    "lm_head_int4_group_size": 0,
+    "mlp_fp8": false,
+    "moe_top_k_limit": 0,
+    "moe_top_k_renorm": true,
+    "mxfp4_down_layers": "0:32",
+    "mxfp4_gate_up_layers": "0:32",
+    "mxfp4_o_layers": null,
+    "mxfp4_qkv_layers": null,
+    "mxfp4_selected_tensorcore": false,
+    "o_fp8_layers": null,
+    "o_proj_fp8": false,
+    "packed_expert_q1_layers": null,
+    "packed_expert_q2_layers": null,
+    "pinned_staging": false,
+    "qkv_fp8": false,
+    "qkv_fp8_layers": null
+  },
+  "minimum_cosine_similarity": 0.8965885639190674,
+  "minimum_generated_token_match_rate": 0.90625,
+  "minimum_top5_overlap": 0.4,
+  "record_count": 6,
+  "records": [
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b-fresh.thin",
+      "candidate_tokens": [
+        2614,
+        513,
+        5081,
+        5576,
+        4602,
+        318,
+        4058,
+        10926,
+        8,
+        883,
+        10774,
+        18076,
+        13,
+        198,
+        22365,
+        314,
+        279,
+        2614,
+        369,
+        264,
+        4047,
+        5073,
+        314,
+        16568,
+        60112,
+        30,
+        198,
+        32,
+        13,
+        13379,
+        278,
+        62144
+      ],
+      "candidate_top5": [
+        {
+          "logit": 12.5625,
+          "token_id": 2614
+        },
+        {
+          "logit": 10.875,
+          "token_id": 7193
+        },
+        {
+          "logit": 10.375,
+          "token_id": 220
+        },
+        {
+          "logit": 10.0,
+          "token_id": 3049
+        },
+        {
+          "logit": 9.8125,
+          "token_id": 8358
+        }
+      ],
+      "cosine_similarity": 0.9961533546447754,
+      "decode_step": 1,
+      "generated_token_match_rate": 0.9375,
+      "kv_tokens_attended": 1,
+      "kv_tokens_expected": 1,
+      "max_abs_logit_error": 1.875,
+      "mean_abs_logit_error": 0.29993975162506104,
+      "prefill_length": 1,
+      "prompt": "The capital of France is",
+      "reference_tokens": [
+        2614,
+        513,
+        5081,
+        5576,
+        4602,
+        318,
+        4058,
+        10926,
+        8,
+        883,
+        14963,
+        18076,
+        13,
+        198,
+        22365,
+        314,
+        279,
+        2614,
+        369,
+        264,
+        4047,
+        5073,
+        314,
+        13838,
+        60112,
+        30,
+        198,
+        32,
+        13,
+        13379,
+        278,
+        62144
+      ],
+      "reference_top5": [
+        {
+          "logit": 12.25,
+          "token_id": 2614
+        },
+        {
+          "logit": 10.3125,
+          "token_id": 7193
+        },
+        {
+          "logit": 10.25,
+          "token_id": 220
+        },
+        {
+          "logit": 9.6875,
+          "token_id": 20438
+        },
+        {
+          "logit": 9.5,
+          "token_id": 3049
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 0.8
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b-fresh.thin",
+      "candidate_tokens": [
+        2614,
+        513,
+        5081,
+        5576,
+        4602,
+        318,
+        4058,
+        10926,
+        8,
+        883,
+        10774,
+        18076,
+        13,
+        198,
+        22365,
+        314,
+        279,
+        2614,
+        369,
+        264,
+        4047,
+        5073,
+        314,
+        16568,
+        60112,
+        30,
+        198,
+        32,
+        13,
+        13379,
+        278,
+        62144
+      ],
+      "candidate_top5": [
+        {
+          "logit": 28.375,
+          "token_id": 10926
+        },
+        {
+          "logit": 18.375,
+          "token_id": 4087
+        },
+        {
+          "logit": 15.5625,
+          "token_id": 36011
+        },
+        {
+          "logit": 14.4375,
+          "token_id": 97632
+        },
+        {
+          "logit": 14.3125,
+          "token_id": 18018
+        }
+      ],
+      "cosine_similarity": 0.9700732231140137,
+      "decode_step": 8,
+      "generated_token_match_rate": 0.9375,
+      "kv_tokens_attended": 8,
+      "kv_tokens_expected": 8,
+      "max_abs_logit_error": 5.0625,
+      "mean_abs_logit_error": 0.8177295327186584,
+      "prefill_length": 1,
+      "prompt": "The capital of France is",
+      "reference_tokens": [
+        2614,
+        513,
+        5081,
+        5576,
+        4602,
+        318,
+        4058,
+        10926,
+        8,
+        883,
+        14963,
+        18076,
+        13,
+        198,
+        22365,
+        314,
+        279,
+        2614,
+        369,
+        264,
+        4047,
+        5073,
+        314,
+        13838,
+        60112,
+        30,
+        198,
+        32,
+        13,
+        13379,
+        278,
+        62144
+      ],
+      "reference_top5": [
+        {
+          "logit": 28.875,
+          "token_id": 10926
+        },
+        {
+          "logit": 15.375,
+          "token_id": 4087
+        },
+        {
+          "logit": 14.6875,
+          "token_id": 36011
+        },
+        {
+          "logit": 14.6875,
+          "token_id": 2519
+        },
+        {
+          "logit": 13.875,
+          "token_id": 23932
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 0.6
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b-fresh.thin",
+      "candidate_tokens": [
+        2614,
+        513,
+        5081,
+        5576,
+        4602,
+        318,
+        4058,
+        10926,
+        8,
+        883,
+        10774,
+        18076,
+        13,
+        198,
+        22365,
+        314,
+        279,
+        2614,
+        369,
+        264,
+        4047,
+        5073,
+        314,
+        16568,
+        60112,
+        30,
+        198,
+        32,
+        13,
+        13379,
+        278,
+        62144
+      ],
+      "candidate_top5": [
+        {
+          "logit": 19.75,
+          "token_id": 62144
+        },
+        {
+          "logit": 18.375,
+          "token_id": 8197
+        },
+        {
+          "logit": 18.25,
+          "token_id": 36688
+        },
+        {
+          "logit": 17.75,
+          "token_id": 1587
+        },
+        {
+          "logit": 16.25,
+          "token_id": 44165
+        }
+      ],
+      "cosine_similarity": 0.9906899929046631,
+      "decode_step": 32,
+      "generated_token_match_rate": 0.9375,
+      "kv_tokens_attended": 32,
+      "kv_tokens_expected": 32,
+      "max_abs_logit_error": 2.10546875,
+      "mean_abs_logit_error": 0.33059486746788025,
+      "prefill_length": 1,
+      "prompt": "The capital of France is",
+      "reference_tokens": [
+        2614,
+        513,
+        5081,
+        5576,
+        4602,
+        318,
+        4058,
+        10926,
+        8,
+        883,
+        14963,
+        18076,
+        13,
+        198,
+        22365,
+        314,
+        279,
+        2614,
+        369,
+        264,
+        4047,
+        5073,
+        314,
+        13838,
+        60112,
+        30,
+        198,
+        32,
+        13,
+        13379,
+        278,
+        62144
+      ],
+      "reference_top5": [
+        {
+          "logit": 19.375,
+          "token_id": 62144
+        },
+        {
+          "logit": 18.875,
+          "token_id": 36688
+        },
+        {
+          "logit": 18.375,
+          "token_id": 8197
+        },
+        {
+          "logit": 17.125,
+          "token_id": 1587
+        },
+        {
+          "logit": 16.5,
+          "token_id": 44165
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b-fresh.thin",
+      "candidate_tokens": [
+        9338,
+        369,
+        11751,
+        13,
+        271,
+        57590,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        57590,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314
+      ],
+      "candidate_top5": [
+        {
+          "logit": 18.125,
+          "token_id": 9338
+        },
+        {
+          "logit": 15.125,
+          "token_id": 11751
+        },
+        {
+          "logit": 14.8125,
+          "token_id": 279
+        },
+        {
+          "logit": 14.4375,
+          "token_id": 9564
+        },
+        {
+          "logit": 14.1875,
+          "token_id": 17163
+        }
+      ],
+      "cosine_similarity": 0.988258957862854,
+      "decode_step": 1,
+      "generated_token_match_rate": 0.90625,
+      "kv_tokens_attended": 8,
+      "kv_tokens_expected": 8,
+      "max_abs_logit_error": 2.5,
+      "mean_abs_logit_error": 0.3974759876728058,
+      "prefill_length": 8,
+      "prompt": "The capital of France is",
+      "reference_tokens": [
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314
+      ],
+      "reference_top5": [
+        {
+          "logit": 18.0,
+          "token_id": 9338
+        },
+        {
+          "logit": 14.8125,
+          "token_id": 9564
+        },
+        {
+          "logit": 14.8125,
+          "token_id": 11751
+        },
+        {
+          "logit": 14.625,
+          "token_id": 279
+        },
+        {
+          "logit": 14.125,
+          "token_id": 17163
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b-fresh.thin",
+      "candidate_tokens": [
+        9338,
+        369,
+        11751,
+        13,
+        271,
+        57590,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        57590,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314
+      ],
+      "candidate_top5": [
+        {
+          "logit": 21.125,
+          "token_id": 314
+        },
+        {
+          "logit": 16.25,
+          "token_id": 3177
+        },
+        {
+          "logit": 15.0625,
+          "token_id": 369
+        },
+        {
+          "logit": 13.9375,
+          "token_id": 198
+        },
+        {
+          "logit": 13.75,
+          "token_id": 760
+        }
+      ],
+      "cosine_similarity": 0.9743362069129944,
+      "decode_step": 8,
+      "generated_token_match_rate": 0.90625,
+      "kv_tokens_attended": 15,
+      "kv_tokens_expected": 15,
+      "max_abs_logit_error": 3.328125,
+      "mean_abs_logit_error": 0.5297235250473022,
+      "prefill_length": 8,
+      "prompt": "The capital of France is",
+      "reference_tokens": [
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314
+      ],
+      "reference_top5": [
+        {
+          "logit": 21.5,
+          "token_id": 314
+        },
+        {
+          "logit": 17.0,
+          "token_id": 3177
+        },
+        {
+          "logit": 14.75,
+          "token_id": 369
+        },
+        {
+          "logit": 13.6875,
+          "token_id": 198
+        },
+        {
+          "logit": 13.6875,
+          "token_id": 1020
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 0.8
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B/qwen-9b-fresh.thin",
+      "candidate_tokens": [
+        9338,
+        369,
+        11751,
+        13,
+        271,
+        57590,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        57590,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314
+      ],
+      "candidate_top5": [
+        {
+          "logit": 24.5,
+          "token_id": 314
+        },
+        {
+          "logit": 15.1875,
+          "token_id": 198
+        },
+        {
+          "logit": 15.0625,
+          "token_id": 369
+        },
+        {
+          "logit": 14.0625,
+          "token_id": 2423
+        },
+        {
+          "logit": 14.0,
+          "token_id": 695
+        }
+      ],
+      "cosine_similarity": 0.8965885639190674,
+      "decode_step": 32,
+      "generated_token_match_rate": 0.90625,
+      "kv_tokens_attended": 39,
+      "kv_tokens_expected": 39,
+      "max_abs_logit_error": 9.125,
+      "mean_abs_logit_error": 1.2632542848587036,
+      "prefill_length": 8,
+      "prompt": "The capital of France is",
+      "reference_tokens": [
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314
+      ],
+      "reference_top5": [
+        {
+          "logit": 24.125,
+          "token_id": 314
+        },
+        {
+          "logit": 15.5625,
+          "token_id": 369
+        },
+        {
+          "logit": 14.0,
+          "token_id": 1020
+        },
+        {
+          "logit": 13.4375,
+          "token_id": 2056
+        },
+        {
+          "logit": 13.4375,
+          "token_id": 1076
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 0.4
+    }
+  ],
+  "reference": "ThinTensor BF16 streamed weights",
+  "tokenizer": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.5-9B",
+  "top1_same_all_records": true
+}

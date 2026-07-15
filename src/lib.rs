@@ -13,7 +13,10 @@ pub mod verify;
 
 pub use archive::{Archive, Header, PackOptions, PageTableRecord};
 pub use bench::{BenchLoadResult, BenchPlanResult, bench_load, bench_plan};
-pub use convert_hf::{ConvertHfOptions, ConvertHfResult, convert_hf};
+pub use convert_hf::{
+    ConversionDeletionPoint, ConversionDryRunReport, ConvertHfOptions, ConvertHfResult, convert_hf,
+    dry_run_hf,
+};
 pub use error::{Report, ThinTensorError};
 pub use manifest::Manifest;
 pub use plan::{Plan, PlanOptions};

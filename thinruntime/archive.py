@@ -118,8 +118,14 @@ class ThinArchive:
             raise ValueError(f"Invalid header length: {header_len}, expected {HEADER_LEN}")
         if version != 0:
             raise ValueError(f"Invalid format version: {version}, expected 0")
+        if manifest_off != header_len:
+            raise ValueError(
+                f"Manifest offset {manifest_off} does not follow header length {header_len}"
+            )
         if manifest_off + manifest_len > self.file_size:
             raise ValueError("Manifest range exceeds file size")
+        if page_table_off != manifest_off + manifest_len:
+            raise ValueError("Page table does not immediately follow the manifest")
         if page_table_off > self.file_size:
             raise ValueError("Page table offset exceeds file size")
 
@@ -138,12 +144,16 @@ class ThinArchive:
         manifest_bytes = self._read_bytes(manifest_off, manifest_len)
         self.manifest = json.loads(manifest_bytes.decode("utf-8"))
 
-        self._parse_page_table(page_table_off, page_count, data_off)
+        page_table_end = self._parse_page_table(page_table_off, page_count, data_off)
+        if page_table_end != data_off:
+            raise ValueError(
+                f"Page table ends at {page_table_end}, but data_off is {data_off}"
+            )
         self._index_manifest_pages()
         self._validate_manifest_vs_table()
         self._validate_no_overlaps()
 
-    def _parse_page_table(self, page_table_off: int, page_count: int, data_off: int) -> None:
+    def _parse_page_table(self, page_table_off: int, page_count: int, data_off: int) -> int:
         pos = page_table_off
 
         for i in range(page_count):
@@ -178,6 +188,14 @@ class ThinArchive:
                 raise ValueError(f"Page {page_id} offset+size exceeds file size")
             if stored_size == 0 and raw_size != 0:
                 raise ValueError(f"Page {page_id} has zero stored_size but nonzero raw_size")
+            if flags != 0:
+                raise ValueError(
+                    f"Page {page_id} uses unsupported runtime flags 0x{flags:x}"
+                )
+            if stored_size != raw_size:
+                raise ValueError(
+                    f"Uncompressed page {page_id} stored/raw sizes differ"
+                )
 
             self.pages[page_id] = {
                 "offset": int(offset),
@@ -187,6 +205,7 @@ class ThinArchive:
                 "flags": int(flags),
                 "checksum": checksum,
             }
+        return pos
 
     def _index_manifest_pages(self) -> None:
         for page in self.manifest.get("pages", []):
@@ -208,6 +227,20 @@ class ThinArchive:
             if fused_to is not None:
                 if fused_to not in self.pages:
                     raise ValueError(f"Logical page {page_id} refers to missing fused page {fused_to}")
+                fused_offset = page.get("fused_offset")
+                logical_size = page.get("size")
+                if not isinstance(fused_offset, int) or fused_offset < 0:
+                    raise ValueError(
+                        f"Logical page {page_id} has invalid fused_offset {fused_offset!r}"
+                    )
+                if not isinstance(logical_size, int) or logical_size <= 0:
+                    raise ValueError(
+                        f"Logical page {page_id} has invalid size {logical_size!r}"
+                    )
+                if fused_offset + logical_size > self.pages[fused_to]["raw_size"]:
+                    raise ValueError(
+                        f"Logical page {page_id} exceeds fused parent {fused_to}"
+                    )
                 continue
 
             kind = page.get("kind")
@@ -217,11 +250,16 @@ class ThinArchive:
             if page_id not in self.pages:
                 raise ValueError(f"Manifest page {page_id} missing from page table")
 
+        fused_targets = {
+            page.get("fused_to")
+            for page in self.manifest_pages.values()
+            if page.get("fused_to") is not None
+        }
         for page_id in self.pages:
-            if page_id not in self.manifest_pages:
-                # Some v0 archives may allow physical fused pages with no logical metadata,
-                # but normal ThinTensor archives should keep table and manifest aligned.
-                pass
+            if page_id not in self.manifest_pages and page_id not in fused_targets:
+                raise ValueError(
+                    f"Page table entry {page_id} has no manifest page or fused-page reference"
+                )
 
     def _validate_no_overlaps(self) -> None:
         sorted_pages = sorted(self.pages.items(), key=lambda item: item[1]["offset"])

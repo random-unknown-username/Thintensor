@@ -780,6 +780,83 @@ def _mxfp4_bf16_tensorcore_matvec_kernel(
 
 
 @triton.jit
+def _dual_mxfp4_bf16_tensorcore_matvec_kernel(
+    packed_weight0,
+    scales0,
+    packed_weight1,
+    scales1,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm0: tl.constexpr,
+    stride_sm0: tl.constexpr,
+    stride_sk0: tl.constexpr,
+    stride_wm1: tl.constexpr,
+    stride_sm1: tl.constexpr,
+    stride_sk1: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Launch two equal-shape MXFP4 matvecs in one CUDA grid."""
+    projection = tl.program_id(1)
+    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offsets_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offsets_packed_k = start_k // 2 + tl.arange(0, BLOCK_K // 2)
+        offsets_scale_k = start_k // 32 + tl.arange(0, BLOCK_K // 32)
+        if projection == 0:
+            weight_values = tl.load(
+                packed_weight0
+                + offsets_m[:, None] * stride_wm0
+                + offsets_packed_k[None, :],
+                mask=mask_m[:, None],
+                other=0,
+            )
+            weight_scales = tl.load(
+                scales0
+                + offsets_m[:, None] * stride_sm0
+                + offsets_scale_k[None, :] * stride_sk0,
+                mask=mask_m[:, None],
+                other=0.0,
+            )
+        else:
+            weight_values = tl.load(
+                packed_weight1
+                + offsets_m[:, None] * stride_wm1
+                + offsets_packed_k[None, :],
+                mask=mask_m[:, None],
+                other=0,
+            )
+            weight_scales = tl.load(
+                scales1
+                + offsets_m[:, None] * stride_sm1
+                + offsets_scale_k[None, :] * stride_sk1,
+                mask=mask_m[:, None],
+                other=0.0,
+            )
+        offsets_k = start_k + tl.arange(0, BLOCK_K)
+        vector = tl.load(x + offsets_k)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_N), dtype=tl.bfloat16
+        )
+        accumulator = tl.dot_scaled(
+            weight_values,
+            weight_scales,
+            "e2m1",
+            vector_tile,
+            None,
+            "bf16",
+            acc=accumulator,
+            fast_math=True,
+        )
+    result = tl.sum(accumulator, axis=1) / BLOCK_N
+    tl.store(y + projection * rows + offsets_m, result, mask=mask_m)
+
+
+@triton.jit
 def _mxfp4_selected_tensorcore_matvec_kernel(
     packed_weight,
     scales,
@@ -869,51 +946,13 @@ def _mxfp_lowbit_selected_tensorcore_matvec_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ) -> None:
-    """Q1/Q2 experts expanded to E2M1 nibbles inside tensor-core tiles."""
+    """Q1/Q2 experts dequantized to BF16 inside GPU and processed via native tensor cores."""
     selected_slot = tl.program_id(1)
     expert = tl.load(expert_indices + selected_slot)
     offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_m = offsets_m < rows
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for start_k in range(0, cols, BLOCK_K):
-        pair_offsets = start_k // 2 + tl.arange(0, BLOCK_K // 2)
-        if BITS == 2:
-            byte_offsets = pair_offsets // 2
-            shifts = (pair_offsets & 1) * 4
-            packed = tl.load(
-                packed_weight
-                + expert * stride_we
-                + offsets_m[:, None] * stride_wr
-                + byte_offsets[None, :],
-                mask=mask_m[:, None],
-                other=0,
-            ).to(tl.int32)
-            low_code = (packed >> shifts[None, :]) & 3
-            high_code = (packed >> (shifts[None, :] + 2)) & 3
-            low_magnitude = tl.where(
-                (low_code == 0) | (low_code == 3), 3, 1
-            )
-            high_magnitude = tl.where(
-                (high_code == 0) | (high_code == 3), 3, 1
-            )
-            low_nibble = low_magnitude | tl.where(low_code < 2, 8, 0)
-            high_nibble = high_magnitude | tl.where(high_code < 2, 8, 0)
-        else:
-            byte_offsets = pair_offsets // 4
-            shifts = (pair_offsets & 3) * 2
-            packed = tl.load(
-                packed_weight
-                + expert * stride_we
-                + offsets_m[:, None] * stride_wr
-                + byte_offsets[None, :],
-                mask=mask_m[:, None],
-                other=0,
-            ).to(tl.int32)
-            low_positive = ((packed >> shifts[None, :]) & 1) != 0
-            high_positive = ((packed >> (shifts[None, :] + 1)) & 1) != 0
-            low_nibble = tl.where(low_positive, 2, 10)
-            high_nibble = tl.where(high_positive, 2, 10)
-        weight_values = (low_nibble | (high_nibble << 4)).to(tl.uint8)
         offsets_scale_k = start_k // 32 + tl.arange(0, BLOCK_K // 32)
         weight_scales = tl.load(
             scales
@@ -923,21 +962,48 @@ def _mxfp_lowbit_selected_tensorcore_matvec_kernel(
             mask=mask_m[:, None],
             other=127,
         )
+        factor = tl.exp2(weight_scales.to(tl.float32) - 127.0).to(tl.bfloat16)
+        factor_expanded = tl.broadcast_to(factor[:, :, None], (BLOCK_M, BLOCK_K // 32, 32))
+        factor_reshaped = factor_expanded.reshape(BLOCK_M, BLOCK_K)
+
+        if BITS == 2:
+            byte_offsets = (start_k // 4) + tl.arange(0, BLOCK_K // 4)
+            packed = tl.load(
+                packed_weight
+                + expert * stride_we
+                + offsets_m[:, None] * stride_wr
+                + byte_offsets[None, :],
+                mask=mask_m[:, None],
+                other=0,
+            ).to(tl.int32)
+            shifts = tl.arange(0, 4) * 2
+            code = (packed[:, :, None] >> shifts[None, None, :]) & 3
+            dequantized = (code.to(tl.float32) - 1.5).to(tl.bfloat16)
+            dequantized = dequantized.reshape(BLOCK_M, BLOCK_K)
+        else:
+            byte_offsets = (start_k // 8) + tl.arange(0, BLOCK_K // 8)
+            packed = tl.load(
+                packed_weight
+                + expert * stride_we
+                + offsets_m[:, None] * stride_wr
+                + byte_offsets[None, :],
+                mask=mask_m[:, None],
+                other=0,
+            ).to(tl.int32)
+            bits_idx = tl.arange(0, 8)
+            shifted = (packed[:, :, None] >> bits_idx[None, None, :]) & 1
+            signs = tl.where(shifted != 0, 1.0, -1.0).to(tl.bfloat16)
+            dequantized = signs.reshape(BLOCK_M, BLOCK_K)
+
+        dequantized = dequantized * factor_reshaped
+
         offsets_k = start_k + tl.arange(0, BLOCK_K)
         vector = tl.load(x + selected_slot * stride_xe + offsets_k)
-        vector_tile = vector[:, None] + tl.zeros(
-            (BLOCK_K, BLOCK_N),
-            dtype=tl.bfloat16,
-        )
-        accumulator = tl.dot_scaled(
-            weight_values,
-            weight_scales,
-            "e2m1",
+        vector_tile = tl.broadcast_to(vector[:, None], (BLOCK_K, BLOCK_N))
+        accumulator = tl.dot(
+            dequantized,
             vector_tile,
-            None,
-            "bf16",
             acc=accumulator,
-            fast_math=True,
         )
     result = tl.sum(accumulator, axis=1) / BLOCK_N
     tl.store(
@@ -1497,6 +1563,91 @@ def _int4_scaled_matvec_looped_kernel(
 
 
 @triton.jit
+def _int4_grouped_matvec_looped_kernel(
+    packed_weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sn: tl.constexpr,
+    stride_sp: tl.constexpr,
+    AFFINE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+) -> None:
+    """Grouped INT4 matvec that loads each scale once per group."""
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    groups: tl.constexpr = cols // GROUP_SIZE
+    packed_per_group: tl.constexpr = GROUP_SIZE // 2
+    offs_i = tl.arange(0, packed_per_group)
+    accumulator = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for start_g in range(0, groups, BLOCK_G):
+        offs_g = start_g + tl.arange(0, BLOCK_G)
+        mask_g = offs_g < groups
+        offs_b = offs_g[:, None] * packed_per_group + offs_i[None, :]
+        packed = tl.load(
+            packed_weight
+            + offs_m[:, None, None] * stride_wm
+            + offs_b[None, :, :],
+            mask=mask_m[:, None, None] & mask_g[None, :, None],
+            other=0,
+        ).to(tl.int32)
+        quantized_low = packed & 0x0F
+        quantized_high = (packed >> 4) & 0x0F
+        if not AFFINE:
+            quantized_low -= 8
+            quantized_high -= 8
+        vector_low = tl.load(
+            x + offs_b * 2,
+            mask=mask_g[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        vector_high = tl.load(
+            x + offs_b * 2 + 1,
+            mask=mask_g[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        scale = tl.load(
+            scales
+            + offs_m[:, None] * stride_sm
+            + offs_g[None, :] * stride_sn,
+            mask=mask_m[:, None] & mask_g[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        group_sum = tl.sum(
+            quantized_low.to(tl.float32) * vector_low[None, :, :]
+            + quantized_high.to(tl.float32) * vector_high[None, :, :],
+            axis=2,
+        )
+        if AFFINE:
+            offset = tl.load(
+                scales
+                + offs_m[:, None] * stride_sm
+                + offs_g[None, :] * stride_sn
+                + stride_sp,
+                mask=mask_m[:, None] & mask_g[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            vector_sum = tl.sum(
+                vector_low + vector_high,
+                axis=1,
+            )
+            accumulator += tl.sum(
+                group_sum * scale + vector_sum[None, :] * offset,
+                axis=1,
+            )
+        else:
+            accumulator += tl.sum(group_sum * scale, axis=1)
+    tl.store(y + offs_m, accumulator, mask=mask_m)
+
+
+@triton.jit
 def _int4_selected_matvec_kernel(
     packed_weight,
     scales,
@@ -1623,6 +1774,79 @@ def _int4_dot_matvec_kernel(
     tl.store(
         y + offs_m,
         (tl.sum(accumulator, axis=1) / BLOCK_OUT) * scale,
+        mask=mask_m,
+    )
+
+
+@triton.jit
+def _int4_grouped_dot_matvec_kernel(
+    packed_weight,
+    scales,
+    x,
+    y,
+    rows: tl.constexpr,
+    cols: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sn: tl.constexpr,
+    stride_sp: tl.constexpr,
+    AFFINE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_OUT: tl.constexpr,
+) -> None:
+    """Dequantize grouped INT4 tiles directly into tensor-core dot products."""
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    accumulator = tl.zeros((BLOCK_M, BLOCK_OUT), dtype=tl.float32)
+    for start_k in range(0, cols, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < cols
+        packed = tl.load(
+            packed_weight
+            + offs_m[:, None] * stride_wm
+            + (offs_k[None, :] // 2),
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0,
+        ).to(tl.int32)
+        shift = (offs_k[None, :] & 1) * 4
+        quantized = (packed >> shift) & 0x0F
+        scale = tl.load(
+            scales
+            + offs_m[:, None] * stride_sm
+            + (offs_k[None, :] // GROUP_SIZE) * stride_sn,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+        if AFFINE:
+            offset = tl.load(
+                scales
+                + offs_m[:, None] * stride_sm
+                + (offs_k[None, :] // GROUP_SIZE) * stride_sn
+                + stride_sp,
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            ).to(tl.bfloat16)
+            dequantized = quantized.to(tl.bfloat16) * scale + offset
+        else:
+            dequantized = (quantized - 8).to(tl.bfloat16) * scale
+        vector = tl.load(
+            x + offs_k,
+            mask=mask_k,
+            other=0.0,
+        ).to(tl.bfloat16)
+        vector_tile = vector[:, None] + tl.zeros(
+            (BLOCK_K, BLOCK_OUT), dtype=tl.bfloat16
+        )
+        accumulator += tl.dot(
+            dequantized,
+            vector_tile,
+        )
+    tl.store(
+        y + offs_m,
+        tl.sum(accumulator, axis=1) / BLOCK_OUT,
         mask=mask_m,
     )
 
@@ -4380,13 +4604,26 @@ class TritonDecodeBackend:
             os.environ.get("THINTENSOR_INT4_DOT", "0") == "1"
             and group_size >= cols
         )
-        if use_dot:
-            kernel = _int4_dot_matvec_kernel
+        use_grouped_dot = (
+            os.environ.get("THINTENSOR_INT4_GROUPED_DOT", "0") == "1"
+            and group_size < cols
+            and cols % 256 == 0
+        )
+        if use_dot or use_grouped_dot:
+            kernel = (
+                _int4_grouped_dot_matvec_kernel
+                if use_grouped_dot
+                else _int4_dot_matvec_kernel
+            )
             block_n = 256
             block_m = 16
             num_warps = 4
         elif cols >= 2048:
-            kernel = _int4_scaled_matvec_looped_kernel
+            kernel = (
+                _int4_grouped_matvec_looped_kernel
+                if group_size < cols
+                else _int4_scaled_matvec_looped_kernel
+            )
             block_n = int(
                 os.environ.get("THINTENSOR_INT4_DOWN_BLOCK_N", "256")
             )
@@ -4430,7 +4667,59 @@ class TritonDecodeBackend:
                 BLOCK_OUT=16,
                 num_warps=num_warps,
             )
+        elif use_grouped_dot:
+            affine = scales.ndim == 3
+            kernel[(triton.cdiv(rows, block_m),)](
+                packed_weight,
+                scales,
+                x,
+                out,
+                rows,
+                cols,
+                int(packed_weight.stride(0)),
+                int(scales.stride(0)),
+                int(scales.stride(1)),
+                int(scales.stride(2)) if affine else 0,
+                AFFINE=affine,
+                GROUP_SIZE=group_size,
+                BLOCK_M=block_m,
+                BLOCK_K=block_n,
+                BLOCK_OUT=16,
+                num_warps=num_warps,
+                num_stages=3,
+            )
+            warm_keys = getattr(self, "_int4_grouped_dot_warm_keys", None)
+            if warm_keys is None:
+                warm_keys = set()
+                self._int4_grouped_dot_warm_keys = warm_keys
+            warm_key = (rows, cols, group_size, block_m, block_n)
+            if warm_key not in warm_keys:
+                torch.cuda.synchronize(device=out.device)
+                torch.cuda.empty_cache()
+                warm_keys.add(warm_key)
         else:
+            if kernel is _int4_grouped_matvec_looped_kernel:
+                affine = scales.ndim == 3
+                packed_per_group = group_size // 2
+                block_g = max(1, block_n // packed_per_group)
+                kernel[(triton.cdiv(rows, block_m),)](
+                    packed_weight,
+                    scales,
+                    x,
+                    out,
+                    rows,
+                    cols,
+                    int(packed_weight.stride(0)),
+                    int(scales.stride(0)),
+                    int(scales.stride(1)),
+                    int(scales.stride(2)) if affine else 0,
+                    AFFINE=affine,
+                    GROUP_SIZE=group_size,
+                    BLOCK_M=block_m,
+                    BLOCK_G=block_g,
+                    num_warps=num_warps,
+                )
+                return out
             kernel[(triton.cdiv(rows, block_m),)](
                 packed_weight,
                 scales,
@@ -4579,6 +4868,59 @@ class TritonDecodeBackend:
             num_stages=3,
         )
         return out
+
+    def dual_mxfp4_tensorcore_matvec(
+        self,
+        packed_weights: tuple[torch.Tensor, torch.Tensor],
+        scales: tuple[torch.Tensor, torch.Tensor],
+        x: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        rows: int,
+        cols: int,
+        block_m: int = 64,
+        block_k: int = 256,
+        block_n: int = 8,
+    ) -> torch.Tensor:
+        """Execute equal-shape gate/up MXFP4 projections in one launch."""
+        weight0, weight1 = packed_weights
+        scale0, scale1 = scales
+        expected_weight = (rows, cols // 2)
+        expected_scale = (rows, cols // 32)
+        if tuple(weight0.shape) != expected_weight or tuple(weight1.shape) != expected_weight:
+            raise ValueError("dual MXFP4 packed weight shape mismatch")
+        if tuple(scale0.shape) != expected_scale or tuple(scale1.shape) != expected_scale:
+            raise ValueError("dual MXFP4 scale shape mismatch")
+        if weight0.dtype != torch.uint8 or weight1.dtype != torch.uint8:
+            raise ValueError("dual MXFP4 packed weights must be uint8")
+        if scale0.dtype != torch.uint8 or scale1.dtype != torch.uint8:
+            raise ValueError("dual MXFP4 scales must be uint8")
+        if out.numel() < 2 * rows:
+            raise ValueError("dual MXFP4 output buffer is too small")
+        _dual_mxfp4_bf16_tensorcore_matvec_kernel[
+            (triton.cdiv(rows, block_m), 2)
+        ](
+            weight0,
+            scale0,
+            weight1,
+            scale1,
+            x,
+            out,
+            rows,
+            cols,
+            int(weight0.stride(0)),
+            int(scale0.stride(0)),
+            int(scale0.stride(1)),
+            int(weight1.stride(0)),
+            int(scale1.stride(0)),
+            int(scale1.stride(1)),
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            BLOCK_N=block_n,
+            num_warps=4,
+            num_stages=3,
+        )
+        return out[: 2 * rows]
 
     def block_hadamard_32(
         self,

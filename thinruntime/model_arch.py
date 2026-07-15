@@ -222,7 +222,7 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
         swiglu_limit=(
             float(config["swiglu_limit"])
             if config.get("swiglu_limit") is not None
-            else None
+            else 7.0 if model_type == "gpt_oss" else None
         ),
         norm_weight_offset=(
             1.0 if model_type in {"gemma2", "qwen3_5"} else 0.0
@@ -433,7 +433,7 @@ def descriptor_from_manifest(manifest_or_model: dict[str, Any]) -> ModelDescript
         swiglu_limit=(
             float(model["swiglu_limit"])
             if model.get("swiglu_limit") is not None
-            else None
+            else 7.0 if model_type == "gpt_oss" else None
         ),
         norm_weight_offset=float(
             model.get("norm_weight_offset")
@@ -619,8 +619,10 @@ def _cross_attention_layers(config: dict[str, Any]) -> set[int]:
     for layer in layers:
         try:
             result.add(int(layer))
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"cross_attention_layers contains invalid layer id {layer!r}"
+            ) from exc
     return result
 
 

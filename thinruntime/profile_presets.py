@@ -237,6 +237,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "recommended_for": "Running extremely large models on low-VRAM GPUs.",
         "tradeoffs": ("High quantization noise.",),
     },
+
 }
 
 # Preserve the exact behavior of previously published opt-in names without
@@ -699,6 +700,7 @@ def profile_to_runtime_kwargs(profile: Mapping[str, Any]) -> dict[str, Any]:
         "mxfp4_o_layers",
         "fused_scaled_mlp",
         "fused_residual_norm",
+        "tuned_large_matvec",
     )
     return {key: profile[key] for key in keys if key in profile}
 
@@ -724,6 +726,7 @@ def profile_to_runtime_flags(profile: Mapping[str, Any]) -> list[str]:
         "fused_rope": "--fused-rope",
         "exact_prefill": "--exact-prefill",
         "cuda_graphs": "--cuda-graphs",
+        "tuned_large_matvec": "--tuned-large-matvec",
     }
     for key, flag in booleans.items():
         if profile.get(key):

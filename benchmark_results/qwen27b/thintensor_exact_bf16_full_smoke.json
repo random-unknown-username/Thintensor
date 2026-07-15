@@ -1,0 +1,63 @@
+{
+  "status": "pass",
+  "archive_sha256": "8f75ef331468756301e3e404ec9db18378dc84fbc827c600acee2b1864e9af45",
+  "command": "THINTENSOR_TENSORCORE_MATVEC=1 THINTENSOR_MULTI_TENSORCORE=1 python scripts/thin_runtime.py run /home/satvik/Projects/thintensor-qwen27b-work/output/qwen3.6-27b.thin --device cuda --dtype bf16 --residency stream --gpu-weight-budget 5500000000 --steps 1 --warmup-steps 0 --prompt-token-ids 14162,25,3437,369,279,6511,314,9338,30,198,15666,25 --layers 64 --kv bf16 --kernel-backend triton --cpu-embed --attention-mode causal_kv --attention-backend triton_fused --no-pinned-staging --fused-residual-norm --fused-rope --tuned-large-matvec --max-gpu-temp 83 --json",
+  "model_type": "qwen3_5",
+  "execution_schema": "heterogeneous:gated_delta_net_dense,separate_qkv_gated_dense",
+  "layers": 64,
+  "dtype": "bf16",
+  "cpu_embed_exact": true,
+  "prompt_token_ids": [14162, 25, 3437, 369, 279, 6511, 314, 9338, 30, 198, 15666, 25],
+  "prompt_tokens": 12,
+  "decode_initial_token_id": 271,
+  "generated_token_ids": [248068],
+  "steps": 1,
+  "batch_size": 1,
+  "sequence_count": 1,
+  "aggregate_batching": false,
+  "speculative_decoding": false,
+  "attention_mode": "causal_kv",
+  "attention_backend": "triton_fused",
+  "kv_dtype": "bf16",
+  "kv_actual_sequence_length": 13,
+  "kv_tokens_attended": 13,
+  "kv_cache_read_bytes": 5963776,
+  "gpu_weight_budget_bytes": 5500000000,
+  "resident_weight_bytes": 4075899776,
+  "gpu_peak_allocated_bytes": 5188616704,
+  "gpu_peak_reserved_bytes": 5356126208,
+  "gpu_peak_memory_used_mib": 5608,
+  "gpu_peak_temp_c": 48,
+  "gpu_peak_power_w": 17.61,
+  "gpu_peak_utilization_pct": 85,
+  "gpu_telemetry_samples": 988,
+  "thermal_stop": false,
+  "prefill_s": 258.89226717699967,
+  "decode_s": 24.31798046875,
+  "tokens_per_s": 0.041121835807256174,
+  "h2d_transfer_bytes": 1089061807872,
+  "h2d_transfer_time_ms": 508722.6359349288,
+  "cache_hits": 672,
+  "cache_misses": 18890,
+  "evicted_pages": 18860,
+  "mmap_virtual_payload_bytes": 53791996928,
+  "process_rss_delta_bytes": 29056589824,
+  "not_hf_equivalent": false,
+  "failure_history": [
+    {
+      "gpu_weight_budget_bytes": 7800000000,
+      "cpu_embed": false,
+      "result": "CUDA OOM while allocating a 178257920-byte decoder page; budget left no activation headroom"
+    },
+    {
+      "gpu_weight_budget_bytes": 5500000000,
+      "cpu_embed": false,
+      "result": "declared budget below protected embedding, head, and active MLP working set"
+    },
+    {
+      "gpu_weight_budget_bytes": 5500000000,
+      "cpu_embed": true,
+      "result": "pre-fix Qwen specialized path indexed the metadata-only CPU embedding tensor; fixed by dispatching through the exact CPU row copier"
+    }
+  ]
+}

@@ -6,7 +6,7 @@ use crate::manifest::{FORMAT_VERSION, Manifest, validate_manifest};
 use anyhow::{Context, Result, anyhow, bail};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -59,6 +59,238 @@ pub enum ArchivePageSource<'a> {
     Owned(Vec<u8>),
     Bytes(&'a [u8]),
     FileRange { path: PathBuf, offset: u64 },
+}
+
+/// Return the exact final byte length for an uncompressed archive plan.
+///
+/// This is shared by conversion dry-runs and the writer so disk-space gates
+/// report the same header, manifest, page-table, and payload accounting that
+/// will actually be used on disk.
+pub fn planned_archive_size(manifest: &Manifest, pages: &[ArchivePage<'_>]) -> Result<u64> {
+    let manifest_len = serde_json::to_vec_pretty(manifest)
+        .context("serialize manifest for archive size")?
+        .len() as u64;
+    let page_table_len = pages.iter().try_fold(0_u64, |acc, page| {
+        acc.checked_add(page_record_len(&page.id))
+            .ok_or_else(|| anyhow!("page table length overflows u64"))
+    })?;
+    pages.iter().try_fold(
+        checked_add(
+            checked_add(HEADER_LEN as u64, manifest_len, "manifest end")?,
+            page_table_len,
+            "data offset",
+        )?,
+        |acc, page| checked_add(acc, page.size, "archive size"),
+    )
+}
+
+/// Transactional archive writer used by low-extra-space HF conversion.
+///
+/// The prefix (header, manifest, and page table) is deterministic.  A caller
+/// can therefore persist `next_page`, reopen the `.partial` file, truncate any
+/// uncommitted tail, and continue without retaining a second model-sized copy.
+pub struct ResumableArchiveWriter {
+    final_path: PathBuf,
+    partial_path: PathBuf,
+    file: File,
+    records: Vec<PageTableRecord>,
+    next_page: usize,
+}
+
+impl ResumableArchiveWriter {
+    pub fn open(
+        path: &Path,
+        manifest: &Manifest,
+        pages: &[ArchivePage<'_>],
+        completed_pages: usize,
+    ) -> Result<Self> {
+        let report = validate_manifest(manifest);
+        if !report.is_ok() {
+            bail!("manifest invalid:\n{}", report.errors.join("\n"));
+        }
+        if completed_pages > pages.len() {
+            bail!(
+                "journal completed_pages {} exceeds page count {}",
+                completed_pages,
+                pages.len()
+            );
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+
+        let manifest_bytes = serde_json::to_vec_pretty(manifest).context("serialize manifest")?;
+        let page_table_len = pages
+            .iter()
+            .try_fold(0_u64, |acc, page| {
+                acc.checked_add(page_record_len(&page.id))
+            })
+            .ok_or_else(|| anyhow!("page table length overflows u64"))?;
+        let manifest_off = HEADER_LEN as u64;
+        let page_table_off =
+            checked_add(manifest_off, manifest_bytes.len() as u64, "page_table_off")?;
+        let data_off = checked_add(page_table_off, page_table_len, "data_off")?;
+        let mut offset = data_off;
+        let mut records = Vec::with_capacity(pages.len());
+        for page in pages {
+            records.push(PageTableRecord {
+                page_id: page.id.clone(),
+                offset,
+                stored_size: page.size,
+                raw_size: page.size,
+                flags: 0,
+                checksum: page.checksum,
+            });
+            offset = checked_add(offset, page.size, "page offset")?;
+        }
+        let header = Header {
+            header_len: HEADER_LEN,
+            version: FORMAT_VERSION,
+            manifest_off,
+            manifest_len: manifest_bytes.len() as u64,
+            page_table_off,
+            page_count: pages.len() as u64,
+            data_off,
+            archive_hash: [0_u8; 32],
+        };
+        let partial_path = partial_archive_path(path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(completed_pages == 0)
+            .open(&partial_path)
+            .with_context(|| format!("open {}", partial_path.display()))?;
+
+        if completed_pages == 0 {
+            write_header(&mut file, &header)?;
+            file.write_all(&manifest_bytes).context("write manifest")?;
+            for record in &records {
+                write_page_table_record(&mut file, record)?;
+            }
+            file.flush().context("flush archive prefix")?;
+            file.sync_all().context("sync archive prefix")?;
+        }
+        let committed_len = records
+            .get(completed_pages)
+            .map(|record| record.offset)
+            .unwrap_or(offset);
+        let actual_len = file.metadata()?.len();
+        if actual_len < committed_len {
+            bail!(
+                "partial archive has {} bytes but journal requires {}",
+                actual_len,
+                committed_len
+            );
+        }
+        if actual_len != committed_len {
+            file.set_len(committed_len)
+                .context("truncate uncommitted archive tail")?;
+        }
+        file.seek(SeekFrom::Start(committed_len))
+            .context("seek archive append position")?;
+        Ok(Self {
+            final_path: path.to_path_buf(),
+            partial_path,
+            file,
+            records,
+            next_page: completed_pages,
+        })
+    }
+
+    pub fn append(&mut self, page: &ArchivePage<'_>) -> Result<()> {
+        let record = self
+            .records
+            .get(self.next_page)
+            .ok_or_else(|| anyhow!("all archive pages are already committed"))?;
+        if record.page_id != page.id
+            || record.stored_size != page.size
+            || record.checksum != page.checksum
+        {
+            bail!("page {} does not match resumable archive plan", page.id);
+        }
+        write_page_source(&mut self.file, page)
+            .with_context(|| format!("write page {}", page.id))?;
+        self.next_page += 1;
+        Ok(())
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
+        self.file.flush().context("flush partial archive")?;
+        self.file.sync_all().context("sync partial archive")
+    }
+
+    pub fn verify_pages(&mut self, indices: &[usize]) -> Result<()> {
+        self.sync()?;
+        let restore = self.file.stream_position()?;
+        let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+        for &index in indices {
+            if index >= self.next_page {
+                bail!("cannot verify uncommitted page index {index}");
+            }
+            let record = self
+                .records
+                .get(index)
+                .ok_or_else(|| anyhow!("page index {index} is outside archive plan"))?;
+            self.file.seek(SeekFrom::Start(record.offset))?;
+            let mut remaining = record.stored_size;
+            let mut hash = blake3::Hasher::new();
+            while remaining > 0 {
+                let chunk = usize::try_from(remaining.min(buffer.len() as u64))?;
+                self.file
+                    .read_exact(&mut buffer[..chunk])
+                    .with_context(|| format!("read committed page {}", record.page_id))?;
+                hash.update(&buffer[..chunk]);
+                remaining -= chunk as u64;
+            }
+            if hash.finalize().as_bytes() != &record.checksum {
+                bail!(
+                    "committed page {} failed read-back checksum",
+                    record.page_id
+                );
+            }
+        }
+        self.file.seek(SeekFrom::Start(restore))?;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        if self.next_page != self.records.len() {
+            bail!(
+                "cannot finalize archive with {}/{} pages committed",
+                self.next_page,
+                self.records.len()
+            );
+        }
+        self.sync()?;
+        drop(self.file);
+        fs::rename(&self.partial_path, &self.final_path).with_context(|| {
+            format!(
+                "atomically replace {} with {}",
+                self.final_path.display(),
+                self.partial_path.display()
+            )
+        })?;
+        if let Some(parent) = self.final_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            File::open(parent)?
+                .sync_all()
+                .context("sync archive directory")?;
+        }
+        Ok(())
+    }
+}
+
+pub fn partial_archive_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".{}.partial",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("thintensor"),
+    ))
 }
 
 #[derive(Debug, Clone)]

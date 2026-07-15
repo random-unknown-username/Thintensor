@@ -42,12 +42,14 @@ def main() -> None:
     if args.hf_model:
         path = Path(args.hf_model)
         descriptor = descriptor_from_hf_config(path)
-        tensor_names = hf_tensor_names(path)
+        source_tensor_names = hf_tensor_names(path)
+        tensor_names = canonical_hf_tensor_names(path, source_tensor_names)
         source_label = str(path)
     else:
         archive = ThinArchive(args.archive)
         descriptor = descriptor_from_manifest(archive.manifest)
         tensor_names = tuple(archive.manifest_pages)
+        source_tensor_names = tensor_names
         source_label = str(args.archive)
 
     kernels = available_quant_kernels()
@@ -68,9 +70,13 @@ def main() -> None:
     report = {
         "source": source_label,
         "tensor_count": len(tensor_names),
+        "source_tensor_count": len(source_tensor_names),
+        "excluded_non_text_tensor_count": (
+            len(source_tensor_names) - len(tensor_names)
+        ),
         "schema_plan_compiles": plan.supported,
         "schema_plan_errors": list(plan.unsupported_reasons),
-        "current_native_executor_ready": not executor_reasons,
+        "current_native_executor_ready": plan.supported and not executor_reasons,
         "current_native_executor_gaps": executor_reasons,
         "available_quant_kernels": sorted(kernels),
         "cuda_capability": list(capability) if capability else None,
@@ -127,6 +133,74 @@ def hf_tensor_names(path: Path) -> tuple[str, ...]:
             return tuple(handle.keys())
     raise FileNotFoundError(
         f"{path} has no model.safetensors or model.safetensors.index.json"
+    )
+
+
+def canonical_hf_tensor_names(
+    path: Path, tensor_names: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Apply the converter's multimodal text-only name projection.
+
+    Compatibility inspection must compile the schema that conversion will
+    actually write.  Vision-language repositories such as Qwen3.6 keep their
+    decoder under ``model.language_model``; compiling the raw repository names
+    reports false missing-role failures even though the converter deliberately
+    strips that wrapper and excludes vision pages.
+    """
+    if path.is_file():
+        path = path.parent
+    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    if "text_config" not in config:
+        return tensor_names
+
+    raw_cross_layers = config.get("text_config", {}).get(
+        "cross_attention_layers", []
+    )
+    cross_layers = {
+        int(layer)
+        for layer in raw_cross_layers
+        if isinstance(layer, int) and layer >= 0
+    }
+    prefixes = ("model.language_model.", "language_model.")
+    canonical: set[str] = set()
+    for name in tensor_names:
+        if name == "lm_head.weight":
+            canonical.add(name)
+            continue
+        suffix = next(
+            (name[len(prefix) :] for prefix in prefixes if name.startswith(prefix)),
+            None,
+        )
+        if suffix is None or _is_text_adapter_tensor(suffix):
+            continue
+        normalized = suffix if suffix.startswith("model.") else f"model.{suffix}"
+        layer_prefix = "model.layers."
+        if not normalized.startswith(layer_prefix):
+            canonical.add(normalized)
+            continue
+        rest = normalized[len(layer_prefix) :]
+        layer_text, separator, layer_suffix = rest.partition(".")
+        if not separator or not layer_text.isdigit():
+            canonical.add(normalized)
+            continue
+        layer = int(layer_text)
+        if layer in cross_layers:
+            continue
+        compact_layer = layer - sum(
+            skipped < layer for skipped in cross_layers
+        )
+        canonical.add(f"model.layers.{compact_layer}.{layer_suffix}")
+    return tuple(sorted(canonical))
+
+
+def _is_text_adapter_tensor(name: str) -> bool:
+    return any(
+        marker in name
+        for marker in (
+            ".cross_attn.",
+            ".cross_attn_attn_gate",
+            ".cross_attn_mlp_gate",
+        )
     )
 
 

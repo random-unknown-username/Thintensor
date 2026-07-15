@@ -1,0 +1,127 @@
+{
+  "archive": "/home/satvik/.cache/thintensor/models/microsoft--phi-4/phi-4-fresh.thin",
+  "case_count": 1,
+  "hf_model": "/home/satvik/.cache/thintensor/models/microsoft--phi-4",
+  "metric_definition": {
+    "centered_logit_cosine": "cosine after subtracting each vocabulary vector mean; this removes the unknown additive log-softmax constant and is directly comparable across HF, ThinTensor, and llama.cpp",
+    "q8_distribution": "all vocabulary log-probabilities returned by llama.cpp n_probs=vocab_size",
+    "raw_logit_cosine": "reported only when raw logits are available"
+  },
+  "modes": [
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.0,
+      "maximum_total_variation_distance": 0.0,
+      "minimum_centered_logit_cosine": 1.0,
+      "minimum_raw_logit_cosine": 1.0,
+      "minimum_top5_overlap": 1.0,
+      "mode": "thin_bf16_source",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "factual",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            },
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 8,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            },
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 32,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.0,
+          "maximum_total_variation_distance": 0.0,
+          "minimum_centered_logit_cosine": 1.0,
+          "minimum_raw_logit_cosine": 1.0,
+          "minimum_top5_overlap": 1.0,
+          "prompt_tokens": 5
+        }
+      ]
+    },
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.05230557095534372,
+      "maximum_total_variation_distance": 0.05279814079403877,
+      "minimum_centered_logit_cosine": 0.9972814917564392,
+      "minimum_raw_logit_cosine": null,
+      "minimum_top5_overlap": 1.0,
+      "mode": "Q4_K_b9986",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "factual",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 0.9975945353507996,
+              "jensen_shannon_distance": 0.026540280789151306,
+              "maximum_centered_abs_error": 0.989574670791626,
+              "mean_centered_abs_error": 0.1565316617488861,
+              "raw_logit_cosine": null,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.015001225285232067
+            },
+            {
+              "centered_logit_cosine": 0.9978241920471191,
+              "jensen_shannon_distance": 0.05230557095534372,
+              "maximum_centered_abs_error": 1.090677261352539,
+              "mean_centered_abs_error": 0.13675794005393982,
+              "raw_logit_cosine": null,
+              "step": 8,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.05279814079403877
+            },
+            {
+              "centered_logit_cosine": 0.9972814917564392,
+              "jensen_shannon_distance": 0.005438042620248404,
+              "maximum_centered_abs_error": 0.7478475570678711,
+              "mean_centered_abs_error": 0.12237720936536789,
+              "raw_logit_cosine": null,
+              "step": 32,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0006981029291637242
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.05230557095534372,
+          "maximum_total_variation_distance": 0.05279814079403877,
+          "minimum_centered_logit_cosine": 0.9972814917564392,
+          "minimum_raw_logit_cosine": null,
+          "minimum_top5_overlap": 1.0,
+          "prompt_tokens": 5
+        }
+      ]
+    }
+  ],
+  "q8_gguf": "benchmark_models/phi4-gguf/phi-4-Q4_K.gguf"
+}

@@ -1,0 +1,46 @@
+{
+  "engine": "llama.cpp",
+  "build": {
+    "tag": "b9986",
+    "commit": "91c631b21d6e5d09e9c6659efdf6baeef5a44ddb",
+    "backend": "Vulkan",
+    "device": "Vulkan1",
+    "binary_archive_sha256": "6ec4c41dbb17590cf0dfbb21ccb842b8e235dc72d9e9556c1db9fe3bc390e768"
+  },
+  "model": {
+    "repo": "unsloth/Qwen3.6-27B-GGUF",
+    "revision": "82d411acf4a06cfb8d9b073a5211bf410bfc29bf",
+    "file": "Qwen3.6-27B-Q4_K_M.gguf",
+    "file_bytes": 16817244384,
+    "sha256": "5ed60d0af4650a854b1755bd392f9aef4872643dc25a254bc68043fa638392a0",
+    "llamacpp_model_type": "qwen35 27B Q4_K - Medium",
+    "llamacpp_tensor_bytes": 16806250496,
+    "parameters": 26895998464
+  },
+  "shape": {
+    "single_sequence": true,
+    "batch": 1,
+    "ubatch": 1,
+    "prompt_tokens": 1,
+    "generated_tokens": 200,
+    "repetitions": 3,
+    "kv_type": "f16",
+    "fit_margin_mib": 512,
+    "minimum_fit_context": 2048
+  },
+  "decode_tokens_per_second": {
+    "mean": 4.579955,
+    "standard_deviation": 0.006700,
+    "samples": [4.57234, 4.58493, 4.58260]
+  },
+  "telemetry": {
+    "maximum_gpu_temperature_c": 58,
+    "maximum_gpu_power_w": 21.04,
+    "maximum_gpu_memory_mib": 7006,
+    "samples": "benchmark_results/qwen27b/llamacpp_q4km_b9986_thermal.csv"
+  },
+  "command": "LD_LIBRARY_PATH=/home/satvik/Projects/thintensor-qwen27b-work/llama/llama-b9986 /home/satvik/Projects/thintensor-qwen27b-work/llama/llama-b9986/llama-bench -m /home/satvik/Projects/thintensor-qwen27b-work/q4/Qwen3.6-27B-Q4_K_M.gguf -p 1 -n 200 -b 1 -ub 1 -ngl 99 -dev Vulkan1 -fitt 512 -fitc 2048 -r 3 -o json",
+  "raw_result": "benchmark_results/qwen27b/llamacpp_q4km_b9986_200_r3.raw.json",
+  "raw_log": "benchmark_results/qwen27b/llamacpp_q4km_b9986_200_r3.log",
+  "correctness_logits": "correctness_results/qwen27b/q4km_b9986_fixed_teacher.npz"
+}

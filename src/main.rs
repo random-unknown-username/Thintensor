@@ -5,7 +5,7 @@ use std::process::Command as ProcessCommand;
 use std::str::FromStr;
 use thintensor::archive::{PackOptions, pack_archive};
 use thintensor::bench::{BenchLoadResult, BenchPlanResult, bench_load, bench_plan};
-use thintensor::convert_hf::{ConvertHfOptions, convert_hf};
+use thintensor::convert_hf::{ConvertHfOptions, convert_hf, dry_run_hf};
 use thintensor::plan::{PlanStatus, WeightResidency, build_plan};
 use thintensor::profile::{ProfileOptions, RuntimeProfile, build_profile};
 use thintensor::repack::{RepackOptions, repack_archive};
@@ -111,6 +111,16 @@ enum Command {
         arch: Option<String>,
         #[arg(long)]
         no_tokenizer: bool,
+        #[arg(long)]
+        streaming_pack: bool,
+        #[arg(long)]
+        consume_source_shards: bool,
+        #[arg(long, default_value_t = 0)]
+        minimum_free_bytes: u64,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
     BenchLoad {
         input: PathBuf,
@@ -359,21 +369,46 @@ fn main() -> Result<()> {
             out,
             arch,
             no_tokenizer,
+            streaming_pack,
+            consume_source_shards,
+            minimum_free_bytes,
+            resume,
+            dry_run,
         } => {
-            let result = convert_hf(ConvertHfOptions {
+            if consume_source_shards && !streaming_pack {
+                bail!("--consume-source-shards requires --streaming-pack");
+            }
+            if resume && !streaming_pack {
+                bail!("--resume requires --streaming-pack");
+            }
+            if dry_run && resume {
+                bail!("--dry-run cannot be combined with --resume");
+            }
+            let options = ConvertHfOptions {
                 hf_dir,
                 out_path: out.clone(),
                 arch_override: arch,
                 include_tokenizer_hashes: !no_tokenizer,
-            })?;
-            for warning in &result.warnings {
-                eprintln!("warning: {warning}");
+                streaming_pack,
+                consume_source_shards,
+                minimum_free_bytes,
+                resume,
+            };
+            if dry_run {
+                let report = dry_run_hf(&options)?;
+                serde_json::to_writer_pretty(std::io::stdout(), &report)?;
+                println!();
+            } else {
+                let result = convert_hf(options)?;
+                for warning in &result.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                println!(
+                    "converted {} pages into {}",
+                    result.archive.records().len(),
+                    out.display()
+                );
             }
-            println!(
-                "converted {} pages into {}",
-                result.archive.records().len(),
-                out.display()
-            );
         }
         Command::BenchLoad { input, json } => {
             let result = bench_load(&input)?;

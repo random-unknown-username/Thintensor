@@ -1,0 +1,137 @@
+{
+  "metric": "full-vocabulary centered cosine; additive log-softmax constants are removed for llama.cpp log-probabilities",
+  "modes": [
+    {
+      "array_prefix": "step_",
+      "centered_logit_cosine_percentiles": {
+        "p05": 0.9876149713993072,
+        "p50": 0.9884393215179443,
+        "p95": 0.9962186396121979
+      },
+      "first_top1_divergence_step": null,
+      "greedy_token_match_rate_at_checkpoints": 1.0,
+      "label": "q4km",
+      "maximum_centered_abs_error": 1.4433660507202148,
+      "maximum_jensen_shannon_distance": 0.08392436078924453,
+      "maximum_total_variation_distance": 0.09180249273777008,
+      "mean_centered_abs_error": 0.18135970334211984,
+      "mean_centered_logit_cosine": 0.9910152355829874,
+      "mean_top5_overlap": 0.9333333333333332,
+      "minimum_centered_logit_cosine": 0.9875233769416809,
+      "minimum_raw_logit_cosine": -0.3717903792858124,
+      "minimum_top5_overlap": 0.8,
+      "path": "/home/satvik/Projects/thintensor-opus/correctness_results/qwen27b/q4km_b9986_fixed_teacher.npz",
+      "records": [
+        {
+          "centered_logit_cosine": 0.9875233769416809,
+          "jensen_shannon_distance": 0.058311114521678385,
+          "maximum_centered_abs_error": 1.3820524215698242,
+          "mean_centered_abs_error": 0.19750593602657318,
+          "raw_logit_cosine": -0.3717903792858124,
+          "step": 1,
+          "top1_same": true,
+          "top5_exact_order": false,
+          "top5_overlap": 0.8,
+          "total_variation_distance": 0.030846381559967995
+        },
+        {
+          "centered_logit_cosine": 0.9884393215179443,
+          "jensen_shannon_distance": 0.043624194774635784,
+          "maximum_centered_abs_error": 1.4433660507202148,
+          "mean_centered_abs_error": 0.21418733894824982,
+          "raw_logit_cosine": 0.4709211587905884,
+          "step": 8,
+          "top1_same": true,
+          "top5_exact_order": false,
+          "top5_overlap": 1.0,
+          "total_variation_distance": 0.01871032640337944
+        },
+        {
+          "centered_logit_cosine": 0.9970830082893372,
+          "jensen_shannon_distance": 0.08392436078924453,
+          "maximum_centered_abs_error": 0.9420151710510254,
+          "mean_centered_abs_error": 0.13238583505153656,
+          "raw_logit_cosine": 0.8016330599784851,
+          "step": 32,
+          "top1_same": true,
+          "top5_exact_order": true,
+          "top5_overlap": 1.0,
+          "total_variation_distance": 0.09180249273777008
+        }
+      ],
+      "top1_agreement_rate": 1.0,
+      "top1_same_all": true,
+      "top5_exact_order_rate": 0.3333333333333333,
+      "values": "logits"
+    },
+    {
+      "array_prefix": "candidate_step_",
+      "centered_logit_cosine_percentiles": {
+        "p05": 0.984331214427948,
+        "p50": 0.984412431716919,
+        "p95": 0.9914141774177552
+      },
+      "first_top1_divergence_step": null,
+      "greedy_token_match_rate_at_checkpoints": 1.0,
+      "label": "gptq2_res256",
+      "maximum_centered_abs_error": 3.37631893157959,
+      "maximum_jensen_shannon_distance": 0.09171345146315286,
+      "maximum_total_variation_distance": 0.10114090144634247,
+      "mean_centered_abs_error": 0.23001664380232492,
+      "mean_centered_logit_cosine": 0.9869755903879801,
+      "mean_top5_overlap": 0.9333333333333332,
+      "minimum_centered_logit_cosine": 0.984322190284729,
+      "minimum_raw_logit_cosine": 0.9869179725646973,
+      "minimum_top5_overlap": 0.8,
+      "path": "/home/satvik/Projects/thintensor-opus/correctness_results/qwen27b/cpu_gptq2_affine_int4g32_res256_headg128_fixed_teacher.npz",
+      "records": [
+        {
+          "centered_logit_cosine": 0.984322190284729,
+          "jensen_shannon_distance": 0.03891704718300711,
+          "maximum_centered_abs_error": 3.37631893157959,
+          "mean_centered_abs_error": 0.2204665094614029,
+          "raw_logit_cosine": 0.9873234033584595,
+          "step": 1,
+          "top1_same": true,
+          "top5_exact_order": true,
+          "top5_overlap": 1.0,
+          "total_variation_distance": 0.019978445023298264
+        },
+        {
+          "centered_logit_cosine": 0.984412431716919,
+          "jensen_shannon_distance": 0.013658611855063691,
+          "maximum_centered_abs_error": 2.380988121032715,
+          "mean_centered_abs_error": 0.2516721785068512,
+          "raw_logit_cosine": 0.9869179725646973,
+          "step": 8,
+          "top1_same": true,
+          "top5_exact_order": false,
+          "top5_overlap": 1.0,
+          "total_variation_distance": 0.004707599990069866
+        },
+        {
+          "centered_logit_cosine": 0.9921921491622925,
+          "jensen_shannon_distance": 0.09171345146315286,
+          "maximum_centered_abs_error": 1.640516996383667,
+          "mean_centered_abs_error": 0.2179112434387207,
+          "raw_logit_cosine": 0.9962871074676514,
+          "step": 32,
+          "top1_same": true,
+          "top5_exact_order": false,
+          "top5_overlap": 0.8,
+          "total_variation_distance": 0.10114090144634247
+        }
+      ],
+      "top1_agreement_rate": 1.0,
+      "top1_same_all": true,
+      "top5_exact_order_rate": 0.3333333333333333,
+      "values": "logits"
+    }
+  ],
+  "reference": "/home/satvik/Projects/thintensor-opus/benchmarks/qwen27b/hf_reference/hf_bf16_fixed_teacher.npz",
+  "steps": [
+    1,
+    8,
+    32
+  ]
+}

@@ -1,0 +1,330 @@
+{
+  "archive": "/home/satvik/Projects/thintensor-qwen27b-work/output/qwen3.6-27b.thin",
+  "candidate": "ThinTensor selected runtime flags",
+  "candidate_flags": {
+    "cpu_embed": true,
+    "dense_int4": false,
+    "dense_int4_calibration_covariance_npz": "benchmarks/qwen27b/hf_reference/archive_activation_covariance32.npz",
+    "dense_int4_calibration_json": "benchmarks/qwen27b/hf_reference/hf_bf16_from_archive_gptq_fixed_teacher.json",
+    "dense_int4_calibration_npz": "benchmarks/qwen27b/hf_reference/archive_activation_stats_gptq.npz",
+    "dense_int4_cpu_layers": "0:64",
+    "dense_int4_group_size": 32,
+    "dense_int4_layers": null,
+    "dense_lowbit_bits": 0,
+    "dense_lowbit_layers": null,
+    "down_fp8_layers": null,
+    "down_proj_fp8": true,
+    "embed_fp8": false,
+    "fp8_layers": "3,7,11,15,19,23,27,31,35,39,43,47,51,55,59,63",
+    "fused_residual_norm": true,
+    "fused_rope": true,
+    "fused_scaled_mlp": false,
+    "gate_up_fp8": true,
+    "lm_head_int4_group_size": 128,
+    "mlp_fp8": false,
+    "moe_top_k_limit": 0,
+    "moe_top_k_renorm": true,
+    "mxfp4_down_layers": null,
+    "mxfp4_gate_up_layers": null,
+    "mxfp4_o_layers": null,
+    "mxfp4_qkv_layers": null,
+    "mxfp4_selected_tensorcore": false,
+    "o_fp8_layers": null,
+    "o_proj_fp8": true,
+    "packed_expert_q1_layers": null,
+    "packed_expert_q2_layers": null,
+    "pinned_staging": false,
+    "qkv_fp8": true,
+    "qkv_fp8_layers": null
+  },
+  "minimum_cosine_similarity": 0.9852556586265564,
+  "minimum_generated_token_match_rate": null,
+  "minimum_top5_overlap": 0.8,
+  "record_count": 3,
+  "records": [
+    {
+      "archive": "/home/satvik/Projects/thintensor-qwen27b-work/output/qwen3.6-27b.thin",
+      "candidate_tokens": [
+        271,
+        271,
+        279,
+        6511,
+        314,
+        7526,
+        3177,
+        314,
+        9338,
+        11,
+        198,
+        369,
+        383,
+        279,
+        181474,
+        181474,
+        303,
+        369,
+        799,
+        364,
+        1141,
+        242476,
+        300,
+        21262,
+        11,
+        279,
+        9440,
+        46890,
+        15849,
+        321,
+        42027,
+        8807
+      ],
+      "candidate_top5": [
+        {
+          "logit": 20.125,
+          "token_id": 271
+        },
+        {
+          "logit": 17.125,
+          "token_id": 11751
+        },
+        {
+          "logit": 16.25,
+          "token_id": 561
+        },
+        {
+          "logit": 15.125,
+          "token_id": 248046
+        },
+        {
+          "logit": 15.0,
+          "token_id": 220
+        }
+      ],
+      "cosine_similarity": 0.9852556586265564,
+      "decode_step": 1,
+      "generated_token_match_rate": null,
+      "kv_tokens_attended": 12,
+      "kv_tokens_expected": 12,
+      "max_abs_logit_error": 3.125,
+      "mean_abs_logit_error": 0.23479895293712616,
+      "prefill_length": 12,
+      "prompt": "Hello",
+      "reference_tokens": [],
+      "reference_top5": [
+        {
+          "logit": 20.375,
+          "token_id": 271
+        },
+        {
+          "logit": 16.625,
+          "token_id": 11751
+        },
+        {
+          "logit": 15.9375,
+          "token_id": 561
+        },
+        {
+          "logit": 15.1875,
+          "token_id": 248046
+        },
+        {
+          "logit": 14.125,
+          "token_id": 220
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 1.0
+    },
+    {
+      "archive": "/home/satvik/Projects/thintensor-qwen27b-work/output/qwen3.6-27b.thin",
+      "candidate_tokens": [
+        271,
+        271,
+        279,
+        6511,
+        314,
+        7526,
+        3177,
+        314,
+        9338,
+        11,
+        198,
+        369,
+        383,
+        279,
+        181474,
+        181474,
+        303,
+        369,
+        799,
+        364,
+        1141,
+        242476,
+        300,
+        21262,
+        11,
+        279,
+        9440,
+        46890,
+        15849,
+        321,
+        42027,
+        8807
+      ],
+      "candidate_top5": [
+        {
+          "logit": 23.25,
+          "token_id": 314
+        },
+        {
+          "logit": 19.125,
+          "token_id": 303
+        },
+        {
+          "logit": 16.875,
+          "token_id": 13
+        },
+        {
+          "logit": 16.125,
+          "token_id": 11
+        },
+        {
+          "logit": 15.3125,
+          "token_id": 198
+        }
+      ],
+      "cosine_similarity": 0.9870990514755249,
+      "decode_step": 8,
+      "generated_token_match_rate": null,
+      "kv_tokens_attended": 19,
+      "kv_tokens_expected": 19,
+      "max_abs_logit_error": 2.0,
+      "mean_abs_logit_error": 0.2489335536956787,
+      "prefill_length": 12,
+      "prompt": "Hello",
+      "reference_tokens": [],
+      "reference_top5": [
+        {
+          "logit": 23.375,
+          "token_id": 314
+        },
+        {
+          "logit": 19.0,
+          "token_id": 303
+        },
+        {
+          "logit": 16.625,
+          "token_id": 13
+        },
+        {
+          "logit": 15.8125,
+          "token_id": 1076
+        },
+        {
+          "logit": 15.75,
+          "token_id": 11
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 0.8
+    },
+    {
+      "archive": "/home/satvik/Projects/thintensor-qwen27b-work/output/qwen3.6-27b.thin",
+      "candidate_tokens": [
+        271,
+        271,
+        279,
+        6511,
+        314,
+        7526,
+        3177,
+        314,
+        9338,
+        11,
+        198,
+        369,
+        383,
+        279,
+        181474,
+        181474,
+        303,
+        369,
+        799,
+        364,
+        1141,
+        242476,
+        300,
+        21262,
+        11,
+        279,
+        9440,
+        46890,
+        15849,
+        321,
+        42027,
+        8807
+      ],
+      "candidate_top5": [
+        {
+          "logit": 14.875,
+          "token_id": 8807
+        },
+        {
+          "logit": 14.25,
+          "token_id": 10829
+        },
+        {
+          "logit": 14.0,
+          "token_id": 17496
+        },
+        {
+          "logit": 14.0,
+          "token_id": 33847
+        },
+        {
+          "logit": 14.0,
+          "token_id": 1599
+        }
+      ],
+      "cosine_similarity": 0.9964786767959595,
+      "decode_step": 32,
+      "generated_token_match_rate": null,
+      "kv_tokens_attended": 43,
+      "kv_tokens_expected": 43,
+      "max_abs_logit_error": 1.5078125,
+      "mean_abs_logit_error": 0.2124669998884201,
+      "prefill_length": 12,
+      "prompt": "Hello",
+      "reference_tokens": [],
+      "reference_top5": [
+        {
+          "logit": 14.8125,
+          "token_id": 8807
+        },
+        {
+          "logit": 14.5625,
+          "token_id": 10829
+        },
+        {
+          "logit": 14.125,
+          "token_id": 31883
+        },
+        {
+          "logit": 13.9375,
+          "token_id": 17496
+        },
+        {
+          "logit": 13.875,
+          "token_id": 1599
+        }
+      ],
+      "top1_same": true,
+      "top5_overlap": 0.8
+    }
+  ],
+  "reference": "saved full-vocabulary vectors: benchmarks/qwen27b/hf_reference/hf_bf16_fixed_teacher.npz",
+  "reference_logits_npz": "benchmarks/qwen27b/hf_reference/hf_bf16_fixed_teacher.npz",
+  "tokenizer": null,
+  "top1_same_all_records": true,
+  "trajectory": "correctness_results/qwen27b/q4km_b9986_fixed_teacher.json"
+}

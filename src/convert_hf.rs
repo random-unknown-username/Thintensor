@@ -1,18 +1,24 @@
 //! Hugging Face safetensors to ThinTensor v0 converter.
 
-use crate::archive::{Archive, ArchivePage, ArchivePageSource, write_archive_pages};
+use crate::archive::{
+    Archive, ArchivePage, ArchivePageSource, ResumableArchiveWriter, planned_archive_size,
+    write_archive_pages,
+};
 use crate::manifest::{
     ExecutionStage, FORMAT_NAME, FORMAT_VERSION, KvCachePlan, Manifest, MemoryPlan, ModelSpec,
     PageSpec,
 };
 use crate::verify::verify_archive;
 use anyhow::{Context, Result, anyhow, bail};
+use fs2::available_space;
 use glob::glob;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const EMBED: &str = "model.embed_tokens.weight";
@@ -25,6 +31,10 @@ pub struct ConvertHfOptions {
     pub out_path: PathBuf,
     pub arch_override: Option<String>,
     pub include_tokenizer_hashes: bool,
+    pub streaming_pack: bool,
+    pub consume_source_shards: bool,
+    pub minimum_free_bytes: u64,
+    pub resume: bool,
 }
 
 #[derive(Debug)]
@@ -33,7 +43,78 @@ pub struct ConvertHfResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversionDeletionPoint {
+    pub source_shard: PathBuf,
+    pub source_bytes: u64,
+    pub retained_pages: usize,
+    pub after_page_index: Option<usize>,
+    pub after_page_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversionDryRunReport {
+    pub schema: String,
+    pub hf_dir: PathBuf,
+    pub out_path: PathBuf,
+    pub shard_order: Vec<PathBuf>,
+    pub expected_archive_bytes: u64,
+    pub archive_payload_bytes: u64,
+    pub peak_temporary_bytes_upper_bound: u64,
+    pub available_bytes_before: u64,
+    pub projected_minimum_available_bytes: u64,
+    pub minimum_free_bytes: u64,
+    pub consume_source_shards: bool,
+    pub payload_checksums_computed: bool,
+    pub meets_minimum_free_requirement: bool,
+    pub deletion_points: Vec<ConversionDeletionPoint>,
+    pub warnings: Vec<String>,
+}
+
+struct PreparedHfConversion {
+    manifest: Manifest,
+    archive_pages: Vec<ArchivePage<'static>>,
+    safetensor_paths: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
 pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
+    if options.streaming_pack && options.resume && conversion_plan_path(&options.out_path).exists()
+    {
+        return resume_streaming_conversion(&options);
+    }
+    let prepared = prepare_hf_conversion(&options)?;
+    if options.streaming_pack {
+        return write_streaming_conversion(
+            &options,
+            prepared.manifest,
+            prepared.archive_pages,
+            prepared.safetensor_paths,
+            prepared.warnings,
+        );
+    }
+
+    write_archive_pages(
+        &options.out_path,
+        &prepared.manifest,
+        &prepared.archive_pages,
+    )?;
+    let archive = Archive::open(&options.out_path)?;
+    let report = verify_archive(&archive)?;
+    if !report.is_ok() {
+        bail!(
+            "archive verify failed after convert:\n{}",
+            report.errors.join("\n")
+        );
+    }
+
+    Ok(ConvertHfResult {
+        archive,
+        warnings: prepared.warnings,
+    })
+}
+
+fn prepare_hf_conversion(options: &ConvertHfOptions) -> Result<PreparedHfConversion> {
     let config_path = options.hf_dir.join("config.json");
     if !config_path.exists() {
         bail!("config.json missing in {}", options.hf_dir.display());
@@ -59,7 +140,7 @@ pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
         ));
     }
     let layers = required_u32(&config, "num_hidden_layers")?;
-    let model = build_model_spec(&config, layers, &tensors, &options, &mut warnings)?;
+    let model = build_model_spec(&config, layers, &tensors, options, &mut warnings)?;
     let pages = build_pages(&tensors, &config)?;
     let execution_tape = build_execution_tape(layers, &tensors, &config, &mut warnings)?;
     warn_unknown_tensors(&tensors, layers, &execution_tape, &mut warnings);
@@ -74,19 +155,434 @@ pub fn convert_hf(options: ConvertHfOptions) -> Result<ConvertHfResult> {
         pages,
         memory_plan,
     };
-    add_tokenizer_hashes(&mut warnings, &mut manifest.model, &options)?;
+    add_tokenizer_hashes(&mut warnings, &mut manifest.model, options)?;
 
-    write_archive_pages(&options.out_path, &manifest, &archive_pages)?;
+    Ok(PreparedHfConversion {
+        manifest,
+        archive_pages,
+        safetensor_paths,
+        warnings,
+    })
+}
+
+pub fn dry_run_hf(options: &ConvertHfOptions) -> Result<ConversionDryRunReport> {
+    if options.resume {
+        bail!("--dry-run cannot be combined with --resume");
+    }
+    // Manifest checksums serialize as JSON byte arrays, so their decimal
+    // widths affect the exact archive prefix length. A truly exact dry-run
+    // must therefore hash payloads just like conversion; header-only planning
+    // is suitable for a bound, but not an exact byte claim.
+    let prepared = prepare_hf_conversion(options)?;
+    let archive_payload_bytes = prepared.archive_pages.iter().try_fold(0_u64, |acc, page| {
+        acc.checked_add(page.size)
+            .ok_or_else(|| anyhow!("archive payload size overflows u64"))
+    })?;
+    let expected_archive_bytes = planned_archive_size(&prepared.manifest, &prepared.archive_pages)?;
+    let output_parent = options
+        .out_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let available_bytes_before = available_space(output_parent)
+        .with_context(|| format!("query free space for {}", output_parent.display()))?;
+    let prefix_bytes = expected_archive_bytes.saturating_sub(archive_payload_bytes);
+    let source_indices = prepared.archive_pages.iter().enumerate().fold(
+        BTreeMap::<PathBuf, Vec<usize>>::new(),
+        |mut result, (index, page)| {
+            if let ArchivePageSource::FileRange { path, .. } = &page.source {
+                result.entry(path.clone()).or_default().push(index);
+            }
+            result
+        },
+    );
+    let mut deletion_points = Vec::with_capacity(prepared.safetensor_paths.len());
+    let mut projected_available = available_bytes_before.saturating_sub(prefix_bytes);
+    let mut projected_minimum = projected_available;
+    for source in &prepared.safetensor_paths {
+        let source_bytes = source
+            .metadata()
+            .with_context(|| format!("stat {}", source.display()))?
+            .len();
+        let indices = source_indices.get(source);
+        let after_page_index = indices.and_then(|values| values.last().copied());
+        deletion_points.push(ConversionDeletionPoint {
+            source_shard: source.clone(),
+            source_bytes,
+            retained_pages: indices.map_or(0, Vec::len),
+            after_page_index,
+            after_page_id: after_page_index.map(|index| prepared.archive_pages[index].id.clone()),
+        });
+        if options.consume_source_shards && indices.is_none() {
+            projected_available = projected_available.saturating_add(source_bytes);
+        }
+    }
+    for (index, page) in prepared.archive_pages.iter().enumerate() {
+        projected_available = projected_available.saturating_sub(page.size);
+        projected_minimum = projected_minimum.min(projected_available);
+        if options.consume_source_shards {
+            for point in deletion_points
+                .iter()
+                .filter(|point| point.after_page_index == Some(index))
+            {
+                projected_available = projected_available.saturating_add(point.source_bytes);
+            }
+        }
+    }
+    let manifest_bytes = serde_json::to_vec_pretty(&prepared.manifest)?.len() as u64;
+    let plan_records_bytes = prepared.archive_pages.iter().fold(0_u64, |acc, page| {
+        acc.saturating_add(page.id.len() as u64 + 256)
+    });
+    let peak_temporary_bytes_upper_bound = manifest_bytes
+        .saturating_add(plan_records_bytes)
+        .saturating_add(1024 * 1024);
+
+    Ok(ConversionDryRunReport {
+        schema: "thintensor.conversion_dry_run.v1".to_string(),
+        hf_dir: options.hf_dir.clone(),
+        out_path: options.out_path.clone(),
+        shard_order: prepared.safetensor_paths,
+        expected_archive_bytes,
+        archive_payload_bytes,
+        peak_temporary_bytes_upper_bound,
+        available_bytes_before,
+        projected_minimum_available_bytes: projected_minimum,
+        minimum_free_bytes: options.minimum_free_bytes,
+        consume_source_shards: options.consume_source_shards,
+        payload_checksums_computed: true,
+        meets_minimum_free_requirement: projected_minimum >= options.minimum_free_bytes,
+        deletion_points,
+        warnings: prepared.warnings,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StreamingPage {
+    id: String,
+    size: u64,
+    checksum: String,
+    source_path: PathBuf,
+    source_offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StreamingConversionPlan {
+    schema_version: u32,
+    hf_dir: PathBuf,
+    out_path: PathBuf,
+    manifest: Manifest,
+    pages: Vec<StreamingPage>,
+    source_shards: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StreamingConversionJournal {
+    schema_version: u32,
+    plan_blake3: String,
+    completed_pages: usize,
+    verified_sources: BTreeSet<PathBuf>,
+    deleted_sources: BTreeSet<PathBuf>,
+    completed: bool,
+}
+
+fn write_streaming_conversion(
+    options: &ConvertHfOptions,
+    manifest: Manifest,
+    pages: Vec<ArchivePage<'static>>,
+    source_shards: Vec<PathBuf>,
+    warnings: Vec<String>,
+) -> Result<ConvertHfResult> {
+    if options.out_path.exists() {
+        bail!("output {} already exists", options.out_path.display());
+    }
+    let hf_dir = fs::canonicalize(&options.hf_dir)
+        .with_context(|| format!("canonicalize {}", options.hf_dir.display()))?;
+    let out_path = absolute_output_path(&options.out_path)?;
+    let source_shards = source_shards
+        .iter()
+        .map(|path| {
+            fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let pages = pages
+        .into_iter()
+        .map(|page| {
+            let ArchivePageSource::FileRange { path, offset } = page.source else {
+                bail!("streaming HF conversion requires file-range page sources")
+            };
+            Ok(StreamingPage {
+                id: page.id,
+                size: page.size,
+                checksum: hex::encode(page.checksum),
+                source_path: fs::canonicalize(&path)
+                    .with_context(|| format!("canonicalize {}", path.display()))?,
+                source_offset: offset,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let plan = StreamingConversionPlan {
+        schema_version: 1,
+        hf_dir,
+        out_path,
+        manifest,
+        pages,
+        source_shards,
+        warnings,
+    };
+    let plan_bytes = serde_json::to_vec_pretty(&plan).context("serialize conversion plan")?;
+    let plan_hash = blake3::hash(&plan_bytes).to_hex().to_string();
+    write_atomic_bytes(&conversion_plan_path(&options.out_path), &plan_bytes)?;
+    let journal = StreamingConversionJournal {
+        schema_version: 1,
+        plan_blake3: plan_hash,
+        completed_pages: 0,
+        verified_sources: BTreeSet::new(),
+        deleted_sources: BTreeSet::new(),
+        completed: false,
+    };
+    write_atomic_json(&conversion_journal_path(&options.out_path), &journal)?;
+    run_streaming_conversion(options, plan, journal)
+}
+
+fn resume_streaming_conversion(options: &ConvertHfOptions) -> Result<ConvertHfResult> {
+    let plan_path = conversion_plan_path(&options.out_path);
+    let journal_path = conversion_journal_path(&options.out_path);
+    let plan_bytes =
+        fs::read(&plan_path).with_context(|| format!("read {}", plan_path.display()))?;
+    let plan: StreamingConversionPlan =
+        serde_json::from_slice(&plan_bytes).context("parse streaming conversion plan")?;
+    let journal: StreamingConversionJournal = serde_json::from_reader(
+        File::open(&journal_path).with_context(|| format!("open {}", journal_path.display()))?,
+    )
+    .context("parse streaming conversion journal")?;
+    let actual_hash = blake3::hash(&plan_bytes).to_hex().to_string();
+    if actual_hash != journal.plan_blake3 {
+        bail!("streaming conversion plan checksum does not match journal");
+    }
+    if absolute_output_path(&options.out_path)? != plan.out_path {
+        bail!("resume output path does not match conversion plan");
+    }
+    if options.out_path.exists() {
+        let archive = Archive::open(&options.out_path)?;
+        let report = verify_archive(&archive)?;
+        if !report.is_ok() {
+            bail!(
+                "completed archive failed verification:\n{}",
+                report.errors.join("\n")
+            );
+        }
+        return Ok(ConvertHfResult {
+            archive,
+            warnings: plan.warnings,
+        });
+    }
+    run_streaming_conversion(options, plan, journal)
+}
+
+fn run_streaming_conversion(
+    options: &ConvertHfOptions,
+    plan: StreamingConversionPlan,
+    mut journal: StreamingConversionJournal,
+) -> Result<ConvertHfResult> {
+    let pages = plan
+        .pages
+        .iter()
+        .map(streaming_archive_page)
+        .collect::<Result<Vec<_>>>()?;
+    let mut writer = ResumableArchiveWriter::open(
+        &options.out_path,
+        &plan.manifest,
+        &pages,
+        journal.completed_pages,
+    )?;
+    let source_indices = source_page_indices(&plan);
+
+    // A shard with no retained text tensors can be consumed as soon as the
+    // durable plan proves that no archive page depends on it.
+    if options.consume_source_shards {
+        for source in &plan.source_shards {
+            if !source_indices.contains_key(source) && source.exists() {
+                validate_consumable_source(&plan.hf_dir, source)?;
+                fs::remove_file(source).with_context(|| {
+                    format!("delete excluded source shard {}", source.display())
+                })?;
+                journal.verified_sources.insert(source.clone());
+                journal.deleted_sources.insert(source.clone());
+                write_atomic_json(&conversion_journal_path(&options.out_path), &journal)?;
+            }
+        }
+    }
+
+    for (index, page) in pages.iter().enumerate().skip(journal.completed_pages) {
+        enforce_free_space(&options.out_path, options.minimum_free_bytes, page.size)?;
+        let source = plan.pages[index].source_path.clone();
+        if !source.exists() {
+            bail!(
+                "source shard {} is missing before page {} was committed",
+                source.display(),
+                plan.pages[index].id
+            );
+        }
+        writer.append(page)?;
+        journal.completed_pages = index + 1;
+        write_atomic_json(&conversion_journal_path(&options.out_path), &journal)?;
+
+        let indices = source_indices
+            .get(&source)
+            .ok_or_else(|| anyhow!("source {} is absent from conversion plan", source.display()))?;
+        if indices.last() == Some(&index) && !journal.verified_sources.contains(&source) {
+            writer.verify_pages(indices)?;
+            journal.verified_sources.insert(source.clone());
+            write_atomic_json(&conversion_journal_path(&options.out_path), &journal)?;
+            if options.consume_source_shards {
+                validate_consumable_source(&plan.hf_dir, &source)?;
+                fs::remove_file(&source).with_context(|| {
+                    format!("delete committed source shard {}", source.display())
+                })?;
+                journal.deleted_sources.insert(source);
+                write_atomic_json(&conversion_journal_path(&options.out_path), &journal)?;
+            }
+        }
+    }
+    writer.finish()?;
     let archive = Archive::open(&options.out_path)?;
     let report = verify_archive(&archive)?;
     if !report.is_ok() {
         bail!(
-            "archive verify failed after convert:\n{}",
+            "archive verify failed after streaming convert:\n{}",
             report.errors.join("\n")
         );
     }
+    journal.completed = true;
+    write_atomic_json(&conversion_journal_path(&options.out_path), &journal)?;
+    Ok(ConvertHfResult {
+        archive,
+        warnings: plan.warnings,
+    })
+}
 
-    Ok(ConvertHfResult { archive, warnings })
+fn streaming_archive_page(page: &StreamingPage) -> Result<ArchivePage<'static>> {
+    let decoded = hex::decode(&page.checksum)
+        .with_context(|| format!("decode checksum for page {}", page.id))?;
+    let checksum: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| anyhow!("page {} checksum must contain 32 bytes", page.id))?;
+    Ok(ArchivePage {
+        id: page.id.clone(),
+        size: page.size,
+        checksum,
+        source: ArchivePageSource::FileRange {
+            path: page.source_path.clone(),
+            offset: page.source_offset,
+        },
+    })
+}
+
+fn source_page_indices(plan: &StreamingConversionPlan) -> BTreeMap<PathBuf, Vec<usize>> {
+    let mut result: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for (index, page) in plan.pages.iter().enumerate() {
+        result
+            .entry(page.source_path.clone())
+            .or_default()
+            .push(index);
+    }
+    result
+}
+
+fn validate_consumable_source(hf_dir: &Path, source: &Path) -> Result<()> {
+    let canonical = fs::canonicalize(source)
+        .with_context(|| format!("canonicalize source shard {}", source.display()))?;
+    if !canonical.starts_with(hf_dir)
+        || canonical.parent() != Some(hf_dir)
+        || canonical.extension().and_then(|value| value.to_str()) != Some("safetensors")
+    {
+        bail!(
+            "refusing to consume source outside the direct HF directory: {}",
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
+fn enforce_free_space(path: &Path, minimum_free: u64, next_page: u64) -> Result<()> {
+    if minimum_free == 0 {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let available = available_space(parent)
+        .with_context(|| format!("query free space for {}", parent.display()))?;
+    let required = minimum_free
+        .checked_add(next_page)
+        .ok_or_else(|| anyhow!("minimum free-space requirement overflows u64"))?;
+    if available < required {
+        bail!(
+            "streaming conversion free-space gate: {} bytes available, {} required before next page",
+            available,
+            required
+        );
+    }
+    Ok(())
+}
+
+fn conversion_plan_path(out: &Path) -> PathBuf {
+    sidecar_path(out, "conversion-plan.json")
+}
+
+fn conversion_journal_path(out: &Path) -> PathBuf {
+    sidecar_path(out, "conversion-journal.json")
+}
+
+fn sidecar_path(out: &Path, suffix: &str) -> PathBuf {
+    out.with_file_name(format!(
+        "{}.{}",
+        out.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("model.thin"),
+        suffix,
+    ))
+}
+
+fn absolute_output_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).context("serialize conversion state")?;
+    write_atomic_bytes(path, &bytes)
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let temporary = path.with_file_name(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("conversion-state"),
+    ));
+    let mut file =
+        File::create(&temporary).with_context(|| format!("create {}", temporary.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
+    File::open(parent)?
+        .sync_all()
+        .context("sync conversion-state directory")?;
+    Ok(())
 }
 
 fn effective_text_config(source: &Value) -> Value {
@@ -126,6 +622,18 @@ fn canonical_text_tensors(
     let mut canonical = BTreeMap::new();
     let mut excluded = 0;
     for (name, mut page) in tensors {
+        // Some multimodal checkpoints keep the text decoder below
+        // `model.language_model.*` but store its untied execution head at the
+        // repository root.  Preserve that head before filtering non-text
+        // tensors; dropping it produces an archive that verifies structurally
+        // but cannot execute logits.
+        if name == LM_HEAD {
+            page.id = LM_HEAD.to_string();
+            if canonical.insert(page.id.clone(), page).is_some() {
+                bail!("canonical text tensor name collision for {name}");
+            }
+            continue;
+        }
         let Some(suffix) = PREFIXES.iter().find_map(|prefix| name.strip_prefix(prefix)) else {
             excluded += 1;
             continue;
@@ -286,7 +794,7 @@ fn collect_tensors(paths: &[PathBuf]) -> Result<BTreeMap<String, TensorPage>> {
             let offset = data_start
                 .checked_sub(base)
                 .ok_or_else(|| anyhow!("tensor {name} data pointer is outside mmap"))?;
-            let checksum = blake3::hash(data);
+            let checksum = *blake3::hash(data).as_bytes();
             let shape = tensor
                 .shape()
                 .iter()
@@ -298,7 +806,7 @@ fn collect_tensors(paths: &[PathBuf]) -> Result<BTreeMap<String, TensorPage>> {
                 path: path.clone(),
                 offset: offset as u64,
                 size: data.len() as u64,
-                checksum: *checksum.as_bytes(),
+                checksum,
                 dtype: format!("{:?}", tensor.dtype()).to_ascii_lowercase(),
                 shape,
             };
@@ -1212,13 +1720,29 @@ fn build_memory_plan(
     );
     let largest_stage_bytes = execution_tape
         .iter()
-        .map(|stage| unique_tensor_bytes(stage.page_refs.iter().filter_map(|id| tensors.get(id))))
+        .map(|stage| {
+            unique_tensor_bytes(
+                stage
+                    .page_refs
+                    .iter()
+                    .filter_map(|id| tensors.get(id))
+                    // Global tensors are already included in `global_bytes`.
+                    // Counting the embedding/head stage again can make the
+                    // advertised minimum exceed the all-resident plan.
+                    .filter(|tensor| layer_from_tensor(&tensor.id).is_some()),
+            )
+        })
         .max()
         .unwrap_or(0);
-    let min_vram_bytes = global_bytes
+    let streaming_working_set_bytes = global_bytes
         .saturating_add(largest_stage_bytes)
         .saturating_add(scratch_bytes);
     let recommended_vram_bytes = weights_bytes.saturating_add(scratch_bytes);
+    // The hot global set and the largest stage are deduplicated separately.
+    // A tied/aliased tensor can therefore occur in both subtotals even though
+    // the all-resident plan counts it once. The streaming minimum cannot be
+    // larger than that verified all-resident upper bound.
+    let min_vram_bytes = streaming_working_set_bytes.min(recommended_vram_bytes);
 
     MemoryPlan {
         scratch_bytes,

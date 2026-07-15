@@ -1,0 +1,635 @@
+{
+  "acceptance": {
+    "attention_equivalent": true,
+    "exact_minimum_cosine_similarity": 0.999,
+    "minimum_generated_token_match_rate": 0.8,
+    "minimum_top5_overlap": 0.8,
+    "short_generation_mostly_matches": true,
+    "strict_cosine_all_records": false,
+    "top1_same_all_records": false,
+    "top5_exact_order_all_records": false,
+    "top5_overlap_high_all_records": true
+  },
+  "adaptive_body_int8_start_token": -1,
+  "archive": "/home/satvik/.cache/thintensor/models/unsloth--Llama-3.2-11B-Vision-Instruct/llama-3.2-11b-fresh.thin",
+  "attention_backend": "triton_fused",
+  "attention_equivalent": true,
+  "attention_mode": "causal_kv",
+  "attn_proj_fp8": false,
+  "body_int4_group_size": 0,
+  "config_mismatches": [
+    {
+      "field": "rope_scaling",
+      "hf": null,
+      "thin": {
+        "factor": 8.0,
+        "high_freq_factor": 4.0,
+        "low_freq_factor": 1.0,
+        "original_max_position_embeddings": 8192,
+        "rope_type": "llama3"
+      }
+    },
+    {
+      "field": "max_position_embeddings",
+      "hf": null,
+      "thin": 131072
+    },
+    {
+      "field": "rope_variant",
+      "hf": "default",
+      "thin": "llama3"
+    }
+  ],
+  "correctness_tier": "experimental",
+  "cpu_weight_offload": false,
+  "down_fp8_layers": "all",
+  "down_proj_fp8": false,
+  "dtype": "bf16",
+  "exact_hf_mode": false,
+  "fp8_layers": "all",
+  "fp8_scale_block": 0,
+  "gate_up_fp8": false,
+  "gpu_weight_budget_bytes": 0,
+  "hf_attention_implementation": "sdpa",
+  "hf_config_summary": {
+    "attention_bias": false,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 4096,
+    "intermediate_size": 14336,
+    "layer_types": [],
+    "max_position_embeddings": null,
+    "model_type": "llama",
+    "no_rope_layers": [],
+    "num_attention_heads": 32,
+    "num_hidden_layers": 32,
+    "num_key_value_heads": 8,
+    "qkv_bias": false,
+    "rms_norm_eps": 1e-05,
+    "rope_scaling": null,
+    "rope_theta": 500000.0,
+    "rope_variant": "default",
+    "sliding_window": null,
+    "tie_word_embeddings": false,
+    "torch_dtype": "bfloat16",
+    "use_sliding_window": false
+  },
+  "hf_descriptor": {
+    "activation": "silu",
+    "architecture_family": "decoder_dense",
+    "attention_bias": false,
+    "attention_kind": "gqa",
+    "attention_logit_softcap": null,
+    "attention_output_gate": false,
+    "attention_sinks": false,
+    "attention_variants": [
+      "causal_kv",
+      "current_only_smoke"
+    ],
+    "embedding_scale": 1.0,
+    "final_logit_softcap": null,
+    "global_head_dim": 0,
+    "head_dim": 128,
+    "hidden_size": 4096,
+    "hidden_size_per_layer_input": 0,
+    "intermediate_size": 14336,
+    "layer_types": [],
+    "linear_conv_kernel_dim": 0,
+    "linear_key_head_dim": 0,
+    "linear_num_key_heads": 0,
+    "linear_num_value_heads": 0,
+    "linear_value_head_dim": 0,
+    "max_position_embeddings": 131072,
+    "mlp_bias": false,
+    "mlp_kind": "gated_dense",
+    "model_type": "llama",
+    "no_rope_layers": [],
+    "norm_eps": 1e-05,
+    "norm_kind": "rms_norm",
+    "norm_topk_prob": true,
+    "norm_weight_offset": 0.0,
+    "num_attention_heads": 32,
+    "num_experts_per_token": 0,
+    "num_global_key_value_heads": 0,
+    "num_hidden_layers": 32,
+    "num_key_value_heads": 8,
+    "num_kv_shared_layers": 0,
+    "num_local_experts": 0,
+    "original_max_position_embeddings": null,
+    "partial_rotary_factor": 1.0,
+    "qkv_bias": false,
+    "quantization": {
+      "bits": null,
+      "group_size": null,
+      "method": "none",
+      "modules_to_not_convert": [],
+      "scale_dtype": null,
+      "source_config": {},
+      "storage_dtype": "bfloat16",
+      "zero_point": null
+    },
+    "query_pre_attn_scalar": null,
+    "required_operators": [
+      "embedding",
+      "rms_norm",
+      "qkv_projection",
+      "rope",
+      "gqa_attention",
+      "o_projection",
+      "lm_head",
+      "gated_activation",
+      "down_projection"
+    ],
+    "rms_norm_eps": 1e-05,
+    "rope_parameters": {
+      "factor": 8.0,
+      "high_freq_factor": 4.0,
+      "low_freq_factor": 1.0,
+      "original_max_position_embeddings": 8192,
+      "rope_type": "llama3"
+    },
+    "rope_scaling": {
+      "factor": 8.0,
+      "high_freq_factor": 4.0,
+      "low_freq_factor": 1.0,
+      "original_max_position_embeddings": 8192,
+      "rope_type": "llama3"
+    },
+    "rope_theta": 500000.0,
+    "rope_variant": "llama3",
+    "sliding_window": null,
+    "supported_precision_modes": [
+      "bf16",
+      "head8",
+      "down_fp8",
+      "gate_up_fp8",
+      "mlp_fp8",
+      "attn_proj_fp8"
+    ],
+    "swiglu_alpha": 1.702,
+    "swiglu_limit": null,
+    "tensor_naming_scheme": "hf_decoder_layers",
+    "tie_word_embeddings": false,
+    "use_double_wide_mlp": false,
+    "vocab_size": 128256,
+    "vocab_size_per_layer_input": 0
+  },
+  "hf_equivalent": false,
+  "hf_reference_device": "cuda",
+  "hf_reference_mode": "full_recompute_causal",
+  "kernel_backend": "triton",
+  "kv_block_size": 16,
+  "kv_residency": "gpu_full",
+  "lm_head_fp8": true,
+  "lm_head_int4_group_size": 0,
+  "minimum_cosine_similarity": 0.9822083711624146,
+  "minimum_top5_overlap": 1.0,
+  "mlp_fp8": true,
+  "model_name": "/home/satvik/.cache/thintensor/models/unsloth--Llama-3.2-11B-Vision-Instruct",
+  "mxfp4_binary_residual": false,
+  "mxfp4_down_layers": null,
+  "mxfp4_gate_up_layers": null,
+  "mxfp4_hadamard": false,
+  "mxfp4_hadamard_seed": 0,
+  "mxfp4_hadamard_size": 0,
+  "mxfp4_int8_row_fraction": 0.0,
+  "mxfp4_o_layers": null,
+  "mxfp4_qkv_layers": null,
+  "mxfp4_residual_terms": 0,
+  "mxfp4_row_postscale": false,
+  "o_fp8_layers": "all",
+  "o_proj_fp8": false,
+  "pin_cpu_weight_pages": false,
+  "prompt": "The capital of France is",
+  "qkv_fp8": false,
+  "qkv_fp8_layers": "all",
+  "quantized_experimental": true,
+  "ranking_equivalent": false,
+  "records": [
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.989232063293457,
+      "decode_step": 1,
+      "generated_hf_tokens": [
+        11
+      ],
+      "generated_thin_tokens": [
+        11
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 17.625,
+          "token_id": 374
+        },
+        {
+          "logit": 17.625,
+          "token_id": 11
+        },
+        {
+          "logit": 16.0,
+          "token_id": 706
+        },
+        {
+          "logit": 15.3125,
+          "token_id": 323
+        },
+        {
+          "logit": 14.375,
+          "token_id": 198
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 20480,
+      "kv_retention_exact": true,
+      "kv_tokens_attended": 5,
+      "kv_tokens_expected": 5,
+      "max_abs_logit_error": 2.171875,
+      "mean_abs_logit_error": 0.48762246966362,
+      "model_name": "/home/satvik/.cache/thintensor/models/unsloth--Llama-3.2-11B-Vision-Instruct",
+      "not_hf_equivalent": false,
+      "prefill_length": 5,
+      "prompt": "The capital of France is",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 16.875,
+          "token_id": 11
+        },
+        {
+          "logit": 16.75,
+          "token_id": 374
+        },
+        {
+          "logit": 15.4375,
+          "token_id": 706
+        },
+        {
+          "logit": 14.375,
+          "token_id": 323
+        },
+        {
+          "logit": 13.5625,
+          "token_id": 198
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": false,
+      "top5_exact_order": false,
+      "top5_overlap": 1.0
+    },
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.9977476596832275,
+      "decode_step": 8,
+      "generated_hf_tokens": [
+        11,
+        12366,
+        11,
+        374,
+        264,
+        3363,
+        315,
+        30363
+      ],
+      "generated_thin_tokens": [
+        11,
+        12366,
+        11,
+        374,
+        264,
+        3363,
+        315,
+        30363
+      ],
+      "generated_token_match_rate": 1.0,
+      "hf_top5": [
+        {
+          "logit": 16.625,
+          "token_id": 30363
+        },
+        {
+          "logit": 15.6875,
+          "token_id": 6800
+        },
+        {
+          "logit": 15.6875,
+          "token_id": 13444
+        },
+        {
+          "logit": 15.3125,
+          "token_id": 3021
+        },
+        {
+          "logit": 15.0625,
+          "token_id": 1989
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 49152,
+      "kv_retention_exact": true,
+      "kv_tokens_attended": 12,
+      "kv_tokens_expected": 12,
+      "max_abs_logit_error": 1.1015625,
+      "mean_abs_logit_error": 0.18611063063144684,
+      "model_name": "/home/satvik/.cache/thintensor/models/unsloth--Llama-3.2-11B-Vision-Instruct",
+      "not_hf_equivalent": false,
+      "prefill_length": 5,
+      "prompt": "The capital of France is",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 16.375,
+          "token_id": 30363
+        },
+        {
+          "logit": 15.5,
+          "token_id": 13444
+        },
+        {
+          "logit": 15.4375,
+          "token_id": 3021
+        },
+        {
+          "logit": 15.3125,
+          "token_id": 6800
+        },
+        {
+          "logit": 14.8125,
+          "token_id": 1989
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_exact_order": false,
+      "top5_overlap": 1.0
+    },
+    {
+      "attention_mode": "causal_kv",
+      "cosine_similarity": 0.9822083711624146,
+      "decode_step": 32,
+      "generated_hf_tokens": [
+        11,
+        12366,
+        11,
+        374,
+        264,
+        3363,
+        315,
+        30363,
+        11,
+        1989,
+        11,
+        11401,
+        11,
+        323,
+        3925,
+        13,
+        1102,
+        374,
+        264,
+        3363,
+        430,
+        706,
+        1027,
+        264,
+        3682,
+        4219,
+        315,
+        7829,
+        323,
+        6975,
+        369,
+        24552
+      ],
+      "generated_thin_tokens": [
+        11,
+        12366,
+        11,
+        374,
+        264,
+        3363,
+        315,
+        30363,
+        11,
+        1989,
+        11,
+        11401,
+        11,
+        323,
+        36105,
+        13,
+        1102,
+        374,
+        264,
+        3363,
+        430,
+        706,
+        1027,
+        279,
+        3682,
+        19240,
+        315,
+        7829,
+        323,
+        6975,
+        369,
+        24552
+      ],
+      "generated_token_match_rate": 0.90625,
+      "hf_top5": [
+        {
+          "logit": 25.25,
+          "token_id": 24552
+        },
+        {
+          "logit": 22.375,
+          "token_id": 927
+        },
+        {
+          "logit": 21.75,
+          "token_id": 1690
+        },
+        {
+          "logit": 21.125,
+          "token_id": 9214
+        },
+        {
+          "logit": 20.375,
+          "token_id": 11758
+        }
+      ],
+      "kv_cache_read_bytes_per_token": 147456,
+      "kv_retention_exact": true,
+      "kv_tokens_attended": 36,
+      "kv_tokens_expected": 36,
+      "max_abs_logit_error": 2.1875,
+      "mean_abs_logit_error": 0.303244948387146,
+      "model_name": "/home/satvik/.cache/thintensor/models/unsloth--Llama-3.2-11B-Vision-Instruct",
+      "not_hf_equivalent": false,
+      "prefill_length": 5,
+      "prompt": "The capital of France is",
+      "reason_not_equivalent": null,
+      "thin_top5": [
+        {
+          "logit": 24.125,
+          "token_id": 24552
+        },
+        {
+          "logit": 21.25,
+          "token_id": 927
+        },
+        {
+          "logit": 21.0,
+          "token_id": 1690
+        },
+        {
+          "logit": 19.5,
+          "token_id": 9214
+        },
+        {
+          "logit": 19.125,
+          "token_id": 11758
+        }
+      ],
+      "token_trajectory": "hf_greedy_teacher_forced",
+      "top1_same": true,
+      "top5_exact_order": true,
+      "top5_overlap": 1.0
+    }
+  ],
+  "thin_config_summary": {
+    "attention_bias": false,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 4096,
+    "intermediate_size": 14336,
+    "layer_types": [],
+    "manifest_metadata_missing": [
+      "attention_bias",
+      "sliding_window"
+    ],
+    "max_position_embeddings": 131072,
+    "model_type": "llama",
+    "no_rope_layers": [],
+    "num_attention_heads": 32,
+    "num_hidden_layers": 32,
+    "num_key_value_heads": 8,
+    "qkv_bias": false,
+    "rms_norm_eps": 1e-05,
+    "rope_scaling": {
+      "factor": 8.0,
+      "high_freq_factor": 4.0,
+      "low_freq_factor": 1.0,
+      "original_max_position_embeddings": 8192,
+      "rope_type": "llama3"
+    },
+    "rope_theta": 500000.0,
+    "rope_variant": "llama3",
+    "sliding_window": null,
+    "tie_word_embeddings": false,
+    "torch_dtype": "bfloat16",
+    "use_sliding_window": false
+  },
+  "thin_descriptor": {
+    "activation": "silu",
+    "architecture_family": "decoder_dense",
+    "attention_bias": false,
+    "attention_kind": "gqa",
+    "attention_logit_softcap": null,
+    "attention_output_gate": false,
+    "attention_sinks": false,
+    "attention_variants": [
+      "causal_kv",
+      "current_only_smoke"
+    ],
+    "embedding_scale": 1.0,
+    "final_logit_softcap": null,
+    "global_head_dim": 0,
+    "head_dim": 128,
+    "hidden_size": 4096,
+    "hidden_size_per_layer_input": 0,
+    "intermediate_size": 14336,
+    "layer_types": [],
+    "linear_conv_kernel_dim": 0,
+    "linear_key_head_dim": 0,
+    "linear_num_key_heads": 0,
+    "linear_num_value_heads": 0,
+    "linear_value_head_dim": 0,
+    "max_position_embeddings": 131072,
+    "mlp_bias": false,
+    "mlp_kind": "gated_dense",
+    "model_type": "llama",
+    "no_rope_layers": [],
+    "norm_eps": 1e-05,
+    "norm_kind": "rms_norm",
+    "norm_topk_prob": true,
+    "norm_weight_offset": 0.0,
+    "num_attention_heads": 32,
+    "num_experts_per_token": 0,
+    "num_global_key_value_heads": 0,
+    "num_hidden_layers": 32,
+    "num_key_value_heads": 8,
+    "num_kv_shared_layers": 0,
+    "num_local_experts": 0,
+    "original_max_position_embeddings": null,
+    "partial_rotary_factor": 1.0,
+    "qkv_bias": false,
+    "quantization": {
+      "bits": null,
+      "group_size": null,
+      "method": "none",
+      "modules_to_not_convert": [],
+      "scale_dtype": null,
+      "source_config": {},
+      "storage_dtype": "bfloat16",
+      "zero_point": null
+    },
+    "query_pre_attn_scalar": null,
+    "required_operators": [
+      "embedding",
+      "rms_norm",
+      "qkv_projection",
+      "rope",
+      "gqa_attention",
+      "o_projection",
+      "lm_head",
+      "gated_activation",
+      "down_projection"
+    ],
+    "rms_norm_eps": 1e-05,
+    "rope_parameters": {
+      "factor": 8.0,
+      "high_freq_factor": 4.0,
+      "low_freq_factor": 1.0,
+      "original_max_position_embeddings": 8192,
+      "rope_type": "llama3"
+    },
+    "rope_scaling": {
+      "factor": 8.0,
+      "high_freq_factor": 4.0,
+      "low_freq_factor": 1.0,
+      "original_max_position_embeddings": 8192,
+      "rope_type": "llama3"
+    },
+    "rope_theta": 500000.0,
+    "rope_variant": "llama3",
+    "sliding_window": null,
+    "supported_precision_modes": [
+      "bf16",
+      "head8",
+      "down_fp8",
+      "gate_up_fp8",
+      "mlp_fp8"
+    ],
+    "swiglu_alpha": 1.702,
+    "swiglu_limit": null,
+    "tensor_naming_scheme": "hf_decoder_layers",
+    "tie_word_embeddings": false,
+    "use_double_wide_mlp": false,
+    "vocab_size": 128256,
+    "vocab_size_per_layer_input": 0
+  },
+  "top1_exact_all_records": false,
+  "top5_ordered_exact_all_records": false,
+  "top5_set_exact_all_records": true,
+  "weight_residency": "all"
+}

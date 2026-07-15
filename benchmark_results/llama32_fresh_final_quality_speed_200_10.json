@@ -1,0 +1,44 @@
+{
+  "model": "unsloth/Llama-3.2-11B-Vision-Instruct text path",
+  "archive": "/home/satvik/.cache/thintensor/models/unsloth--Llama-3.2-11B-Vision-Instruct/llama-3.2-11b-fresh.thin",
+  "profile": "fp8-attention-fp8-mlp0:28-refined-int4g8-tail",
+  "environment": {
+    "THINTENSOR_TENSORCORE_MATVEC": "1",
+    "THINTENSOR_MULTI_TENSORCORE": "1"
+  },
+  "steps": 200,
+  "warmup_steps": 10,
+  "attention_mode": "causal_kv",
+  "not_hf_equivalent": false,
+  "kv_tokens_attended": 200,
+  "steady_tokens_per_s": 41.015809019117135,
+  "tokens_per_s": 41.0169356083179,
+  "ms_per_token": 24.380842994804958,
+  "steady_decode_s": 4.851787755966186,
+  "first_token_s": 0.024246912002563476,
+  "resident_weight_bytes": 7292962848,
+  "bytes_moved_per_token": 7068963840,
+  "effective_bandwidth_gb_s": 289.9472346428077,
+  "gpu_peak_allocated_bytes": 7851226112,
+  "gpu_peak_reserved_bytes": 7868514304,
+  "runtime_executor": "operator_graph_decoder",
+  "llamacpp_q4_k_m_b9986_tokens_per_s": 39.820577,
+  "speed_ratio_vs_llamacpp_q4_k_m": 1.030016,
+  "quality": {
+    "prompt": "The capital of France is",
+    "prompt_tokens": 6,
+    "checkpoints": [1, 8, 32],
+    "thin_minimum_raw_full_vocab_cosine": 0.9962721467018127,
+    "thin_minimum_centered_full_vocab_cosine": 0.9950945377349854,
+    "llamacpp_q4_k_m_minimum_centered_full_vocab_cosine": 0.9919375777244568,
+    "top1_same_all_checkpoints": true
+  },
+  "runtime_flags": [
+    "--embed-fp8", "--attn-proj-fp8", "--mlp-fp8",
+    "--fp8-layers", "0:28", "--dense-int4",
+    "--dense-int4-layers", "0:32", "--dense-int4-group-size", "8",
+    "--lm-head-fp8", "--lm-head-backend", "triton_loop_512",
+    "--attention-backend", "triton_fused",
+    "--fused-residual-norm", "--fused-rope", "--tuned-large-matvec"
+  ]
+}

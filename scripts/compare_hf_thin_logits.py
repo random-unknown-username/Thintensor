@@ -95,6 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin-cpu-weight-pages", action="store_true")
     parser.add_argument("--mlp-fp8", action="store_true")
     parser.add_argument("--embed-fp8", action="store_true")
+    parser.add_argument("--cpu-embed", action="store_true")
     parser.add_argument("--down-proj-fp8", action="store_true")
     parser.add_argument("--gate-up-fp8", action="store_true")
     parser.add_argument("--fused-scaled-mlp", action="store_true")
@@ -130,6 +131,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dense-int4", action="store_true")
     parser.add_argument("--dense-int4-layers")
     parser.add_argument("--dense-int4-group-size", type=int, default=32)
+    parser.add_argument("--dense-int4-attention-group-size", type=int, default=0)
+    parser.add_argument("--dense-int4-fine-layers")
+    parser.add_argument("--dense-int4-fine-group-size", type=int, default=0)
     parser.add_argument("--packed-expert-q2-layers")
     parser.add_argument("--packed-expert-q1-layers")
     parser.add_argument("--mxfp4-gate-up-layers")
@@ -366,6 +370,7 @@ def main() -> None:
         or args.o_proj_fp8
         or args.mlp_fp8
         or args.embed_fp8
+        or args.cpu_embed
         or args.attn_proj_fp8
         or args.fp8_layers
         or args.down_fp8_layers
@@ -398,6 +403,7 @@ def main() -> None:
                 qkv_fp8=args.qkv_fp8 or args.attn_proj_fp8,
                 o_proj_fp8=args.o_proj_fp8 or args.attn_proj_fp8,
                 embed_fp8=args.embed_fp8,
+                cpu_embed=args.cpu_embed,
                 fp8_layer_spec=args.fp8_layers,
                 down_fp8_layer_spec=args.down_fp8_layers,
                 qkv_fp8_layer_spec=args.qkv_fp8_layers,
@@ -412,6 +418,15 @@ def main() -> None:
                 dense_int4=args.dense_int4,
                 dense_int4_layer_spec=args.dense_int4_layers,
                 dense_int4_group_size=args.dense_int4_group_size,
+                dense_int4_attention_group_size=(
+                    args.dense_int4_attention_group_size
+                ),
+                dense_int4_fine_layer_spec=args.dense_int4_fine_layers,
+                dense_int4_fine_group_size=args.dense_int4_fine_group_size,
+                mxfp4_gate_up_layer_spec=args.mxfp4_gate_up_layers,
+                mxfp4_down_layer_spec=args.mxfp4_down_layers,
+                mxfp4_qkv_layer_spec=args.mxfp4_qkv_layers,
+                mxfp4_o_layer_spec=args.mxfp4_o_layers,
                 packed_expert_q2_layer_spec=args.packed_expert_q2_layers,
                 packed_expert_q1_layer_spec=args.packed_expert_q1_layers,
             )
@@ -516,6 +531,9 @@ def main() -> None:
                         hf_tokens=hf_run["tokens"][:step],
                         thin_tokens=thin_run["tokens"][:step],
                         attention_mode=attention_mode,
+                        attention_window=thin_descriptor.layer_attention_window(
+                            thin_descriptor.num_hidden_layers - 1
+                        ),
                         kv_tokens_attended=thin_run["kv_tokens_attended"][step],
                         kv_read_bytes=thin_run["kv_read_bytes"][step],
                     )
@@ -1878,10 +1896,13 @@ def comparison_record(
     hf_tokens: list[torch.Tensor],
     thin_tokens: list[torch.Tensor],
     attention_mode: str,
+    attention_window: int | None,
     kv_tokens_attended: int,
     kv_read_bytes: int,
 ) -> dict[str, Any]:
     difference = (hf_logits - thin_logits).abs()
+    hf_centered = hf_logits - hf_logits.mean()
+    thin_centered = thin_logits - thin_logits.mean()
     hf_values, hf_indices = torch.topk(hf_logits, 5)
     thin_values, thin_indices = torch.topk(thin_logits, 5)
     hf_top5 = top_entries(hf_values, hf_indices)
@@ -1892,7 +1913,12 @@ def comparison_record(
         [entry["token_id"] for entry in hf_top5]
         == [entry["token_id"] for entry in thin_top5]
     )
-    expected_kv_tokens = prefill_len + step - 1
+    full_kv_tokens = prefill_len + step - 1
+    expected_kv_tokens = (
+        min(full_kv_tokens, attention_window)
+        if attention_window is not None
+        else full_kv_tokens
+    )
     exact_kv_retention = kv_tokens_attended == expected_kv_tokens
     equivalent_attention = (
         attention_mode == "causal_kv" and exact_kv_retention
@@ -1919,6 +1945,9 @@ def comparison_record(
         "mean_abs_logit_error": float(difference.mean()),
         "cosine_similarity": float(
             F.cosine_similarity(hf_logits, thin_logits, dim=0)
+        ),
+        "centered_logit_cosine": float(
+            F.cosine_similarity(hf_centered, thin_centered, dim=0)
         ),
         "generated_hf_tokens": [int(token) for token in hf_tokens],
         "generated_thin_tokens": [int(token) for token in thin_tokens],
@@ -1959,6 +1988,7 @@ def build_summary(
             args.qkv_fp8,
             args.o_proj_fp8,
             args.embed_fp8,
+            args.cpu_embed,
             args.adaptive_body_int8_start_token >= 0,
             args.body_int4_group_size > 0,
             args.mxfp4_gate_up_layers is not None,

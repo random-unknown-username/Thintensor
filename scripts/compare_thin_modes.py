@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -23,13 +24,25 @@ from thinruntime.gpu_runtime import PagedKVCache, ThinGpuPagePool, ThinGpuQwenRu
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive", required=True)
-    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--tokenizer")
+    parser.add_argument(
+        "--trajectory",
+        help="Fixed token trajectory JSON from dump_llamacpp_full_logits.py",
+    )
+    parser.add_argument(
+        "--reference-logits-npz",
+        help="Use saved step_<N> full-vocabulary reference vectors instead of rerunning BF16",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--prefill-lens", default="1,8")
     parser.add_argument("--steps", default="1,4")
     parser.add_argument("--gpu-weight-budget", required=True)
+    parser.add_argument(
+        "--reference-gpu-weight-budget",
+        help="Optional lower residency budget for the exact BF16 reference",
+    )
     parser.add_argument("--kv-block-size", type=int, default=512)
     parser.add_argument("--kernel-backend", default="triton-matvec")
     parser.add_argument("--attention-backend", default="torch")
@@ -43,6 +56,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qkv-fp8", action="store_true")
     parser.add_argument("--o-proj-fp8", action="store_true")
     parser.add_argument("--embed-fp8", action="store_true")
+    parser.add_argument("--cpu-embed", action="store_true")
+    parser.add_argument("--dense-int4", action="store_true")
+    parser.add_argument("--dense-int4-layers")
+    parser.add_argument("--dense-int4-group-size", type=int, default=128)
+    parser.add_argument("--dense-int4-cpu-layers")
+    parser.add_argument("--dense-int4-calibration-json")
+    parser.add_argument("--dense-int4-calibration-npz")
+    parser.add_argument("--dense-int4-calibration-covariance-npz")
+    parser.add_argument("--dense-int4-gpu-ops")
+    parser.add_argument("--dense-int4-gpu-suffixes")
+    parser.add_argument("--dense-lowbit-bits", type=int, choices=[0, 1, 2], default=0)
+    parser.add_argument("--dense-lowbit-layers")
+    parser.add_argument("--dense-lowbit-suffixes")
+    parser.add_argument("--mxfp4-gate-up-layers")
+    parser.add_argument("--mxfp4-down-layers")
+    parser.add_argument("--mxfp4-qkv-layers")
+    parser.add_argument("--mxfp4-o-layers")
     parser.add_argument("--moe-top-k-limit", type=int, default=0)
     parser.add_argument("--moe-top-k-no-renorm", action="store_true")
     parser.add_argument("--mxfp4-selected-tensorcore", action="store_true")
@@ -57,12 +87,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fused-rope", action="store_true")
     parser.add_argument("--no-pinned-staging", action="store_true")
     parser.add_argument("--out", default="correctness_results/thin_modes/latest.md")
+    parser.add_argument(
+        "--save-logits-npz",
+        help="Persist reference and candidate full-vocabulary vectors",
+    )
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.dense_int4_gpu_ops:
+        os.environ["THINTENSOR_DENSE_INT4_GPU_OPS"] = args.dense_int4_gpu_ops
+    if args.dense_int4_gpu_suffixes:
+        os.environ["THINTENSOR_DENSE_INT4_GPU_SUFFIXES"] = (
+            args.dense_int4_gpu_suffixes
+        )
+    if args.dense_lowbit_suffixes:
+        os.environ["THINTENSOR_DENSE_LOWBIT_SUFFIXES"] = args.dense_lowbit_suffixes
     device = torch.device(args.device)
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     prefill_lens = parse_positive_csv(args.prefill_lens, "prefill-lens")
@@ -75,35 +117,72 @@ def main() -> None:
         "0" if args.no_pinned_staging else "1"
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    inputs = {
-        length: prompt_ids(tokenizer, args.prompt, length)
-        for length in prefill_lens
-    }
+    fixed_teacher_tokens: list[torch.Tensor] | None = None
+    if args.trajectory:
+        trajectory = json.loads(Path(args.trajectory).read_text(encoding="utf-8"))
+        input_ids = torch.tensor(
+            [trajectory["prompt_token_ids"]], dtype=torch.long
+        )
+        inputs = {int(input_ids.shape[1]): input_ids}
+        fixed_teacher_tokens = [
+            torch.tensor(int(value), dtype=torch.long)
+            for value in trajectory["teacher_token_ids"]
+        ]
+        requested_steps = [int(value) for value in trajectory["steps"]]
+        max_steps = max(requested_steps)
+    else:
+        if not args.tokenizer:
+            raise ValueError("--tokenizer is required without --trajectory")
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer, trust_remote_code=True
+        )
+        inputs = {
+            length: prompt_ids(tokenizer, args.prompt, length)
+            for length in prefill_lens
+        }
 
     records: list[dict[str, Any]] = []
+    saved_logits: dict[str, Any] = {}
+    saved_reference = None
+    if args.reference_logits_npz:
+        archive = np.load(args.reference_logits_npz)
+        saved_reference = {
+            step: torch.from_numpy(np.asarray(archive[f"step_{step}"])).float()
+            for step in requested_steps
+        }
     for prefill_len, input_ids in inputs.items():
-        print(f"reference prefill={prefill_len}", file=sys.stderr)
-        reference = run_mode(
-            args=args,
-            input_ids=input_ids,
-            teacher_tokens=None,
-            requested_steps=requested_steps,
-            max_steps=max_steps,
-            exact=True,
-            dtype=dtype,
-            device=device,
-            budget=budget,
-        )
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        if saved_reference is None:
+            print(f"reference prefill={prefill_len}", file=sys.stderr)
+            reference = run_mode(
+                args=args,
+                input_ids=input_ids,
+                teacher_tokens=fixed_teacher_tokens,
+                requested_steps=requested_steps,
+                max_steps=max_steps,
+                exact=True,
+                dtype=dtype,
+                device=device,
+                budget=(
+                    parse_bytes(args.reference_gpu_weight_budget)
+                    if args.reference_gpu_weight_budget else budget
+                ),
+            )
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        else:
+            print(f"saved reference prefill={prefill_len}", file=sys.stderr)
+            reference = {
+                "logits": saved_reference,
+                "tokens": [],
+                "kv_tokens_attended": {},
+            }
 
         print(f"candidate prefill={prefill_len}", file=sys.stderr)
         candidate = run_mode(
             args=args,
             input_ids=input_ids,
-            teacher_tokens=reference["tokens"],
+            teacher_tokens=(fixed_teacher_tokens or reference["tokens"]),
             requested_steps=requested_steps,
             max_steps=max_steps,
             exact=False,
@@ -121,6 +200,13 @@ def main() -> None:
             )
             for step in requested_steps
         )
+        for step in requested_steps:
+            saved_logits[f"reference_step_{step}"] = (
+                reference["logits"][step].numpy()
+            )
+            saved_logits[f"candidate_step_{step}"] = (
+                candidate["logits"][step].numpy()
+            )
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -133,6 +219,10 @@ def main() -> None:
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    if args.save_logits_npz:
+        logits_path = Path(args.save_logits_npz)
+        logits_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(logits_path, **saved_logits)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
@@ -167,6 +257,7 @@ def run_mode(
         qkv_fp8=False if exact else args.qkv_fp8,
         o_proj_fp8=False if exact else args.o_proj_fp8,
         embed_fp8=False if exact else args.embed_fp8,
+        cpu_embed=args.cpu_embed,
         fp8_layer_spec=None if exact else args.fp8_layers,
         down_fp8_layer_spec=None if exact else args.down_fp8_layers,
         qkv_fp8_layer_spec=None if exact else args.qkv_fp8_layers,
@@ -174,6 +265,39 @@ def run_mode(
         lm_head_fp8=False if exact else args.lm_head_fp8,
         lm_head_int4_group_size=(
             0 if exact else args.lm_head_int4_group_size
+        ),
+        dense_int4=False if exact else args.dense_int4,
+        dense_int4_layer_spec=(
+            None if exact else args.dense_int4_layers
+        ),
+        dense_int4_group_size=args.dense_int4_group_size,
+        dense_int4_cpu_layer_spec=(
+            None if exact else args.dense_int4_cpu_layers
+        ),
+        dense_int4_calibration_json=(
+            None if exact else args.dense_int4_calibration_json
+        ),
+        dense_int4_calibration_npz=(
+            None if exact else args.dense_int4_calibration_npz
+        ),
+        dense_int4_calibration_covariance_npz=(
+            None if exact else args.dense_int4_calibration_covariance_npz
+        ),
+        dense_lowbit_bits=0 if exact else args.dense_lowbit_bits,
+        dense_lowbit_layer_spec=(
+            None if exact else args.dense_lowbit_layers
+        ),
+        mxfp4_gate_up_layer_spec=(
+            None if exact else args.mxfp4_gate_up_layers
+        ),
+        mxfp4_down_layer_spec=(
+            None if exact else args.mxfp4_down_layers
+        ),
+        mxfp4_qkv_layer_spec=(
+            None if exact else args.mxfp4_qkv_layers
+        ),
+        mxfp4_o_layer_spec=(
+            None if exact else args.mxfp4_o_layers
         ),
         packed_expert_q2_layer_spec=(
             None if exact else args.packed_expert_q2_layers
@@ -229,6 +353,18 @@ def run_mode(
             fused_scaled_mlp=False if exact else args.fused_scaled_mlp,
             fused_residual_norm=False if exact else args.fused_residual_norm,
             fused_rope=False if exact else args.fused_rope,
+            mxfp4_gate_up_layers=(
+                None if exact else args.mxfp4_gate_up_layers
+            ),
+            mxfp4_down_layers=(
+                None if exact else args.mxfp4_down_layers
+            ),
+            mxfp4_qkv_layers=(
+                None if exact else args.mxfp4_qkv_layers
+            ),
+            mxfp4_o_layers=(
+                None if exact else args.mxfp4_o_layers
+            ),
         )
         hidden = None
         with torch.inference_mode():
@@ -266,6 +402,11 @@ def run_mode(
         }
     finally:
         weights.close()
+        if "runtime" in locals():
+            del runtime
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 def comparison_record(
@@ -299,11 +440,15 @@ def comparison_record(
         "max_abs_logit_error": float(difference.max()),
         "reference_tokens": [int(token) for token in reference["tokens"]],
         "candidate_tokens": [int(token) for token in candidate["tokens"]],
-        "generated_token_match_rate": sum(
-            int(left) == int(right)
-            for left, right in zip(reference["tokens"], candidate["tokens"])
-        )
-        / max(1, len(reference["tokens"])),
+        "generated_token_match_rate": (
+            sum(
+                int(left) == int(right)
+                for left, right in zip(reference["tokens"], candidate["tokens"])
+            )
+            / len(reference["tokens"])
+            if reference["tokens"]
+            else None
+        ),
         "kv_tokens_attended": candidate["kv_tokens_attended"][step],
         "kv_tokens_expected": prefill_len + step - 1,
     }
@@ -313,7 +458,13 @@ def build_summary(args: argparse.Namespace, records: list[dict[str, Any]]) -> di
     return {
         "archive": args.archive,
         "tokenizer": args.tokenizer,
-        "reference": "ThinTensor BF16 streamed weights",
+        "trajectory": args.trajectory,
+        "reference_logits_npz": args.reference_logits_npz,
+        "reference": (
+            f"saved full-vocabulary vectors: {args.reference_logits_npz}"
+            if args.reference_logits_npz
+            else "ThinTensor BF16 streamed weights"
+        ),
         "candidate": "ThinTensor selected runtime flags",
         "candidate_flags": {
             "mlp_fp8": args.mlp_fp8,
@@ -322,10 +473,29 @@ def build_summary(args: argparse.Namespace, records: list[dict[str, Any]]) -> di
             "qkv_fp8": args.qkv_fp8,
             "o_proj_fp8": args.o_proj_fp8,
             "embed_fp8": args.embed_fp8,
+            "cpu_embed": args.cpu_embed,
             "moe_top_k_limit": args.moe_top_k_limit,
             "moe_top_k_renorm": not args.moe_top_k_no_renorm,
             "mxfp4_selected_tensorcore": args.mxfp4_selected_tensorcore,
             "lm_head_int4_group_size": args.lm_head_int4_group_size,
+            "dense_int4": args.dense_int4,
+            "dense_int4_layers": args.dense_int4_layers,
+            "dense_int4_group_size": args.dense_int4_group_size,
+            "dense_int4_cpu_layers": args.dense_int4_cpu_layers,
+            "dense_int4_calibration_json": args.dense_int4_calibration_json,
+            "dense_int4_calibration_npz": args.dense_int4_calibration_npz,
+            "dense_int4_calibration_covariance_npz": (
+                args.dense_int4_calibration_covariance_npz
+            ),
+            "dense_int4_gpu_ops": args.dense_int4_gpu_ops,
+            "dense_int4_gpu_suffixes": args.dense_int4_gpu_suffixes,
+            "dense_lowbit_bits": args.dense_lowbit_bits,
+            "dense_lowbit_layers": args.dense_lowbit_layers,
+            "dense_lowbit_suffixes": args.dense_lowbit_suffixes,
+            "mxfp4_gate_up_layers": args.mxfp4_gate_up_layers,
+            "mxfp4_down_layers": args.mxfp4_down_layers,
+            "mxfp4_qkv_layers": args.mxfp4_qkv_layers,
+            "mxfp4_o_layers": args.mxfp4_o_layers,
             "fp8_layers": args.fp8_layers,
             "down_fp8_layers": args.down_fp8_layers,
             "qkv_fp8_layers": args.qkv_fp8_layers,
@@ -342,7 +512,12 @@ def build_summary(args: argparse.Namespace, records: list[dict[str, Any]]) -> di
         "minimum_top5_overlap": min(row["top5_overlap"] for row in records),
         "top1_same_all_records": all(row["top1_same"] for row in records),
         "minimum_generated_token_match_rate": min(
-            row["generated_token_match_rate"] for row in records
+            (
+                row["generated_token_match_rate"]
+                for row in records
+                if row["generated_token_match_rate"] is not None
+            ),
+            default=None,
         ),
         "records": records,
     }
@@ -358,7 +533,13 @@ def render_markdown(summary: dict[str, Any]) -> str:
         f"- Minimum cosine: `{summary['minimum_cosine_similarity']:.6f}`",
         f"- Minimum top-5 overlap: `{summary['minimum_top5_overlap']:.3f}`",
         f"- Top-1 same for all records: `{summary['top1_same_all_records']}`",
-        f"- Minimum generated-token match: `{summary['minimum_generated_token_match_rate']:.3f}`",
+        "- Minimum generated-token match: `"
+        + (
+            f"{summary['minimum_generated_token_match_rate']:.3f}"
+            if summary["minimum_generated_token_match_rate"] is not None
+            else "not measured for saved fixed-teacher reference"
+        )
+        + "`",
         "",
         "| prefill | step | cosine | top1 | top5 | token match | mean abs err | max abs err | KV |",
         "|---:|---:|---:|:---:|---:|---:|---:|---:|---:|",
@@ -368,7 +549,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"| {row['prefill_length']} | {row['decode_step']} | "
             f"{row['cosine_similarity']:.6f} | {row['top1_same']} | "
             f"{row['top5_overlap']:.3f} | "
-            f"{row['generated_token_match_rate']:.3f} | "
+            + (
+                f"{row['generated_token_match_rate']:.3f}"
+                if row["generated_token_match_rate"] is not None
+                else "n/a"
+            )
+            + " | "
             f"{row['mean_abs_logit_error']:.6f} | "
             f"{row['max_abs_logit_error']:.6f} | "
             f"{row['kv_tokens_attended']}/{row['kv_tokens_expected']} |"

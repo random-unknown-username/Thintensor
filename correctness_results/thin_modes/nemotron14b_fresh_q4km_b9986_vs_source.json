@@ -1,0 +1,127 @@
+{
+  "archive": "SmolLM3-3B.thin",
+  "case_count": 1,
+  "hf_model": "/home/satvik/.cache/thintensor/models/nvidia--OpenReasoning-Nemotron-14B",
+  "metric_definition": {
+    "centered_logit_cosine": "cosine after subtracting each vocabulary vector mean; this removes the unknown additive log-softmax constant and is directly comparable across HF, ThinTensor, and llama.cpp",
+    "q8_distribution": "all vocabulary log-probabilities returned by llama.cpp n_probs=vocab_size",
+    "raw_logit_cosine": "reported only when raw logits are available"
+  },
+  "modes": [
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.0,
+      "maximum_total_variation_distance": 0.0,
+      "minimum_centered_logit_cosine": 1.0,
+      "minimum_raw_logit_cosine": 1.0,
+      "minimum_top5_overlap": 1.0,
+      "mode": "hf_bf16",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "factual",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            },
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 8,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            },
+            {
+              "centered_logit_cosine": 1.0,
+              "jensen_shannon_distance": 0.0,
+              "maximum_centered_abs_error": 0.0,
+              "mean_centered_abs_error": 0.0,
+              "raw_logit_cosine": 1.0,
+              "step": 32,
+              "top1_same": true,
+              "top5_overlap": 1.0,
+              "total_variation_distance": 0.0
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.0,
+          "maximum_total_variation_distance": 0.0,
+          "minimum_centered_logit_cosine": 1.0,
+          "minimum_raw_logit_cosine": 1.0,
+          "minimum_top5_overlap": 1.0,
+          "prompt_tokens": 5
+        }
+      ]
+    },
+    {
+      "all_top1_same": true,
+      "maximum_jensen_shannon_distance": 0.03669630909561929,
+      "maximum_total_variation_distance": 0.006170558277517557,
+      "minimum_centered_logit_cosine": 0.9671399593353271,
+      "minimum_raw_logit_cosine": null,
+      "minimum_top5_overlap": 0.8,
+      "mode": "Q4_K_M_b9986",
+      "records": [
+        {
+          "all_top1_same": true,
+          "case": "factual",
+          "category": "prompt",
+          "comparisons": [
+            {
+              "centered_logit_cosine": 0.9818106889724731,
+              "jensen_shannon_distance": 0.01544048657237026,
+              "maximum_centered_abs_error": 2.4677979946136475,
+              "mean_centered_abs_error": 0.40341851115226746,
+              "raw_logit_cosine": null,
+              "step": 1,
+              "top1_same": true,
+              "top5_overlap": 0.8,
+              "total_variation_distance": 0.0015600022161379457
+            },
+            {
+              "centered_logit_cosine": 0.9671399593353271,
+              "jensen_shannon_distance": 0.03669630909561929,
+              "maximum_centered_abs_error": 4.627532005310059,
+              "mean_centered_abs_error": 0.5320231914520264,
+              "raw_logit_cosine": null,
+              "step": 8,
+              "top1_same": true,
+              "top5_overlap": 0.8,
+              "total_variation_distance": 0.006170558277517557
+            },
+            {
+              "centered_logit_cosine": 0.9870229363441467,
+              "jensen_shannon_distance": 0.019632861198001717,
+              "maximum_centered_abs_error": 2.2975821495056152,
+              "mean_centered_abs_error": 0.24331679940223694,
+              "raw_logit_cosine": null,
+              "step": 32,
+              "top1_same": true,
+              "top5_overlap": 0.8,
+              "total_variation_distance": 0.0035324518103152514
+            }
+          ],
+          "maximum_jensen_shannon_distance": 0.03669630909561929,
+          "maximum_total_variation_distance": 0.006170558277517557,
+          "minimum_centered_logit_cosine": 0.9671399593353271,
+          "minimum_raw_logit_cosine": null,
+          "minimum_top5_overlap": 0.8,
+          "prompt_tokens": 5
+        }
+      ]
+    }
+  ],
+  "q8_gguf": "benchmark_models/nemotron14b-gguf/nvidia_OpenReasoning-Nemotron-14B-Q4_K_M.gguf"
+}

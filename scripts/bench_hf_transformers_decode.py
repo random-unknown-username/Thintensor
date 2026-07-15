@@ -35,23 +35,30 @@ def main():
         args.model,
         trust_remote_code=args.trust_remote_code,
     )
+    load_kwargs = {
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": args.trust_remote_code,
+    }
     if "cuda" in args.device:
+        load_kwargs["device_map"] = "auto"
+    attention_implementation = "sdpa"
+    try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            trust_remote_code=args.trust_remote_code,
-            attn_implementation="sdpa",
-            device_map="auto",
+            attn_implementation=attention_implementation,
+            **load_kwargs,
         )
-    else:
+    except ValueError as exc:
+        if "does not support an attention implementation" not in str(exc):
+            raise
+        attention_implementation = "eager"
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            trust_remote_code=args.trust_remote_code,
-            attn_implementation="sdpa",
+            attn_implementation=attention_implementation,
+            **load_kwargs,
         )
+    if "cuda" not in args.device:
         model.to(args.device)
     model.eval()
 
@@ -100,6 +107,7 @@ def main():
         "tokens_per_s": args.steps / dt,
         "ms_per_token": 1000.0 * dt / args.steps,
         "final_token": final_token,
+        "attention_implementation": attention_implementation,
         "gpu_peak_allocated_bytes": (
             int(torch.cuda.max_memory_allocated()) if uses_cuda else None
         ),

@@ -119,6 +119,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument(
         "--no-verify", action="store_true", help="Skip post-conversion verification"
     )
+    p_convert.add_argument(
+        "--streaming-pack",
+        action="store_true",
+        help="Write a durable resumable archive without model-sized temporary files",
+    )
+    p_convert.add_argument(
+        "--consume-source-shards",
+        action="store_true",
+        help="Delete each source shard only after its archive pages fsync and verify",
+    )
+    p_convert.add_argument(
+        "--minimum-free-gib",
+        type=float,
+        default=0.0,
+        help="Abort before a page write would cross this free-space reserve",
+    )
+    p_convert.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a conversion from its durable plan and journal",
+    )
+    p_convert.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report exact archive size, shard deletion points, and free-space forecast",
+    )
 
     p_pull = sub.add_parser(
         "pull",
@@ -281,6 +307,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bench.add_argument("--steps", type=int, default=200, help="Steps per profile")
     p_bench.add_argument("--warmup", type=int, default=10, help="Warmup decode steps")
+    p_bench.add_argument(
+        "--prompt-token-ids",
+        help="Comma-separated explicit prompt token IDs used by every ThinTensor run",
+    )
+    p_bench.add_argument("--cpu-embed", action="store_true")
+    p_bench.add_argument("--lm-head-int4-group-size", type=int, default=0)
+    p_bench.add_argument("--lm-head-fp8", action="store_true")
+    p_bench.add_argument("--no-keep-bf16-lm-head", action="store_true")
+    p_bench.add_argument("--dense-int4-cpu-layers")
+    p_bench.add_argument("--dense-int4-group-size", type=int, default=32)
+    p_bench.add_argument("--dense-int4-affine", action="store_true")
+    p_bench.add_argument("--dense-int4-calibration-json")
+    p_bench.add_argument("--dense-int4-calibration-npz")
+    p_bench.add_argument("--dense-int4-calibration-covariance-npz")
+    p_bench.add_argument("--dense-int4-gptq-damp-percent", type=float, default=0.01)
+    p_bench.add_argument("--dense-int4-cpu-residual-terms", type=int, default=0)
+    p_bench.add_argument("--dense-int4-gpu-ops")
+    p_bench.add_argument("--dense-int4-gpu-suffixes")
+    p_bench.add_argument("--dense-lowbit-bits", type=int, choices=(0, 1, 2), default=0)
+    p_bench.add_argument("--dense-lowbit-suffixes")
+    p_bench.add_argument("--fp8-layers")
+    p_bench.add_argument("--gate-up-fp8", action="store_true")
+    p_bench.add_argument("--down-proj-fp8", action="store_true")
+    p_bench.add_argument("--qkv-fp8", action="store_true")
+    p_bench.add_argument("--o-proj-fp8", action="store_true")
+    p_bench.add_argument("--kernel-backend")
+    p_bench.add_argument("--attention-backend")
+    p_bench.add_argument("--fused-residual-norm", action="store_true")
+    p_bench.add_argument("--fused-rope", action="store_true")
     p_bench.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p_bench.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p_bench.add_argument("--force-profile", action="store_true")
@@ -290,6 +345,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument(
         "--gpu-weight-budget", "--gpu-memory-budget",
         dest="gpu_weight_budget", default="0"
+    )
+    p_bench.add_argument(
+        "--fixed-gpu-weight-budget",
+        help="Explicit page-pool weight budget without automatic runtime-reserve subtraction",
     )
     p_bench.add_argument(
         "--auto-quant",
@@ -497,7 +556,19 @@ def cmd_convert(args: argparse.Namespace) -> None:
         _print(f"\u2717 HF directory not found: {hf_dir}")
         raise SystemExit(1)
 
-    if out_path.exists() and not args.overwrite:
+    if args.consume_source_shards and not args.streaming_pack:
+        _print("\u2717 --consume-source-shards requires --streaming-pack")
+        raise SystemExit(1)
+    if args.resume and not args.streaming_pack:
+        _print("\u2717 --resume requires --streaming-pack")
+        raise SystemExit(1)
+    if args.dry_run and args.resume:
+        _print("\u2717 --dry-run cannot be combined with --resume")
+        raise SystemExit(1)
+    if args.minimum_free_gib < 0:
+        _print("\u2717 --minimum-free-gib must be non-negative")
+        raise SystemExit(1)
+    if out_path.exists() and not (args.overwrite or args.resume or args.dry_run):
         _print(f"\u2717 Output file exists: {out_path}")
         _print("  Use --overwrite to replace it.")
         raise SystemExit(1)
@@ -526,7 +597,8 @@ def cmd_convert(args: argparse.Namespace) -> None:
     include_tokenizer = args.include_tokenizer_hashes and not args.no_tokenizer_hashes
     verify = not args.no_verify
 
-    _print("Converting..." if not _RICH_AVAILABLE else "[yellow]Converting...[/yellow]")
+    action = "Planning..." if args.dry_run else "Converting..."
+    _print(action if not _RICH_AVAILABLE else f"[yellow]{action}[/yellow]")
     t0 = time.perf_counter()
 
     success = convert_hf_model(
@@ -535,12 +607,21 @@ def cmd_convert(args: argparse.Namespace) -> None:
         arch=args.arch,
         include_tokenizer_hashes=include_tokenizer,
         verify=verify,
+        streaming_pack=args.streaming_pack,
+        consume_source_shards=args.consume_source_shards,
+        minimum_free_bytes=int(args.minimum_free_gib * 1024**3),
+        resume=args.resume,
+        dry_run=args.dry_run,
     )
     elapsed = time.perf_counter() - t0
 
     if not success:
-        _print("\u2717 Conversion failed!")
+        _print("\u2717 Conversion planning failed!" if args.dry_run else "\u2717 Conversion failed!")
         raise SystemExit(1)
+
+    if args.dry_run:
+        _print("\u2713 Dry run complete; no archive or journal was written.")
+        return
 
     # Print summary
     print()
@@ -907,6 +988,73 @@ def cmd_bench(args: argparse.Namespace) -> None:
         raise SystemExit("--profiles must contain at least one profile")
     if args.steps < 1 or args.warmup < 0:
         raise SystemExit("--steps must be positive and --warmup non-negative")
+    runtime_extra_flags: list[str] = []
+    if args.prompt_token_ids:
+        runtime_extra_flags.extend(["--prompt-token-ids", args.prompt_token_ids])
+    if args.cpu_embed:
+        runtime_extra_flags.append("--cpu-embed")
+    if args.lm_head_int4_group_size:
+        runtime_extra_flags.extend(
+            ["--lm-head-int4-group-size", str(args.lm_head_int4_group_size)]
+        )
+    if args.lm_head_fp8:
+        runtime_extra_flags.append("--lm-head-fp8")
+    if args.no_keep_bf16_lm_head:
+        runtime_extra_flags.append("--no-keep-bf16-lm-head")
+    if args.dense_int4_cpu_layers:
+        runtime_extra_flags.extend(
+            ["--dense-int4-cpu-layers", args.dense_int4_cpu_layers]
+        )
+        runtime_extra_flags.extend(
+            ["--dense-int4-group-size", str(args.dense_int4_group_size)]
+        )
+    if args.dense_int4_affine:
+        runtime_extra_flags.append("--dense-int4-affine")
+    for flag, value in (
+        ("--dense-int4-calibration-json", args.dense_int4_calibration_json),
+        ("--dense-int4-calibration-npz", args.dense_int4_calibration_npz),
+        (
+            "--dense-int4-calibration-covariance-npz",
+            args.dense_int4_calibration_covariance_npz,
+        ),
+    ):
+        if value:
+            runtime_extra_flags.extend([flag, value])
+    runtime_extra_flags.extend(
+        [
+            "--dense-int4-gptq-damp-percent",
+            str(args.dense_int4_gptq_damp_percent),
+            "--dense-int4-cpu-residual-terms",
+            str(args.dense_int4_cpu_residual_terms),
+        ]
+    )
+    if args.dense_int4_gpu_ops:
+        runtime_extra_flags.extend(
+            ["--dense-int4-gpu-ops", args.dense_int4_gpu_ops]
+        )
+    if args.dense_int4_gpu_suffixes:
+        runtime_extra_flags.extend(
+            ["--dense-int4-gpu-suffixes", args.dense_int4_gpu_suffixes]
+        )
+
+    if args.fp8_layers:
+        runtime_extra_flags.extend(["--fp8-layers", args.fp8_layers])
+    for enabled, flag in (
+        (args.gate_up_fp8, "--gate-up-fp8"),
+        (args.down_proj_fp8, "--down-proj-fp8"),
+        (args.qkv_fp8, "--qkv-fp8"),
+        (args.o_proj_fp8, "--o-proj-fp8"),
+    ):
+        if enabled:
+            runtime_extra_flags.append(flag)
+    if args.kernel_backend:
+        runtime_extra_flags.extend(["--kernel-backend", args.kernel_backend])
+    if args.attention_backend:
+        runtime_extra_flags.extend(["--attention-backend", args.attention_backend])
+    if args.fused_residual_norm:
+        runtime_extra_flags.append("--fused-residual-norm")
+    if args.fused_rope:
+        runtime_extra_flags.append("--fused-rope")
 
     if not args.json:
         _header("ThinTensor Causal Decode Benchmark")
@@ -914,6 +1062,8 @@ def cmd_bench(args: argparse.Namespace) -> None:
         _kv("Profiles", ", ".join(profiles))
         _kv("Steps", args.steps)
         _kv("Warmup", args.warmup)
+        if args.prompt_token_ids:
+            _kv("Prompt token IDs", args.prompt_token_ids)
         _kv("Device", args.device)
         print()
 
@@ -963,6 +1113,7 @@ def cmd_bench(args: argparse.Namespace) -> None:
                 gpu_weight_budget=args.gpu_weight_budget,
                 auto_quant=args.auto_quant,
                 out=args.auto_search_out,
+                prompt_token_ids=args.prompt_token_ids,
             )
         else:
             result = _run_benchmark_profile(
@@ -979,6 +1130,8 @@ def cmd_bench(args: argparse.Namespace) -> None:
                 residency=args.residency,
                 gpu_weight_budget=args.gpu_weight_budget,
                 auto_quant=args.auto_quant,
+                fixed_gpu_weight_budget=args.fixed_gpu_weight_budget,
+                extra_flags=runtime_extra_flags or None,
             )
         if result:
             results.append(result)
@@ -1868,6 +2021,8 @@ def _automatic_fit_plan(
     context: int,
     budget_text: str,
     auto_quant: str,
+    cpu_embed: bool = False,
+    lm_head_fp8: bool = False,
 ):
     from .auto_fit import plan_auto_fit
 
@@ -1890,6 +2045,8 @@ def _automatic_fit_plan(
         total_budget_bytes=_parse_bytes(budget_text),
         context_tokens=context,
         mode=auto_quant,
+        cpu_embed=cpu_embed,
+        lm_head_fp8=lm_head_fp8,
     )
 
 
@@ -3065,6 +3222,9 @@ def _run_benchmark_profile(
         if fixed_gpu_weight_budget
         else 0
     )
+    cpu_embed = bool(profile.get("cpu_embed", False) or (extra_flags and "--cpu-embed" in extra_flags))
+    lm_head_fp8 = bool(profile.get("lm_head_fp8", False) or (extra_flags and "--lm-head-fp8" in extra_flags))
+
     if residency == "auto":
         auto_fit_plan = _automatic_fit_plan(
             archive_path,
@@ -3072,6 +3232,8 @@ def _run_benchmark_profile(
             context=max(512, steps + warmup + 1),
             budget_text=gpu_weight_budget,
             auto_quant=auto_quant,
+            cpu_embed=cpu_embed,
+            lm_head_fp8=lm_head_fp8,
         )
         effective_residency = auto_fit_plan.residency
     elif residency == "stream" and fixed_gpu_weight_budget_bytes <= 0:
@@ -3081,6 +3243,8 @@ def _run_benchmark_profile(
             context=max(512, steps + warmup + 1),
             budget_text=gpu_weight_budget,
             auto_quant=auto_quant,
+            cpu_embed=cpu_embed,
+            lm_head_fp8=lm_head_fp8,
         )
     if auto_fit_plan is not None and (
         auto_fit_plan.expert_int4
@@ -3178,6 +3342,7 @@ def _run_benchmark_profile(
                     auto_fit_plan.packed_expert_q1_layer_spec,
                 ]
             )
+
     if profile.get("experimental_int8_tensorcore"):
         command.append("--experimental-int8-tensorcore")
     if dry_run:
@@ -3260,6 +3425,10 @@ def _run_benchmark_profile(
     return {
         "profile": profile_name,
         "engine": "thintensor",
+        "batch_size": raw.get("batch_size", 1),
+        "sequence_count": raw.get("sequence_count", 1),
+        "aggregate_batching": raw.get("aggregate_batching", False),
+        "speculative_decoding": raw.get("speculative_decoding", False),
         "command": command,
         "env_overrides": dict(extra_env or {}),
         "runtime_extra_flags": list(extra_flags or []),
@@ -3268,6 +3437,14 @@ def _run_benchmark_profile(
         "ms_per_token": raw.get("ms_per_token"),
         "resident_weight_bytes": raw.get("resident_weight_bytes"),
         "gpu_peak_allocated_bytes": raw.get("gpu_peak_allocated_bytes"),
+        "gpu_peak_reserved_bytes": raw.get("gpu_peak_reserved_bytes"),
+        "gpu_peak_temp_c": raw.get("gpu_peak_temp_c"),
+        "gpu_peak_power_w": raw.get("gpu_peak_power_w"),
+        "gpu_peak_memory_used_mib": raw.get("gpu_peak_memory_used_mib"),
+        "gpu_peak_utilization_pct": raw.get("gpu_peak_utilization_pct"),
+        "gpu_telemetry_samples": raw.get("gpu_telemetry_samples"),
+        "prompt_token_ids": raw.get("prompt_token_ids"),
+        "generated_token_ids": raw.get("generated_token_ids"),
         "effective_bandwidth_gb_s": effective_bandwidth,
         "bytes_moved_per_token": bytes_moved_per_token,
         "h2d_transfer_bytes_per_token": gpu_cache.get(
@@ -3388,6 +3565,7 @@ def _run_benchmark_profile_search(
     gpu_weight_budget: str,
     auto_quant: str,
     out: str | None,
+    prompt_token_ids: str | None = None,
 ) -> Optional[dict]:
     if search_steps < 1 or search_warmup < 0:
         raise SystemExit("--auto-search-steps must be positive and --auto-search-warmup non-negative")
@@ -3399,6 +3577,11 @@ def _run_benchmark_profile_search(
         gpu_weight_budget=gpu_weight_budget,
         auto_quant=auto_quant,
         device=device,
+    )
+    prompt_flags = (
+        ["--prompt-token-ids", prompt_token_ids]
+        if prompt_token_ids
+        else []
     )
     probes: list[dict[str, Any]] = []
     probe_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -3417,7 +3600,10 @@ def _run_benchmark_profile_search(
             "gpu_weight_budget": candidate["gpu_weight_budget"],
             "auto_quant": candidate["auto_quant"],
             "extra_env": candidate.get("env"),
-            "extra_flags": candidate.get("extra_flags"),
+            "extra_flags": [
+                *list(candidate.get("extra_flags") or []),
+                *prompt_flags,
+            ],
             "fixed_gpu_weight_budget": candidate.get(
                 "fixed_gpu_weight_budget"
             ),
@@ -3544,7 +3730,10 @@ def _run_benchmark_profile_search(
             gpu_weight_budget=candidate["gpu_weight_budget"],
             auto_quant=candidate["auto_quant"],
             extra_env=candidate.get("env"),
-            extra_flags=candidate.get("extra_flags"),
+            extra_flags=[
+                *list(candidate.get("extra_flags") or []),
+                *prompt_flags,
+            ],
             fixed_gpu_weight_budget=candidate.get(
                 "fixed_gpu_weight_budget"
             ),
@@ -3599,6 +3788,16 @@ def _auto_search_candidates(
         or model.get("num_experts")
         or 0
     ) > 0
+    required_operators = set(model.get("required_operators") or ())
+    is_recurrent = "gated_delta_net" in required_operators
+    cuda_capability = (0, 0)
+    if device == "cuda":
+        try:
+            import torch
+
+            cuda_capability = tuple(torch.cuda.get_device_capability())
+        except Exception:
+            pass
     candidates: list[dict[str, Any]] = []
 
     def add(
@@ -3695,6 +3894,53 @@ def _auto_search_candidates(
         )
     else:
         full_fp8 = _body_fp8_profile(profile, layer_spec=None)
+        if (
+            not is_recurrent
+            and cuda_capability >= (12, 0)
+            and layers >= 8
+        ):
+            quality_fp8_layers = max(1, layers - 4)
+            resident_quality = _body_fp8_profile(
+                profile,
+                layer_spec=f"0:{quality_fp8_layers}",
+            )
+            resident_quality.update(
+                {
+                    "qkv_fp8_layer_spec": f"0:{layers}",
+                    "o_fp8_layer_spec": f"0:{layers}",
+                    "lm_head_fp8": False,
+                    "keep_bf16_lm_head": False,
+                    "lm_head_backend": "triton_loop_512",
+                    "fused_residual_norm": True,
+                    "fused_rope": True,
+                    "tuned_large_matvec": True,
+                }
+            )
+            add(
+                "quality-fp8-body-int4g8-tail-full-resident",
+                resident_quality,
+                candidate_residency="stream",
+                candidate_auto_quant="off",
+                reason=(
+                    "keep attention and most MLP projections in FP8 tensor-core "
+                    "form while using refined group-8 INT4 for the final four "
+                    "MLP layers"
+                ),
+                env={
+                    "THINTENSOR_TENSORCORE_MATVEC": "1",
+                    "THINTENSOR_MULTI_TENSORCORE": "1",
+                },
+                extra_flags=[
+                    "--embed-fp8",
+                    "--dense-int4",
+                    "--dense-int4-layers", f"0:{layers}",
+                    "--dense-int4-group-size", "8",
+                    "--no-pinned-staging",
+                ],
+                fixed_gpu_weight_budget=str(
+                    min(device_total_bytes, 8_000_000_000)
+                ),
+            )
         add(
             "body-fp8-stream",
             full_fp8,
@@ -3790,6 +4036,154 @@ def _auto_search_candidates(
             candidate_auto_quant="off",
             reason="stream QKV/O projections as FP8 and leave MLP projections exact",
         )
+        if cuda_capability >= (12, 0) and device_total_bytes > 0:
+            cpu_embed_int4 = dict(profile)
+            cpu_embed_int4.update(
+                {
+                    "kernel_backend": "triton",
+                    "attention_backend": "triton_fused",
+                    "gate_up_fp8": False,
+                    "down_proj_fp8": False,
+                    "qkv_fp8": False,
+                    "o_proj_fp8": False,
+                    "lm_head_fp8": True,
+                    "lm_head_backend": "triton_loop_512",
+                    "lm_head_int4_group_size": 128,
+                    "keep_bf16_lm_head": False,
+                    "lm_head_topk_guard": 0,
+                    "fused_scaled_mlp": False,
+                    "fused_residual_norm": False,
+                    "fused_rope": False,
+                    "tuned_large_matvec": False,
+                }
+            )
+            cpu_embed_budget = max(
+                0,
+                min(device_total_bytes - 256 * 1024**2, 7_800_000_000),
+            )
+            if cpu_embed_budget > 0:
+                add(
+                    "cpu-embed-mxfp4-mlp-int4g128-attention-head-full-resident",
+                    cpu_embed_int4,
+                    candidate_residency="stream",
+                    candidate_auto_quant="off",
+                    reason=(
+                        "keep the exact one-row input embedding lookup mmap-backed "
+                        "on CPU so MXFP4 MLP projections, grouped-128 INT4 "
+                        "attention and grouped-128 execution head fit fully resident"
+                    ),
+                    env={
+                        "THINTENSOR_TENSORCORE_MATVEC": "1",
+                        "THINTENSOR_MULTI_TENSORCORE": "1",
+                        "THINTENSOR_INT4_GROUPED_DOT": "0",
+                    },
+                    extra_flags=[
+                        "--cpu-embed",
+                        "--dense-int4",
+                        "--dense-int4-layers", f"0:{layers}",
+                        "--dense-int4-group-size", "64",
+                        "--dense-int4-attention-group-size", "128",
+                        "--mxfp4-gate-up-layers", f"0:{layers}",
+                        "--mxfp4-down-layers", f"0:{layers}",
+                        "--no-pinned-staging",
+                    ],
+                    fixed_gpu_weight_budget=str(cpu_embed_budget),
+                )
+                candidates.insert(0, candidates.pop())
+
+            lowbit_resident = dict(profile)
+            lowbit_resident.update(
+                {
+                    "kernel_backend": "triton",
+                    "attention_backend": "triton_fused",
+                    "gate_up_fp8": False,
+                    "down_proj_fp8": False,
+                    "qkv_fp8": False,
+                    "o_proj_fp8": False,
+                    "lm_head_fp8": True,
+                    "lm_head_backend": "triton_loop_512",
+                    "lm_head_int4_group_size": 0,
+                    "keep_bf16_lm_head": False,
+                    "lm_head_topk_guard": 0,
+                    "fused_scaled_mlp": False,
+                    "fused_residual_norm": True,
+                    "fused_rope": True,
+                    "tuned_large_matvec": True,
+                }
+            )
+            lowbit_budget = min(device_total_bytes, 8_000_000_000)
+            dense_q2_budget = max(
+                0,
+                min(device_total_bytes - 256 * 1024**2, 7_800_000_000),
+            )
+            if dense_q2_budget > 0:
+                dense_q2 = dict(lowbit_resident)
+                dense_q2.update(
+                    {
+                        "lm_head_fp8": False,
+                        "lm_head_int4_group_size": 128,
+                        "fused_residual_norm": True,
+                        "fused_rope": True,
+                        "tuned_large_matvec": True,
+                    }
+                )
+                add(
+                    "dense-q2-e8m0-int4-head-full-resident-experimental",
+                    dense_q2,
+                    candidate_residency="stream",
+                    candidate_auto_quant="off",
+                    reason=(
+                        "pack every dense decoder projection into MSE-selected "
+                        "Q2 groups with E8M0 scales, keep the exact embedding "
+                        "lookup on CPU, and use a grouped-128 INT4 execution head"
+                    ),
+                    env={
+                        "THINTENSOR_TENSORCORE_MATVEC": "1",
+                        "THINTENSOR_MULTI_TENSORCORE": "1",
+                    },
+                    extra_flags=[
+                        "--cpu-embed",
+                        "--dense-lowbit-bits",
+                        "2",
+                        "--dense-lowbit-layers",
+                        f"0:{layers}",
+                        "--lm-head-int4-group-size",
+                        "128",
+                        "--no-pinned-staging",
+                    ],
+                    fixed_gpu_weight_budget=str(dense_q2_budget),
+                )
+                candidates.insert(0, candidates.pop())
+            add(
+                (
+                    "recurrent-mxfp4-mlp-int4g512-attention-full-resident"
+                    if is_recurrent
+                    else "mxfp4-mlp-int4g512-attention-full-resident"
+                ),
+                lowbit_resident,
+                candidate_residency="stream",
+                candidate_auto_quant="off",
+                reason=(
+                    "keep the dense execution set resident with SM12 MXFP4 "
+                    "MLPs, grouped-512 INT4 attention, and compact FP8 "
+                    "embedding/head storage"
+                ),
+                extra_flags=[
+                    "--embed-fp8",
+                    "--dense-int4",
+                    "--dense-int4-layers", f"0:{layers}",
+                    "--dense-int4-group-size", "512",
+                    "--mxfp4-gate-up-layers", f"0:{layers}",
+                    "--mxfp4-down-layers", f"0:{layers}",
+                    "--no-pinned-staging",
+                ],
+                fixed_gpu_weight_budget=str(lowbit_budget),
+            )
+            # This candidate runs close to the device limit while constructing
+            # its replacement FP8 head. Probe it before legacy candidates so
+            # allocator/context residue from a dozen prior CUDA subprocesses
+            # cannot turn a valid plan into a spurious startup OOM.
+            candidates.insert(0, candidates.pop())
 
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
@@ -3963,6 +4357,7 @@ def _auto_search_probe_summary(row: Mapping[str, Any]) -> dict[str, Any]:
         "candidate": row.get("auto_search_candidate"),
         "reason": row.get("auto_search_reason"),
         "error": row.get("error"),
+        "stderr_tail": row.get("stderr_tail"),
         "tokens_per_s": row.get("tokens_per_s"),
         "steady_tokens_per_s": raw_mapping.get("steady_tokens_per_s"),
         "ms_per_token": row.get("ms_per_token"),

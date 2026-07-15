@@ -31,6 +31,14 @@ from thinruntime.gpu_runtime import (
     _gpu_peak_reserved,
     _rss_bytes,
 )
+from thinruntime.memory_report import build_memory_report
+
+
+def reported_fp8_layer_spec(
+    *, enabled: bool, specific: str | None, generic: str | None
+) -> str | None:
+    """Return the effective selector only for an active FP8 projection route."""
+    return (specific or generic or "all") if enabled else None
 
 
 def main() -> None:
@@ -79,6 +87,13 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--steps", type=int, default=8)
     run.add_argument("--warmup-steps", type=int, default=0)
     run.add_argument("--token-id", type=int, default=0)
+    run.add_argument(
+        "--prompt-token-ids",
+        help=(
+            "Comma-separated explicit prompt token IDs to prefill before the "
+            "timed autoregressive decode"
+        ),
+    )
     run.add_argument("--layers", type=int)
     run.add_argument("--kv", default="bf16")
     run.add_argument("--kv-budget", default="0")
@@ -163,7 +178,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     run.add_argument("--lm-head-fp8", action="store_true")
-    run.add_argument("--keep-bf16-lm-head", action="store_true")
+    run.add_argument(
+        "--keep-bf16-lm-head",
+        dest="keep_bf16_lm_head",
+        action="store_true",
+        default=False,
+    )
+    run.add_argument(
+        "--no-keep-bf16-lm-head",
+        dest="keep_bf16_lm_head",
+        action="store_false",
+    )
     run.add_argument("--exact-topk", action="store_true")
     run.add_argument("--max-gpu-temp", type=int, default=87)
     run.add_argument("--fused-mlp", action="store_true")
@@ -222,6 +247,37 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--dense-int4", action="store_true")
     run.add_argument("--dense-int4-layers")
     run.add_argument("--dense-int4-group-size", type=int, default=32)
+    run.add_argument("--dense-int4-attention-group-size", type=int, default=0)
+    run.add_argument("--dense-int4-fine-layers")
+    run.add_argument("--dense-int4-fine-group-size", type=int, default=0)
+    run.add_argument(
+        "--dense-int4-cpu-layers",
+        help="Execute selected grouped-INT4 decoder layers with the CPU INT4 kernel",
+    )
+    run.add_argument(
+        "--dense-int4-affine",
+        action="store_true",
+        help="Use affine rather than symmetric grouped-INT4 decoder weights",
+    )
+    run.add_argument("--dense-int4-calibration-json")
+    run.add_argument("--dense-int4-calibration-npz")
+    run.add_argument("--dense-int4-calibration-covariance-npz")
+    run.add_argument("--dense-int4-gptq-damp-percent", type=float, default=0.01)
+    run.add_argument("--dense-int4-cpu-residual-terms", type=int, default=0)
+    run.add_argument(
+        "--dense-int4-gpu-ops",
+        help="Comma-separated projection op names kept as affine INT4 on GPU",
+    )
+    run.add_argument("--dense-int4-gpu-suffixes")
+    run.add_argument(
+        "--dense-lowbit-bits",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="Pack selected dense decoder projections to Q1/Q2 E8M0 groups",
+    )
+    run.add_argument("--dense-lowbit-layers")
+    run.add_argument("--dense-lowbit-suffixes")
     run.add_argument("--packed-expert-q2-layers")
     run.add_argument("--packed-expert-q1-layers")
     run.add_argument("--down-proj-fp8", action="store_true")
@@ -236,6 +292,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Store model.embed_tokens.weight as scaled FP8 and reuse it as "
             "the execution head when the archive has no separate lm_head"
+        ),
+    )
+    run.add_argument(
+        "--cpu-embed",
+        action="store_true",
+        help=(
+            "Keep the exact input embedding table mmap-backed on CPU and "
+            "transfer only the selected row per token"
         ),
     )
     run.add_argument("--validate-lm-head-fp8", action="store_true")
@@ -523,6 +587,10 @@ def cmd_gpu_load(args: argparse.Namespace) -> dict[str, Any]:
             "peak_vram_allocated_bytes": _gpu_peak_allocated(args.device),
             "peak_vram_reserved_bytes": _gpu_peak_reserved(args.device),
             "gpu_peak_temp_c": guard.peak_temp,
+            "gpu_peak_power_w": guard.peak_power_w,
+            "gpu_peak_memory_used_mib": guard.peak_memory_used_mib,
+            "gpu_peak_utilization_pct": guard.peak_utilization_pct,
+            "gpu_telemetry_samples": guard.samples,
             "thermal_stop": guard.too_hot,
         }
         weights.close()
@@ -626,6 +694,22 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["THINTENSOR_PINNED_STAGING"] = (
             "1" if args.pinned_staging else "0"
         )
+    if args.dense_int4_affine:
+        os.environ["THINTENSOR_AFFINE_INT4"] = "1"
+    os.environ["THINTENSOR_GPTQ_DAMP_PERCENT"] = str(
+        args.dense_int4_gptq_damp_percent
+    )
+    os.environ["THINTENSOR_CPU_INT4_RESIDUAL_TERMS"] = str(
+        args.dense_int4_cpu_residual_terms
+    )
+    if args.dense_int4_gpu_ops:
+        os.environ["THINTENSOR_DENSE_INT4_GPU_OPS"] = args.dense_int4_gpu_ops
+    if args.dense_int4_gpu_suffixes:
+        os.environ["THINTENSOR_DENSE_INT4_GPU_SUFFIXES"] = (
+            args.dense_int4_gpu_suffixes
+        )
+    if args.dense_lowbit_suffixes:
+        os.environ["THINTENSOR_DENSE_LOWBIT_SUFFIXES"] = args.dense_lowbit_suffixes
     dtype = parse_dtype(args.dtype)
     reset_gpu(args.device)
     rss0 = _rss_bytes()
@@ -660,6 +744,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 qkv_fp8=args.qkv_fp8 or args.attn_proj_fp8,
                 o_proj_fp8=args.o_proj_fp8 or args.attn_proj_fp8,
                 embed_fp8=args.embed_fp8,
+                cpu_embed=args.cpu_embed,
                 fp8_layer_spec=args.fp8_layers,
                 down_fp8_layer_spec=args.down_fp8_layers,
                 qkv_fp8_layer_spec=args.qkv_fp8_layers,
@@ -674,6 +759,23 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 dense_int4=args.dense_int4,
                 dense_int4_layer_spec=args.dense_int4_layers,
                 dense_int4_group_size=args.dense_int4_group_size,
+                dense_int4_attention_group_size=(
+                    args.dense_int4_attention_group_size
+                ),
+                dense_int4_fine_layer_spec=args.dense_int4_fine_layers,
+                dense_int4_fine_group_size=args.dense_int4_fine_group_size,
+                dense_int4_cpu_layer_spec=args.dense_int4_cpu_layers,
+                dense_int4_calibration_json=args.dense_int4_calibration_json,
+                dense_int4_calibration_npz=args.dense_int4_calibration_npz,
+                dense_int4_calibration_covariance_npz=(
+                    args.dense_int4_calibration_covariance_npz
+                ),
+                dense_lowbit_bits=args.dense_lowbit_bits,
+                dense_lowbit_layer_spec=args.dense_lowbit_layers,
+                mxfp4_gate_up_layer_spec=args.mxfp4_gate_up_layers,
+                mxfp4_down_layer_spec=args.mxfp4_down_layers,
+                mxfp4_qkv_layer_spec=args.mxfp4_qkv_layers,
+                mxfp4_o_layer_spec=args.mxfp4_o_layers,
                 packed_expert_q2_layer_spec=args.packed_expert_q2_layers,
                 packed_expert_q1_layer_spec=args.packed_expert_q1_layers,
             )
@@ -818,8 +920,43 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         load_s = time.perf_counter() - load_start
 
         guard.raise_if_hot("before run")
-        token_id = torch.full(
-            (), args.token_id, device=args.device, dtype=torch.long
+        prompt_token_ids = _parse_token_ids(args.prompt_token_ids)
+        if prompt_token_ids and args.mode != "decode":
+            raise ValueError("--prompt-token-ids requires --mode decode")
+        if prompt_token_ids and args.cuda_graphs:
+            raise ValueError(
+                "--prompt-token-ids is not yet compatible with CUDA graph replay"
+            )
+        token_index_offset = 0
+        prefill_s = 0.0
+        if prompt_token_ids:
+            sync(args.device)
+            prefill_started = time.perf_counter()
+            for prompt_index, prompt_token_id in enumerate(prompt_token_ids):
+                prompt_token = torch.full(
+                    (),
+                    prompt_token_id,
+                    device=args.device,
+                    dtype=torch.long,
+                )
+                hidden = runtime.forward_token(
+                    prompt_token,
+                    layers=args.layers,
+                    token_index=prompt_index,
+                )
+            token_id = runtime.next_token_tensor(hidden)
+            sync(args.device)
+            prefill_s = time.perf_counter() - prefill_started
+            token_index_offset = len(prompt_token_ids)
+        else:
+            token_id = torch.full(
+                (), args.token_id, device=args.device, dtype=torch.long
+            )
+        decode_initial_token_id = int(token_id.detach().cpu().item())
+        generated_token_ids_device = torch.empty(
+            (max(1, args.steps),),
+            device=args.device,
+            dtype=torch.long,
         )
         top_logits: list[dict[str, float | int]] = []
         lm_head_validation: dict[str, Any] = {}
@@ -852,8 +989,13 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 if getattr(runtime, "_cuda_graphs_enabled", False):
                     token_id = runtime.replay_cuda_graph(token_id)
                 else:
-                    hidden = runtime.forward_token(token_id, layers=args.layers, token_index=step)
+                    hidden = runtime.forward_token(
+                        token_id,
+                        layers=args.layers,
+                        token_index=token_index_offset + step,
+                    )
                     token_id = runtime.next_token_tensor(hidden)
+            generated_token_ids_device[step].copy_(token_id)
             if step == 0 and args.device == "cuda":
                 first_end_event.record()
         if args.device == "cuda":
@@ -864,6 +1006,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         else:
             loop_s = time.perf_counter() - loop_start
             first_s = None
+        generated_token_ids = [
+            int(value)
+            for value in generated_token_ids_device.cpu().tolist()
+        ]
 
         if getattr(runtime, "_cuda_graphs_enabled", False):
             hidden = runtime._static_hidden
@@ -915,9 +1061,11 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 hidden = runtime.forward_token(
                     token_id,
                     layers=args.layers,
-                    token_index=max(1, args.steps) + i,
+                    token_index=(
+                        token_index_offset + max(1, args.steps) + i
+                    ),
                 )
-                _ = runtime.next_token_tensor(hidden)
+                token_id = runtime.next_token_tensor(hidden)
             breakdown = runtime.get_profiler_results()
             runtime._profiler_enabled = False
         else:
@@ -950,6 +1098,14 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 "fused_logical_pages": stats.fused_logical_pages,
                 "aliased_pages": stats.aliased_pages,
             }
+        memory_ownership = build_memory_report(
+            runtime,
+            weights,
+            kv_cache,
+            device=args.device,
+            rss_before_bytes=rss0,
+            rss_after_bytes=rss1,
+        )
         result = {
             "command": "run",
             "archive": str(args.archive),
@@ -957,6 +1113,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "dtype": args.dtype,
             "residency": args.residency,
             "mode": args.mode,
+            "batch_size": 1,
+            "sequence_count": 1,
+            "aggregate_batching": False,
+            "speculative_decoding": bool(args.speculative),
             "kernel_backend": runtime.kernel_backend_name,
             "opt_in_profile": (
                 "fast_60"
@@ -974,6 +1134,14 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "pinned_staging": args.pinned_staging,
             "steps": max(1, args.steps),
             "warmup_steps": max(0, args.warmup_steps),
+            "prompt_token_ids": prompt_token_ids,
+            "prompt_tokens": len(prompt_token_ids),
+            "prefill_s": prefill_s,
+            "prefill_tokens_per_s": (
+                len(prompt_token_ids) / prefill_s
+                if prompt_token_ids and prefill_s > 0
+                else None
+            ),
             "layers": args.layers,
             "load_s": load_s,
             "first_token_s": first_s,
@@ -989,6 +1157,9 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 if max(1, args.steps) > 1
                 else None
             ),
+            "initial_token_id": int(args.token_id),
+            "decode_initial_token_id": decode_initial_token_id,
+            "generated_token_ids": generated_token_ids,
             "bytes_moved_per_token": weight_read_bytes,
             "estimated_weight_read_bytes_per_token": weight_read_bytes,
             "weight_bytes": weight_read_bytes,
@@ -1009,6 +1180,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "gpu_cache": pool_telemetry.get("gpu_cache", {}),
             "cpu_store": pool_telemetry.get("cpu_store", {}),
             "page_pool": pool_telemetry,
+            "memory_ownership": memory_ownership,
             "kv_cache": timed_kv_telemetry,
             "kv_old_codec": kv_cache.old_codec,
             "kv_compressed_blocks": timed_kv_telemetry["kv_compressed_blocks"],
@@ -1062,6 +1234,8 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 runtime.adaptive_exact_resident_bytes
             ),
             "body_int4_group_size": args.body_int4_group_size,
+            "dense_lowbit_bits": args.dense_lowbit_bits,
+            "dense_lowbit_layers": args.dense_lowbit_layers,
             "mxfp4_gate_up_layers": args.mxfp4_gate_up_layers,
             "mxfp4_down_layers": args.mxfp4_down_layers,
             "mxfp4_qkv_layers": args.mxfp4_qkv_layers,
@@ -1097,15 +1271,34 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 runtime._fp8_sparse_residual_dtype
             ).replace("torch.", ""),
             "embed_fp8": args.embed_fp8,
-            "fp8_layers": args.fp8_layers or "all",
-            "down_fp8_layers": (
-                args.down_fp8_layers or args.fp8_layers or "all"
+            "cpu_embed": args.cpu_embed,
+            "fp8_layers": reported_fp8_layer_spec(
+                enabled=any(
+                    (
+                        args.down_proj_fp8,
+                        args.mlp_fp8,
+                        args.qkv_fp8,
+                        args.o_proj_fp8,
+                        args.attn_proj_fp8,
+                    )
+                ),
+                specific=None,
+                generic=args.fp8_layers,
             ),
-            "qkv_fp8_layers": (
-                args.qkv_fp8_layers or args.fp8_layers or "all"
+            "down_fp8_layers": reported_fp8_layer_spec(
+                enabled=args.down_proj_fp8 or args.mlp_fp8,
+                specific=args.down_fp8_layers,
+                generic=args.fp8_layers,
             ),
-            "o_fp8_layers": (
-                args.o_fp8_layers or args.fp8_layers or "all"
+            "qkv_fp8_layers": reported_fp8_layer_spec(
+                enabled=args.qkv_fp8 or args.attn_proj_fp8,
+                specific=args.qkv_fp8_layers,
+                generic=args.fp8_layers,
+            ),
+            "o_fp8_layers": reported_fp8_layer_spec(
+                enabled=args.o_proj_fp8 or args.attn_proj_fp8,
+                specific=args.o_fp8_layers,
+                generic=args.fp8_layers,
             ),
             "fp8_scale_block": args.fp8_scale_block,
             "lm_head_fp8_scale_block": args.lm_head_fp8_scale_block,
@@ -1126,6 +1319,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                     args.o_proj_fp8,
                     args.attn_proj_fp8,
                     args.embed_fp8,
+                    args.cpu_embed,
                 )
             ),
             "exact_topk": args.exact_topk,
@@ -1158,6 +1352,10 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "gpu_peak_allocated_bytes": _gpu_peak_allocated(args.device),
             "gpu_peak_reserved_bytes": _gpu_peak_reserved(args.device),
             "gpu_peak_temp_c": guard.peak_temp,
+            "gpu_peak_power_w": guard.peak_power_w,
+            "gpu_peak_memory_used_mib": guard.peak_memory_used_mib,
+            "gpu_peak_utilization_pct": guard.peak_utilization_pct,
+            "gpu_telemetry_samples": guard.samples,
             "thermal_stop": guard.too_hot,
         }
         if args.profile_runtime is not None:
@@ -1463,6 +1661,17 @@ def parse_dtype(value: str) -> torch.dtype | None:
     if value == "fp32":
         return torch.float32
     raise ValueError(f"unsupported dtype {value}")
+
+
+def _parse_token_ids(value: str | None) -> list[int]:
+    if value is None or not value.strip():
+        return []
+    token_ids = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not token_ids:
+        raise ValueError("--prompt-token-ids did not contain any token IDs")
+    if any(token_id < 0 for token_id in token_ids):
+        raise ValueError("--prompt-token-ids cannot contain negative IDs")
+    return token_ids
 
 
 def parse_bytes(value: str) -> int:

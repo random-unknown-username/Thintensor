@@ -103,6 +103,11 @@ def convert_hf_model(
     arch: Optional[str] = None,
     include_tokenizer_hashes: bool = True,
     verify: bool = True,
+    streaming_pack: bool = False,
+    consume_source_shards: bool = False,
+    minimum_free_bytes: int = 0,
+    resume: bool = False,
+    dry_run: bool = False,
 ) -> bool:
     """Convert a HuggingFace model directory to .thin archive.
 
@@ -114,13 +119,23 @@ def convert_hf_model(
         args.extend(["--arch", arch])
     if not include_tokenizer_hashes:
         args.append("--no-tokenizer")
+    if streaming_pack:
+        args.append("--streaming-pack")
+    if consume_source_shards:
+        args.append("--consume-source-shards")
+    if minimum_free_bytes:
+        args.extend(["--minimum-free-bytes", str(minimum_free_bytes)])
+    if resume:
+        args.append("--resume")
+    if dry_run:
+        args.append("--dry-run")
 
     try:
         run_rust_command("convert-hf", args)
     except subprocess.CalledProcessError:
         return False
 
-    if verify:
+    if verify and not dry_run:
         try:
             run_rust_command("verify", [str(out_path)])
         except subprocess.CalledProcessError:
