@@ -66,7 +66,11 @@ class ModelDescriptor:
     num_kv_shared_layers: int = 0
     hidden_size_per_layer_input: int = 0
     vocab_size_per_layer_input: int = 0
+    kv_lora_rank: int = 0
+    qk_rope_head_dim: int = 0
     use_double_wide_mlp: bool = False
+    parallel_residual: bool = False
+    alibi: bool = False
     required_operators: tuple[str, ...] = ()
     quantization: QuantizationDescriptor = field(
         default_factory=lambda: descriptor_from_config({})
@@ -247,9 +251,13 @@ def descriptor_from_hf_config(config_or_path: dict[str, Any] | str | Path) -> Mo
             if config.get("final_logit_softcapping") is not None
             else None
         ),
+        kv_lora_rank=int(config.get("kv_lora_rank", 0)),
+        qk_rope_head_dim=int(config.get("qk_rope_head_dim", 0)),
         linear_conv_kernel_dim=int(
             config.get("linear_conv_kernel_dim") or 0
         ),
+        parallel_residual=bool(config.get("use_parallel_residual", False) or config.get("parallel_attn", False) or model_type in {"falcon", "gpt_neox"}),
+        alibi=bool(config.get("alibi", False) or config.get("position_embedding_type") == "alibi" or model_type in {"bloom", "mpt"}),
         linear_key_head_dim=int(
             config.get("linear_key_head_dim") or 0
         ),
@@ -709,7 +717,18 @@ def _semantic_traits(
         or 0
     )
     has_moe_tensors = any(".mlp.experts." in name for name in tensor_names)
-    mlp_kind = "sparse_moe" if num_experts or has_moe_tensors else "gated_dense"
+    
+    # Check for dense (non-gated) MLPs. 
+    # Usually they lack 'gate' or 'gate_up' in their projection names.
+    has_gated = any("gate" in name for name in tensor_names if ".mlp." in name)
+    
+    if num_experts or has_moe_tensors:
+        mlp_kind = "sparse_moe"
+    elif has_gated:
+        mlp_kind = "gated_dense"
+    else:
+        mlp_kind = "dense"
+
     layer_types = tuple(
         str(value) for value in (config.get("layer_types") or ())
     )
@@ -721,6 +740,9 @@ def _semantic_traits(
             "sliding_attention" if layer % 2 == 0 else "full_attention"
             for layer in range(layers)
         )
+    if raw_model_type == "gemma4":
+        if not experts_per_token:
+            experts_per_token = 4
     if not layer_types and config.get("sliding_window") is not None:
         use_sliding = bool(config.get("use_sliding_window", True))
         if use_sliding:

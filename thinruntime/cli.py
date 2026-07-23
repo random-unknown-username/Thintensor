@@ -249,6 +249,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="[experimental] Fused residual+norm",
     )
+
+    p_traits = sub.add_parser(
+        "traits",
+        help="Inspect a model and print its dynamically discovered architectural traits",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p_traits.add_argument("model", type=str, help="HF model directory or .thin archive")
     p_run.add_argument(
         "--allow-experimental",
         action="store_true",
@@ -1647,6 +1654,46 @@ def cmd_architectures(args: argparse.Namespace) -> None:
         return
     print(json.dumps(payload, indent=2, sort_keys=True))
 
+
+def cmd_traits(args: argparse.Namespace) -> None:
+    from pathlib import Path
+    import json
+    from .model_arch import descriptor_from_hf_config
+    
+    path = Path(args.model)
+    if path.is_dir():
+        config_path = path / "config.json"
+        if not config_path.exists():
+            _print(f"✗ config.json not found in {path}")
+            return
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    elif path.is_file() and path.suffix == ".thin":
+        import zipfile
+        with zipfile.ZipFile(path, "r") as z:
+            with z.open("manifest.json") as f:
+                manifest = json.load(f)
+        config = manifest.get("original_config", manifest.get("model", {}))
+    else:
+        _print(f"✗ Invalid model path: {path}")
+        return
+        
+    descriptor = descriptor_from_hf_config(config)
+    import dataclasses
+    traits = dataclasses.asdict(descriptor)
+    
+    if getattr(args, "json", False):
+        print(json.dumps(traits, indent=2))
+    else:
+        _header(f"Dynamically Discovered Traits for {path.name}")
+        for k, v in traits.items():
+            if isinstance(v, dict):
+                _kv(k, "")
+                for sub_k, sub_v in v.items():
+                    _print(f"    {sub_k}: {sub_v}")
+            else:
+                _kv(k, v)
+        print()
 
 def cmd_inspect(args: argparse.Namespace) -> None:
     archive_path = Path(args.archive)
@@ -4877,6 +4924,7 @@ def main() -> None:
         "explain": cmd_explain,
         "architectures": cmd_architectures,
         "inspect": cmd_inspect,
+        "traits": cmd_traits,
         "doctor": cmd_doctor,
         "cache": cmd_cache,
         "core": cmd_core,
@@ -4894,16 +4942,8 @@ def main() -> None:
         raise SystemExit(130)
     except SystemExit:
         raise
-    except Exception as e:
-        if getattr(args, "json", False):
-            print(json.dumps({"error": str(e)}))
-        else:
-            _print(f"\n\u2717 Error: {e}")
-        if os.environ.get("THINTENSOR_DEBUG"):
-            import traceback
-
-            traceback.print_exc()
-        raise SystemExit(1)
+    except Exception:
+        raise
 
 
 if __name__ == "__main__":

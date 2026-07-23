@@ -1,0 +1,432 @@
+{
+  "archive": "/home/satvik/.cache/thintensor/archives/openai--gpt-oss-20b.thin",
+  "candidate": "ThinTensor selected runtime flags",
+  "candidate_flags": {
+    "cpu_embed": false,
+    "dense_int4": false,
+    "dense_int4_calibration_covariance_npz": null,
+    "dense_int4_calibration_json": null,
+    "dense_int4_calibration_npz": null,
+    "dense_int4_cpu_layers": null,
+    "dense_int4_gpu_ops": null,
+    "dense_int4_gpu_suffixes": null,
+    "dense_int4_group_size": 128,
+    "dense_int4_layers": null,
+    "dense_lowbit_bits": 0,
+    "dense_lowbit_layers": null,
+    "dense_lowbit_suffixes": null,
+    "down_fp8_layers": null,
+    "down_proj_fp8": false,
+    "embed_fp8": false,
+    "fp8_layers": null,
+    "fused_residual_norm": true,
+    "fused_rope": true,
+    "fused_scaled_mlp": false,
+    "gate_up_fp8": false,
+    "lm_head_int4_group_size": 0,
+    "mlp_fp8": false,
+    "moe_top_k_limit": 0,
+    "moe_top_k_renorm": true,
+    "mxfp4_down_layers": null,
+    "mxfp4_gate_up_layers": null,
+    "mxfp4_o_layers": null,
+    "mxfp4_qkv_layers": null,
+    "mxfp4_selected_tensorcore": true,
+    "o_fp8_layers": "all",
+    "o_proj_fp8": true,
+    "packed_expert_q1_layers": "2:22",
+    "packed_expert_q2_layers": "0:24",
+    "pinned_staging": true,
+    "qkv_fp8": true,
+    "qkv_fp8_layers": "all"
+  },
+  "minimum_cosine_similarity": -0.6688835620880127,
+  "minimum_generated_token_match_rate": 0.0,
+  "minimum_top5_overlap": 0.0,
+  "record_count": 3,
+  "records": [
+    {
+      "archive": "/home/satvik/.cache/thintensor/archives/openai--gpt-oss-20b.thin",
+      "candidate_tokens": [
+        105333,
+        75537,
+        124739,
+        3658,
+        68768,
+        41482,
+        33485,
+        160890,
+        186515,
+        47209,
+        156627,
+        39869,
+        18958,
+        64500,
+        119798,
+        150021,
+        61230,
+        125034,
+        58082,
+        10333,
+        104655,
+        74564,
+        166681,
+        117660,
+        59155,
+        110909,
+        61722,
+        3162,
+        71115,
+        185774,
+        45487,
+        139802
+      ],
+      "candidate_top5": [
+        {
+          "logit": 19.75,
+          "token_id": 105333
+        },
+        {
+          "logit": 17.875,
+          "token_id": 47761
+        },
+        {
+          "logit": 17.5,
+          "token_id": 37659
+        },
+        {
+          "logit": 17.0,
+          "token_id": 192208
+        },
+        {
+          "logit": 16.625,
+          "token_id": 189137
+        }
+      ],
+      "cosine_similarity": -0.6688835620880127,
+      "decode_step": 1,
+      "generated_token_match_rate": 0.0,
+      "kv_tokens_attended": 27,
+      "kv_tokens_expected": 27,
+      "max_abs_logit_error": 27.5,
+      "mean_abs_logit_error": 8.552804946899414,
+      "prefill_length": 27,
+      "prompt": "Hello",
+      "reference_tokens": [
+        306,
+        11,
+        11,
+        290,
+        11,
+        11,
+        11,
+        11002,
+        11002,
+        13,
+        306,
+        290,
+        11002,
+        382,
+        13,
+        13,
+        290,
+        11002,
+        13,
+        13,
+        13,
+        290,
+        11002,
+        13,
+        13,
+        290,
+        2684,
+        13,
+        13,
+        290,
+        382,
+        261
+      ],
+      "reference_top5": [
+        {
+          "logit": 12.5625,
+          "token_id": 306
+        },
+        {
+          "logit": 12.5,
+          "token_id": 326
+        },
+        {
+          "logit": 12.1875,
+          "token_id": 483
+        },
+        {
+          "logit": 12.125,
+          "token_id": 2356
+        },
+        {
+          "logit": 11.8125,
+          "token_id": 1199
+        }
+      ],
+      "top1_same": false,
+      "top5_overlap": 0.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/archives/openai--gpt-oss-20b.thin",
+      "candidate_tokens": [
+        105333,
+        75537,
+        124739,
+        3658,
+        68768,
+        41482,
+        33485,
+        160890,
+        186515,
+        47209,
+        156627,
+        39869,
+        18958,
+        64500,
+        119798,
+        150021,
+        61230,
+        125034,
+        58082,
+        10333,
+        104655,
+        74564,
+        166681,
+        117660,
+        59155,
+        110909,
+        61722,
+        3162,
+        71115,
+        185774,
+        45487,
+        139802
+      ],
+      "candidate_top5": [
+        {
+          "logit": 16.625,
+          "token_id": 160890
+        },
+        {
+          "logit": 16.125,
+          "token_id": 190696
+        },
+        {
+          "logit": 16.0,
+          "token_id": 177088
+        },
+        {
+          "logit": 15.3125,
+          "token_id": 173642
+        },
+        {
+          "logit": 14.75,
+          "token_id": 177439
+        }
+      ],
+      "cosine_similarity": -0.18173329532146454,
+      "decode_step": 8,
+      "generated_token_match_rate": 0.0,
+      "kv_tokens_attended": 34,
+      "kv_tokens_expected": 34,
+      "max_abs_logit_error": 25.25,
+      "mean_abs_logit_error": 6.716284275054932,
+      "prefill_length": 27,
+      "prompt": "Hello",
+      "reference_tokens": [
+        306,
+        11,
+        11,
+        290,
+        11,
+        11,
+        11,
+        11002,
+        11002,
+        13,
+        306,
+        290,
+        11002,
+        382,
+        13,
+        13,
+        290,
+        11002,
+        13,
+        13,
+        13,
+        290,
+        11002,
+        13,
+        13,
+        290,
+        2684,
+        13,
+        13,
+        290,
+        382,
+        261
+      ],
+      "reference_top5": [
+        {
+          "logit": 16.875,
+          "token_id": 11002
+        },
+        {
+          "logit": 16.625,
+          "token_id": 290
+        },
+        {
+          "logit": 16.0,
+          "token_id": 261
+        },
+        {
+          "logit": 15.75,
+          "token_id": 31251
+        },
+        {
+          "logit": 14.9375,
+          "token_id": 9297
+        }
+      ],
+      "top1_same": false,
+      "top5_overlap": 0.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/archives/openai--gpt-oss-20b.thin",
+      "candidate_tokens": [
+        105333,
+        75537,
+        124739,
+        3658,
+        68768,
+        41482,
+        33485,
+        160890,
+        186515,
+        47209,
+        156627,
+        39869,
+        18958,
+        64500,
+        119798,
+        150021,
+        61230,
+        125034,
+        58082,
+        10333,
+        104655,
+        74564,
+        166681,
+        117660,
+        59155,
+        110909,
+        61722,
+        3162,
+        71115,
+        185774,
+        45487,
+        139802
+      ],
+      "candidate_top5": [
+        {
+          "logit": 18.375,
+          "token_id": 139802
+        },
+        {
+          "logit": 18.25,
+          "token_id": 143741
+        },
+        {
+          "logit": 16.25,
+          "token_id": 195777
+        },
+        {
+          "logit": 15.6875,
+          "token_id": 67304
+        },
+        {
+          "logit": 15.625,
+          "token_id": 21353
+        }
+      ],
+      "cosine_similarity": -0.24901099503040314,
+      "decode_step": 32,
+      "generated_token_match_rate": 0.0,
+      "kv_tokens_attended": 58,
+      "kv_tokens_expected": 58,
+      "max_abs_logit_error": 23.9375,
+      "mean_abs_logit_error": 6.932949542999268,
+      "prefill_length": 27,
+      "prompt": "Hello",
+      "reference_tokens": [
+        306,
+        11,
+        11,
+        290,
+        11,
+        11,
+        11,
+        11002,
+        11002,
+        13,
+        306,
+        290,
+        11002,
+        382,
+        13,
+        13,
+        290,
+        11002,
+        13,
+        13,
+        13,
+        290,
+        11002,
+        13,
+        13,
+        290,
+        2684,
+        13,
+        13,
+        290,
+        382,
+        261
+      ],
+      "reference_top5": [
+        {
+          "logit": 13.75,
+          "token_id": 261
+        },
+        {
+          "logit": 13.6875,
+          "token_id": 290
+        },
+        {
+          "logit": 13.125,
+          "token_id": 11
+        },
+        {
+          "logit": 12.875,
+          "token_id": 316
+        },
+        {
+          "logit": 12.625,
+          "token_id": 306
+        }
+      ],
+      "top1_same": false,
+      "top5_overlap": 0.0
+    }
+  ],
+  "reference": "ThinTensor BF16 streamed weights",
+  "reference_logits_npz": null,
+  "tokenizer": null,
+  "top1_same_all_records": false,
+  "trajectory": "benchmark_results/overnight_2026-07-22/gptoss_quality_trajectories/general_explanation.json"
+}

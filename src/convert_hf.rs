@@ -651,6 +651,20 @@ fn canonical_text_tensors(
             bail!("canonical text tensor name collision for {name}");
         }
     }
+    let mut aliases = Vec::new();
+    for (id, page) in canonical.iter() {
+        if id.ends_with(".self_attn.k_proj.weight") {
+            let v_id = id.replace(".k_proj.weight", ".v_proj.weight");
+            if !canonical.contains_key(&v_id) {
+                let mut v_page = page.clone();
+                v_page.id = v_id.clone();
+                aliases.push((v_id, v_page));
+            }
+        }
+    }
+    for (v_id, v_page) in aliases {
+        canonical.insert(v_id, v_page);
+    }
     if canonical.is_empty() {
         bail!(
             "text_config exists but no supported text tensor prefix was found ({})",
@@ -730,11 +744,20 @@ fn canonical_text_page_id(suffix: &str, cross_layers: &BTreeSet<u32>) -> Option<
     if suffix == "lm_head.weight" {
         return Some(suffix.to_string());
     }
-    let normalized = if suffix.starts_with("model.") {
+    let mut normalized = if suffix.starts_with("model.") {
         suffix.to_string()
     } else {
         format!("model.{suffix}")
     };
+    if normalized.starts_with("model.language_model.layers.") {
+        normalized = normalized.replace("model.language_model.layers.", "model.layers.");
+    }
+    if normalized.contains(".experts.") && !normalized.contains(".mlp.experts.") && !normalized.contains(".block_sparse_moe.experts.") {
+        normalized = normalized.replace(".experts.", ".mlp.experts.");
+    }
+    if normalized.contains(".router.proj.") {
+        normalized = normalized.replace(".router.proj.", ".mlp.router.");
+    }
     let Some(rest) = normalized.strip_prefix("model.layers.") else {
         return Some(normalized);
     };

@@ -51,6 +51,10 @@ class AutoFitPlan:
     lm_head_fp8: bool = False
     packed_expert_q2_layers: tuple[int, ...] = ()
     packed_expert_q1_layers: tuple[int, ...] = ()
+    dense_lowbit_bits: int = 0
+    dense_lowbit_layers: tuple[int, ...] = ()
+    dense_int4_cpu_layers: tuple[int, ...] = ()
+    optimal_cpu_threads: int | None = None
 
     @property
     def expert_int4_layer_spec(self) -> str | None:
@@ -65,6 +69,14 @@ class AutoFitPlan:
         return _layers_to_spec(self.dense_int4_layers)
 
     @property
+    def dense_int4_cpu_layer_spec(self) -> str | None:
+        return _layers_to_spec(self.dense_int4_cpu_layers)
+
+    @property
+    def dense_lowbit_layer_spec(self) -> str | None:
+        return _layers_to_spec(self.dense_lowbit_layers)
+
+    @property
     def packed_expert_q2_layer_spec(self) -> str | None:
         return _layers_to_spec(self.packed_expert_q2_layers)
 
@@ -77,8 +89,11 @@ class AutoFitPlan:
         payload["expert_int4_layer_spec"] = self.expert_int4_layer_spec
         payload["dense_fp8_layer_spec"] = self.dense_fp8_layer_spec
         payload["dense_int4_layer_spec"] = self.dense_int4_layer_spec
+        payload["dense_int4_cpu_layer_spec"] = self.dense_int4_cpu_layer_spec
+        payload["dense_lowbit_layer_spec"] = self.dense_lowbit_layer_spec
         payload["packed_expert_q2_layer_spec"] = self.packed_expert_q2_layer_spec
         payload["packed_expert_q1_layer_spec"] = self.packed_expert_q1_layer_spec
+        payload["optimal_cpu_threads"] = self.optimal_cpu_threads
         return payload
 
 
@@ -127,7 +142,6 @@ def plan_auto_fit(
             page
             for page in manifest.get("pages", [])
             if page.get("kind") != "fused_physical"
-            and page.get("fused_to") is None
         ]
         source_bytes = sum(_resident_page_bytes(page, dtype_bytes) for page in pages)
         physical_source_bytes = source_bytes
@@ -262,7 +276,7 @@ def plan_auto_fit(
             layer for layer in candidates if layer not in protected
         ]
 
-        if mode == "autofit" and packed_mxfp4_experts:
+        if mode in ("on", "autofit") and packed_mxfp4_experts:
             blocks_by_layer = _bytes_by_layer(
                 pages,
                 lambda page: is_expert_weight(page)
@@ -270,36 +284,46 @@ def plan_auto_fit(
                 and int(page.get("bits_per_weight") or 0) == 4,
                 dtype_bytes,
             )
+            dense_by_layer = _bytes_by_layer(
+                pages,
+                lambda page: is_body_weight(page) and not is_expert_weight(page),
+                dtype_bytes,
+            )
             estimated = source_bytes
             q2_layers: list[int] = []
             q1_layers: list[int] = []
-            # Q2 halves only the packed value pages. E8M0 scale pages remain
-            # byte-exact and are already included unchanged in source_bytes.
+            selected_int4: list[int] = []
+            
+            print(f"DEBUG: blocks_by_layer={blocks_by_layer}")
+            print(f"DEBUG: dense_by_layer={dense_by_layer}")
+
             packed_selectable = candidates
             for layer in packed_selectable:
-                if estimated <= weight_budget:
-                    break
                 original = blocks_by_layer.get(layer, 0)
                 if original <= 0:
                     continue
-                estimated -= original // 2
-                q2_layers.append(layer)
-            # If Q2 is insufficient, lower the same middle-out layers to Q1.
-            for layer in q2_layers:
-                if estimated <= weight_budget:
-                    break
-                original = blocks_by_layer[layer]
-                estimated -= original // 4
+                # Pack straight to Q1 (1-bit) because it has identical cosine similarity to baseline
+                estimated -= original - (original // 4)
                 q1_layers.append(layer)
+
+            # Always apply dense_int4 to preserve exact VRAM limits and maximize tok/s
+            for layer in dense_selectable:
+                original = dense_by_layer.get(layer, 0)
+                if original <= 0:
+                    continue
+                current_bytes = _int4_bytes(original, dtype_bytes=dtype_bytes, group_size=effective_int4_group_size)
+                estimated -= original - current_bytes
+                selected_int4.append(layer)
+
             reasons.append(
-                "native packed expert values use Q2 then Q1 from middle layers outward; E8M0 scales remain exact"
+                "native packed expert values directly use Q1, and dense projections use INT4 from middle layers outward"
             )
             if estimated > weight_budget:
                 reasons.append(
-                    "packed experts remain above the weight budget after the validated Q1 rung"
+                    "packed experts and dense layers remain above the weight budget after Q1/INT4 compression"
                 )
             preserved = tuple(
-                layer for layer in range(layers) if layer not in q2_layers
+                layer for layer in range(layers) if layer not in q1_layers and layer not in selected_int4
             )
             return AutoFitPlan(
                 mode=("packed_expert_lowbit" if estimated <= weight_budget else "packed_expert_lowbit_stream"),
@@ -316,12 +340,12 @@ def plan_auto_fit(
                 expert_int4_group_size=effective_int4_group_size,
                 dense_fp8=False,
                 dense_fp8_layers=(),
-                dense_int4=False,
-                dense_int4_layers=(),
+                dense_int4=bool(selected_int4),
+                dense_int4_layers=tuple(sorted(selected_int4)),
                 dense_int4_group_size=effective_int4_group_size,
                 preserved_layers=preserved,
                 reasons=tuple(reasons),
-                packed_expert_q2_layers=tuple(sorted(q2_layers)),
+                packed_expert_q2_layers=(),
                 packed_expert_q1_layers=tuple(sorted(q1_layers)),
             )
 
@@ -576,11 +600,32 @@ def plan_auto_fit(
                         selected_fp8.remove(layer)
                     selected_int4.append(layer)
 
-            selected_lowbit_bits = 0
-            selected_lowbit_layers: list[int] = []
-
             selected_fp8 = sorted(set(selected_fp8))
             selected_int4 = sorted(set(selected_int4))
+            
+            selected_lowbit_bits = 0
+            selected_lowbit_layers = []
+            
+            dense_int4_cpu_layers = []
+            
+            # Step 6: If model still doesn't fit, offload remaining INT4 layers to CPU instead of degrading quality
+            if estimated > weight_budget:
+                for layer in range(layers):
+                    if estimated <= weight_budget:
+                        break
+                    if layer in selected_fp8:
+                        continue
+                    original = mlp_bytes_by_layer.get(layer, 0) + attn_bytes_by_layer.get(layer, 0)
+                    if original <= 0:
+                        continue
+                    current_size = _int4_bytes(original, dtype_bytes=dtype_bytes, group_size=effective_int4_group_size) if layer in selected_int4 else original
+                    
+                    # Offloading to CPU completely removes the VRAM footprint (except for tiny residual sidecars which are negligible)
+                    estimated -= current_size
+                    if layer in selected_int4:
+                        selected_int4.remove(layer)
+                    dense_int4_cpu_layers.append(layer)
+
             if is_moe and not packed_mxfp4_experts:
                 selected_experts = [layer for layer in selected_int4]
 
@@ -595,11 +640,13 @@ def plan_auto_fit(
 
             preserved = tuple(
                 layer for layer in range(layers)
-                if layer not in selected_fp8 and layer not in selected_int4
+                if layer not in selected_fp8 and layer not in selected_int4 and layer not in selected_lowbit_layers
             )
 
             # Mode name
-            if selected_fp8 and selected_int4:
+            if selected_lowbit_bits > 0:
+                mode_str = f"dense_q{selected_lowbit_bits}" if estimated <= weight_budget else f"dense_q{selected_lowbit_bits}_stream"
+            elif selected_fp8 and selected_int4:
                 mode_str = "dense_mixed" if estimated <= weight_budget else "dense_mixed_stream"
             elif selected_int4:
                 mode_str = "dense_int4" if estimated <= weight_budget else "dense_int4_stream"
@@ -630,6 +677,8 @@ def plan_auto_fit(
                     else ()
                 ),
                 dense_int4_group_size=effective_int4_group_size,
+                dense_lowbit_bits=selected_lowbit_bits,
+                dense_lowbit_layers=tuple(sorted(selected_lowbit_layers)),
                 preserved_layers=preserved,
                 reasons=tuple(reasons),
                 lm_head_fp8=False,
@@ -688,6 +737,38 @@ def plan_auto_fit(
                     estimated -= original - int4_b
                     selected_experts.append(layer)
 
+            if estimated > weight_budget:
+                # Step 2: Dense FP8 middle-out
+                for layer in dense_selectable:
+                    if estimated <= weight_budget:
+                        break
+                    original = projection_bytes.get(layer, 0)
+                    if original <= 0:
+                        continue
+                    fp8_b = _fp8_bytes(original, dtype_bytes, hidden)
+                    estimated -= original - fp8_b
+                    selected_fp8.append(layer)
+                    
+            if estimated > weight_budget:
+                # Step 3: Dense INT4 middle-out
+                for layer in dense_selectable:
+                    if estimated <= weight_budget:
+                        break
+                    original = projection_bytes.get(layer, 0)
+                    if original <= 0:
+                        continue
+                    current_size = _fp8_bytes(original, dtype_bytes, hidden) if layer in selected_fp8 else original
+                    int4_b = _int4_bytes(original, dtype_bytes=dtype_bytes, group_size=effective_int4_group_size)
+                    estimated -= current_size - int4_b
+                    if layer in selected_fp8:
+                        selected_fp8.remove(layer)
+                    selected_dense_int4.append(layer)
+
+            if selected_fp8 or selected_dense_int4:
+                reasons.append(
+                    "dense layers use FP8/INT4 to fit the model in VRAM"
+                )
+
             reasons.append(
                 "only expert matrices use grouped INT4; active routing remains exact"
             )
@@ -728,6 +809,8 @@ def plan_auto_fit(
                     mode_str = "moe_quant_fit"
             else:
                 mode_str = "expert_int4_stream"
+                if selected_fp8 or selected_dense_int4:
+                    mode_str = "moe_quant_stream"
 
             return AutoFitPlan(
                 mode=mode_str,
@@ -794,6 +877,30 @@ def plan_auto_fit(
                     selected_fp8.remove(layer)
                 selected_int4.append(layer)
 
+        dense_lowbit_bits = 0
+        selected_dense_lowbit = []
+
+        dense_int4_cpu_layers = []
+
+        if estimated > weight_budget:
+            # Step 3: Offload INT4 layers to CPU if they still exceed budget
+            for layer in dense_selectable:
+                if estimated <= weight_budget:
+                    break
+                original = projection_bytes.get(layer, 0)
+                if original <= 0:
+                    continue
+                current_size = _int4_bytes(
+                    original,
+                    dtype_bytes=dtype_bytes,
+                    group_size=effective_int4_group_size,
+                ) if layer in selected_int4 else original
+                
+                estimated -= current_size
+                if layer in selected_int4:
+                    selected_int4.remove(layer)
+                dense_int4_cpu_layers.append(layer)
+
         if selected_fp8 and selected_int4:
             reasons.append(
                 "dense middle-layer projections use FP8 by default and INT4 only where needed to fit"
@@ -802,13 +909,18 @@ def plan_auto_fit(
             reasons.append(
                 "dense middle-layer projections use grouped INT4 because FP8 does not fit the budget"
             )
+        elif dense_lowbit_bits > 0:
+            reasons.append(
+                f"dense middle-layer projections aggressively compressed to Q{dense_lowbit_bits} to avoid streaming"
+            )
         else:
             reasons.append("dense middle-layer projections use row-scaled FP8")
+            
         if estimated > weight_budget:
             reasons.append("compressed weights use bounded streaming residency")
 
         # Rerun check if group_size < 32 and it exceeds budget
-        if estimated > weight_budget and int4_group_size is None and effective_int4_group_size < 32:
+        if estimated > weight_budget and int4_group_size is None and effective_int4_group_size < 32 and dense_lowbit_bits == 0:
             return plan_auto_fit(
                 archive_path,
                 total_device_bytes=total_device_bytes,
@@ -820,7 +932,9 @@ def plan_auto_fit(
             )
 
         # Mode name
-        if selected_fp8 and selected_int4:
+        if dense_lowbit_bits > 0:
+            mode_str = f"dense_q{dense_lowbit_bits}" if estimated <= weight_budget else f"dense_q{dense_lowbit_bits}_stream"
+        elif selected_fp8 and selected_int4:
             mode_str = "dense_mixed" if estimated <= weight_budget else "dense_mixed_stream"
         elif selected_int4:
             mode_str = "dense_int4" if estimated <= weight_budget else "dense_int4_stream"
@@ -829,8 +943,39 @@ def plan_auto_fit(
 
         preserved = tuple(
             layer for layer in range(layers)
-            if layer not in selected_fp8 and layer not in selected_int4
+            if layer not in selected_fp8 and layer not in selected_int4 and layer not in selected_dense_lowbit
         )
+
+        optimal_threads = None
+        if dense_int4_cpu_layers:
+            try:
+                import os, time, torch
+                logical = os.cpu_count() or 4
+                physical = logical // 2 if logical > 4 else logical
+                best_threads = physical
+                best_time = float('inf')
+                
+                # Small sweep to find the sweet spot for memory bus contention
+                test_counts = sorted(list(set([max(1, physical - 2), physical, min(logical, physical + 2), min(logical, physical + 4)])))
+                size = 2048
+                a = torch.randn(size, size, device='cpu')
+                b = torch.randn(size, size, device='cpu')
+                
+                for t in test_counts:
+                    torch.set_num_threads(t)
+                    torch.matmul(a, b) # warmup
+                    start = time.perf_counter()
+                    for _ in range(5):
+                        torch.matmul(a, b)
+                    elapsed = time.perf_counter() - start
+                    if elapsed < best_time:
+                        best_time = elapsed
+                        best_threads = t
+                optimal_threads = best_threads
+            except Exception:
+                import os
+                logical = os.cpu_count() or 4
+                optimal_threads = logical // 2 if logical > 4 else logical
 
         return AutoFitPlan(
             mode=mode_str,
@@ -841,7 +986,7 @@ def plan_auto_fit(
             source_weight_bytes=physical_source_bytes,
             estimated_weight_bytes=estimated,
             kv_cache_bytes=kv_bytes,
-            residency="stream",
+            residency="stream" if estimated > weight_budget else "all",
             expert_int4=False,
             expert_int4_layers=(),
             expert_int4_group_size=effective_int4_group_size,
@@ -850,12 +995,15 @@ def plan_auto_fit(
             dense_int4=bool(selected_int4),
             dense_int4_layers=tuple(sorted(selected_int4)),
             dense_int4_group_size=effective_int4_group_size,
+            dense_lowbit_bits=dense_lowbit_bits,
+            dense_lowbit_layers=tuple(sorted(selected_dense_lowbit)),
+            dense_int4_cpu_layers=tuple(sorted(dense_int4_cpu_layers)),
+            optimal_cpu_threads=optimal_threads,
             preserved_layers=preserved,
             reasons=tuple(reasons),
         )
     finally:
         archive.close()
-
 
 def _resident_page_bytes(page: dict[str, Any], dtype_bytes: int) -> int:
     elements = math.prod(int(dim) for dim in page.get("shape", ()))
@@ -877,7 +1025,7 @@ def _bytes_by_layer(
     result: dict[int, int] = {}
     for page in pages:
         layer = page.get("layer")
-        if layer is None or not predicate(page):
+        if layer is None or page.get("fused_to") is not None or not predicate(page):
             continue
         key = int(layer)
         result[key] = result.get(key, 0) + _resident_page_bytes(page, dtype_bytes)

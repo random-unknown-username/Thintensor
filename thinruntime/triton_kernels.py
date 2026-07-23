@@ -44,6 +44,11 @@ def _single_token_gqa_attention_kernel(
         other=0.0,
     ).to(tl.float32)
 
+    if hasattr(tokens, "type") and tokens.type.is_ptr():
+        tokens_val = tl.load(tokens).to(tl.int32)
+    else:
+        tokens_val = tokens
+
     if HAS_SINKS:
         running_max = tl.load(sinks + head).to(tl.float32)
         running_den = 1.0
@@ -54,7 +59,7 @@ def _single_token_gqa_attention_kernel(
 
     for token_start in range(0, token_bucket, block_t):
         offsets_t = token_start + tl.arange(0, block_t)
-        mask_t = offsets_t < tokens
+        mask_t = offsets_t < tokens_val
         
         # Load keys
         key = tl.load(
@@ -626,7 +631,7 @@ def _fp8_bf16_tensorcore_matvec_kernel(
             None,
             "bf16",
             acc=accumulator,
-            fast_math=True,
+            fast_math=False,
         )
     scale = tl.load(scales + offsets_m, mask=mask_m, other=0.0)
     result = tl.sum(accumulator, axis=1) / BLOCK_N
@@ -727,7 +732,7 @@ def _mxfp4_bf16_tensorcore_matvec_kernel(
             None,
             "bf16",
             acc=accumulator,
-            fast_math=True,
+            fast_math=False,
         )
         if HAS_BINARY_RESIDUAL:
             pair_index = start_k // 2 + tl.arange(0, BLOCK_K // 2)
@@ -771,7 +776,7 @@ def _mxfp4_bf16_tensorcore_matvec_kernel(
                 None,
                 "bf16",
                 acc=accumulator,
-                fast_math=True,
+                fast_math=False,
             )
     result = tl.sum(accumulator, axis=1) / BLOCK_N
     if HAS_POST_SCALE:
@@ -850,7 +855,7 @@ def _dual_mxfp4_bf16_tensorcore_matvec_kernel(
             None,
             "bf16",
             acc=accumulator,
-            fast_math=True,
+            fast_math=False,
         )
     result = tl.sum(accumulator, axis=1) / BLOCK_N
     tl.store(y + projection * rows + offsets_m, result, mask=mask_m)
@@ -915,7 +920,7 @@ def _mxfp4_selected_tensorcore_matvec_kernel(
             None,
             "bf16",
             acc=accumulator,
-            fast_math=True,
+            fast_math=False,
         )
     result = tl.sum(accumulator, axis=1) / BLOCK_N
     tl.store(
@@ -1118,7 +1123,7 @@ def _mxfp_ternary_selected_tensorcore_matvec_kernel(
             None,
             "bf16",
             acc=accumulator,
-            fast_math=True,
+            fast_math=False,
         )
     result = tl.sum(accumulator, axis=1) / BLOCK_N
     tl.store(
@@ -2046,7 +2051,7 @@ def _multi_scaled_tensorcore_matvec_kernel(
                 None,
                 "bf16",
                 acc=accumulator,
-                fast_math=True,
+                fast_math=False,
             )
         else:
             accumulator += tl.dot(
@@ -5211,15 +5216,16 @@ class TritonDecodeBackend:
         kv_heads: int,
         head_dim: int,
         sinks: torch.Tensor | None = None,
+        active_tokens: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
-        tokens = int(keys.shape[1])
-        if tokens <= 0:
+        tokens = int(keys.shape[1]) if active_tokens is None else active_tokens
+        if isinstance(tokens, int) and tokens <= 0:
             raise ValueError("attention requires at least one KV token")
         if head_dim > 256:
             raise ValueError(
                 "fused single-token attention supports head_dim <= 256"
             )
-        token_bucket = max(16, triton.next_power_of_2(tokens))
+        token_bucket = max(16, triton.next_power_of_2(int(keys.shape[1])))
         block_d = triton.next_power_of_2(head_dim)
         block_t = int(
             os.environ.get("THINTENSOR_ATTENTION_BLOCK_T", "16")
@@ -5273,7 +5279,7 @@ class TritonDecodeBackend:
                 kv_heads,
                 head_dim,
             )
-        token_bucket = max(16, triton.next_power_of_2(tokens))
+        token_bucket = max(16, triton.next_power_of_2(int(keys.shape[1])))
         splits = min(8, max(2, token_bucket // 128))
         partial_count = heads * splits
         partial_values = partial_count * head_dim
@@ -5498,7 +5504,7 @@ class TritonDecodeBackend:
         block_n = triton.next_power_of_2(cols)
 
         num_programs = 64
-        block_m = 32
+        block_m = 64
 
         if (
             self._persistent_argmax_partial_vals is None
@@ -5532,7 +5538,7 @@ class TritonDecodeBackend:
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             NUM_PROGRAMS=num_programs,
-            num_warps=8,
+            num_warps=4,
         )
         return self._argmax_out_idx
 

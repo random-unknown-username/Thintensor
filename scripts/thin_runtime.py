@@ -966,7 +966,6 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             and (
                 args.residency == "all"
                 or isinstance(weights, ThinGpuPagePool)
-                and weights.is_fully_pinned
             )
             and args.device == "cuda"
         ):
@@ -987,7 +986,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
                 token_id = runtime.next_token_tensor(hidden)
             else:
                 if getattr(runtime, "_cuda_graphs_enabled", False):
-                    token_id = runtime.replay_cuda_graph(token_id)
+                    token_id = runtime.replay_cuda_graph(token_id, token_index_offset + step)
                 else:
                     hidden = runtime.forward_token(
                         token_id,

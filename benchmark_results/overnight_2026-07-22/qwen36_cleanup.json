@@ -1,0 +1,24 @@
+{
+  "model": "Qwen/Qwen3.6-27B",
+  "completed_at": "2026-07-22",
+  "archive_removed": "/home/satvik/.cache/thintensor/archives/Qwen--Qwen3.6-27B.thin",
+  "archive_bytes_removed": 53792526418,
+  "archive_sidecars_removed": [
+    "Qwen--Qwen3.6-27B.thin.int4-calibration.json",
+    "Qwen--Qwen3.6-27B.thin.conversion-plan.json",
+    "Qwen--Qwen3.6-27B.thin.conversion-journal.json"
+  ],
+  "source_metadata_directory_removed": "/home/satvik/.cache/thintensor/models/Qwen--Qwen3.6-27B",
+  "derived_cache_removal": {
+    "method": "recomputed derived-cache keys from the verified Qwen archive page checksums and the exercised INT4/Q2/Q3 configurations",
+    "files_removed": 784,
+    "bytes_removed": 21859493584
+  },
+  "preserved_shared_cache": {
+    "archive": "qwen3-1.7b-smoke.thin",
+    "derived_files": 588,
+    "derived_bytes": 1697276700
+  },
+  "free_bytes_before": 12808536064,
+  "free_bytes_after": 88486363136
+}

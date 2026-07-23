@@ -1,0 +1,48 @@
+{
+  "model": "Qwen/Qwen3.6-27B",
+  "protocol": "fresh public CLI child process; causal-KV decode; 10 warmup tokens; 200 measured tokens; five-run median",
+  "accepted": [
+    {
+      "name": "calibrated-affine-int4-g32-with-fp8-edges",
+      "configuration": "all dense text layers are input-RMS weighted affine INT4, group 32; gate_up/down_proj/qkv/o_proj layers 0,63 remain FP8; BF16 LM head",
+      "quality": "top-1 exact at all fixed full-vocabulary trajectory records across coding, general explanation, mathematics, long continuation, and instruction style",
+      "normal_cli": "archive-adjacent calibration record selects this configuration automatically"
+    },
+    {
+      "name": "7gb-page-pool-budget",
+      "configuration": "archive-calibrated 7,000,000,000-byte page-pool budget",
+      "baseline_median_tokens_per_s": 0.8104400379159307,
+      "candidate_median_tokens_per_s": 0.8413752594130829,
+      "gain_percent": 3.817089,
+      "keep_reason": "five independent 200-token runs; more persistent pages and 3.82% higher median without a quality change"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "pageable-staging",
+      "result": "0.6913889344713452 tok/s",
+      "reason": "removing pinned staging raised transfer time to 284.899 s and reduced effective bandwidth to 12.480 GB/s"
+    },
+    {
+      "name": "7.5gb-page-pool-budget",
+      "reason": "CUDA OOM in warmup while allocating an 86 MiB FP8 layer with only 10 MiB free"
+    },
+    {
+      "name": "affine-int4-g64-fp8-edges",
+      "reason": "instruction-style trajectory lost top-1 at a recorded point; coding minimum cosine fell to 0.969819"
+    },
+    {
+      "name": "symmetric-int4-g32-fp8-edges",
+      "reason": "coding minimum cosine only 0.750267; affine calibration is required"
+    },
+    {
+      "name": "dense-q3-fp8-edges",
+      "reason": "instruction-style top-1 mismatch and minimum cosine 0.928329"
+    },
+    {
+      "name": "dense-q2-fp8-edges",
+      "reason": "coding minimum cosine 0.219842 and top-1 mismatches"
+    }
+  ],
+  "known_control_bug": "Earlier auto_mixed/protected result names predate the fixed dense_int4_cpu_layers=None parser behavior and are controls only, not accepted configurations."
+}

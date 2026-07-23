@@ -1,0 +1,432 @@
+{
+  "archive": "/home/satvik/.cache/thintensor/archives/qwen3-1.7b-smoke.thin",
+  "candidate": "ThinTensor selected runtime flags",
+  "candidate_flags": {
+    "cpu_embed": true,
+    "dense_int4": false,
+    "dense_int4_calibration_covariance_npz": null,
+    "dense_int4_calibration_json": null,
+    "dense_int4_calibration_npz": null,
+    "dense_int4_cpu_layers": null,
+    "dense_int4_gpu_ops": null,
+    "dense_int4_gpu_suffixes": null,
+    "dense_int4_group_size": 128,
+    "dense_int4_layers": null,
+    "dense_lowbit_bits": 2,
+    "dense_lowbit_layers": null,
+    "dense_lowbit_suffixes": null,
+    "down_fp8_layers": null,
+    "down_proj_fp8": false,
+    "embed_fp8": false,
+    "fp8_layers": null,
+    "fused_residual_norm": false,
+    "fused_rope": false,
+    "fused_scaled_mlp": false,
+    "gate_up_fp8": false,
+    "lm_head_int4_group_size": 128,
+    "mlp_fp8": false,
+    "moe_top_k_limit": 0,
+    "moe_top_k_renorm": true,
+    "mxfp4_down_layers": null,
+    "mxfp4_gate_up_layers": null,
+    "mxfp4_o_layers": null,
+    "mxfp4_qkv_layers": null,
+    "mxfp4_selected_tensorcore": false,
+    "o_fp8_layers": null,
+    "o_proj_fp8": false,
+    "packed_expert_q1_layers": null,
+    "packed_expert_q2_layers": null,
+    "pinned_staging": true,
+    "qkv_fp8": false,
+    "qkv_fp8_layers": null
+  },
+  "minimum_cosine_similarity": -0.6593326330184937,
+  "minimum_generated_token_match_rate": 0.0,
+  "minimum_top5_overlap": 0.0,
+  "record_count": 3,
+  "records": [
+    {
+      "archive": "/home/satvik/.cache/thintensor/archives/qwen3-1.7b-smoke.thin",
+      "candidate_tokens": [
+        57960,
+        57960,
+        57960,
+        57960,
+        13,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960
+      ],
+      "candidate_top5": [
+        {
+          "logit": 11.875,
+          "token_id": 57960
+        },
+        {
+          "logit": 11.4375,
+          "token_id": 13
+        },
+        {
+          "logit": 10.6875,
+          "token_id": 624
+        },
+        {
+          "logit": 10.5,
+          "token_id": 259
+        },
+        {
+          "logit": 10.4375,
+          "token_id": 51
+        }
+      ],
+      "cosine_similarity": -0.6593326330184937,
+      "decode_step": 1,
+      "generated_token_match_rate": 0.0,
+      "kv_tokens_attended": 27,
+      "kv_tokens_expected": 27,
+      "max_abs_logit_error": 31.75,
+      "mean_abs_logit_error": 9.714807510375977,
+      "prefill_length": 27,
+      "prompt": "Hello",
+      "reference_tokens": [
+        576,
+        11,
+        279,
+        28431,
+        3728,
+        315,
+        2319,
+        5819,
+        315,
+        5005,
+        11,
+        279,
+        3766,
+        429,
+        279,
+        13,
+        323,
+        279,
+        6500,
+        11,
+        11,
+        6500,
+        82,
+        11,
+        323,
+        279,
+        3019,
+        3019,
+        323,
+        279,
+        279,
+        429
+      ],
+      "reference_top5": [
+        {
+          "logit": 21.625,
+          "token_id": 576
+        },
+        {
+          "logit": 20.75,
+          "token_id": 220
+        },
+        {
+          "logit": 20.75,
+          "token_id": 3155
+        },
+        {
+          "logit": 20.375,
+          "token_id": 5443
+        },
+        {
+          "logit": 20.125,
+          "token_id": 5209
+        }
+      ],
+      "top1_same": false,
+      "top5_overlap": 0.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/archives/qwen3-1.7b-smoke.thin",
+      "candidate_tokens": [
+        57960,
+        57960,
+        57960,
+        57960,
+        13,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960
+      ],
+      "candidate_top5": [
+        {
+          "logit": 12.5625,
+          "token_id": 57960
+        },
+        {
+          "logit": 11.9375,
+          "token_id": 13
+        },
+        {
+          "logit": 11.3125,
+          "token_id": 9285
+        },
+        {
+          "logit": 11.25,
+          "token_id": 259
+        },
+        {
+          "logit": 10.9375,
+          "token_id": 51
+        }
+      ],
+      "cosine_similarity": -0.5900239944458008,
+      "decode_step": 8,
+      "generated_token_match_rate": 0.0,
+      "kv_tokens_attended": 34,
+      "kv_tokens_expected": 34,
+      "max_abs_logit_error": 28.875,
+      "mean_abs_logit_error": 8.737046241760254,
+      "prefill_length": 27,
+      "prompt": "Hello",
+      "reference_tokens": [
+        576,
+        11,
+        279,
+        28431,
+        3728,
+        315,
+        2319,
+        5819,
+        315,
+        5005,
+        11,
+        279,
+        3766,
+        429,
+        279,
+        13,
+        323,
+        279,
+        6500,
+        11,
+        11,
+        6500,
+        82,
+        11,
+        323,
+        279,
+        3019,
+        3019,
+        323,
+        279,
+        279,
+        429
+      ],
+      "reference_top5": [
+        {
+          "logit": 21.375,
+          "token_id": 5819
+        },
+        {
+          "logit": 20.875,
+          "token_id": 6220
+        },
+        {
+          "logit": 20.75,
+          "token_id": 4938
+        },
+        {
+          "logit": 20.5,
+          "token_id": 8527
+        },
+        {
+          "logit": 20.5,
+          "token_id": 3542
+        }
+      ],
+      "top1_same": false,
+      "top5_overlap": 0.0
+    },
+    {
+      "archive": "/home/satvik/.cache/thintensor/archives/qwen3-1.7b-smoke.thin",
+      "candidate_tokens": [
+        57960,
+        57960,
+        57960,
+        57960,
+        13,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960,
+        57960
+      ],
+      "candidate_top5": [
+        {
+          "logit": 13.125,
+          "token_id": 57960
+        },
+        {
+          "logit": 11.6875,
+          "token_id": 259
+        },
+        {
+          "logit": 11.375,
+          "token_id": 13
+        },
+        {
+          "logit": 11.25,
+          "token_id": 624
+        },
+        {
+          "logit": 11.1875,
+          "token_id": 9285
+        }
+      ],
+      "cosine_similarity": -0.5028490424156189,
+      "decode_step": 32,
+      "generated_token_match_rate": 0.0,
+      "kv_tokens_attended": 58,
+      "kv_tokens_expected": 58,
+      "max_abs_logit_error": 28.75,
+      "mean_abs_logit_error": 8.268165588378906,
+      "prefill_length": 27,
+      "prompt": "Hello",
+      "reference_tokens": [
+        576,
+        11,
+        279,
+        28431,
+        3728,
+        315,
+        2319,
+        5819,
+        315,
+        5005,
+        11,
+        279,
+        3766,
+        429,
+        279,
+        13,
+        323,
+        279,
+        6500,
+        11,
+        11,
+        6500,
+        82,
+        11,
+        323,
+        279,
+        3019,
+        3019,
+        323,
+        279,
+        279,
+        429
+      ],
+      "reference_top5": [
+        {
+          "logit": 22.0,
+          "token_id": 429
+        },
+        {
+          "logit": 21.75,
+          "token_id": 3542
+        },
+        {
+          "logit": 20.125,
+          "token_id": 10695
+        },
+        {
+          "logit": 19.875,
+          "token_id": 5435
+        },
+        {
+          "logit": 19.5,
+          "token_id": 5424
+        }
+      ],
+      "top1_same": false,
+      "top5_overlap": 0.0
+    }
+  ],
+  "reference": "ThinTensor BF16 streamed weights",
+  "reference_logits_npz": null,
+  "tokenizer": null,
+  "top1_same_all_records": false,
+  "trajectory": "benchmark_results/overnight_run/smoke_qwen3_1.7b_quality/instruction_style.json"
+}

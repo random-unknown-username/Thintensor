@@ -249,26 +249,27 @@ def _semantic_reasons(
                 reasons.append(f"native tensor layout is missing {name}")
         if family != "hybrid_decoder":
             separate_qkv = all(
-                f"model.layers.0.self_attn.{part}_proj.weight" in names
+                any(f"self_attn.{part}_proj.weight" in name for name in names)
                 for part in ("q", "k", "v")
             )
-            fused_qkv = "model.layers.0.self_attn.qkv_proj.weight" in names
+            fused_qkv = any("self_attn.qkv_proj.weight" in name for name in names)
             if not separate_qkv and not fused_qkv:
                 reasons.append("native tensor layout requires separate or fused QKV")
         if family in {"decoder_dense", "hybrid_decoder"}:
             separate_mlp = all(
-                f"model.layers.0.mlp.{part}_proj.weight" in names
+                any(f"mlp.{part}_proj.weight" in name for name in names)
                 for part in ("gate", "up", "down")
             )
             fused_mlp = (
-                "model.layers.0.mlp.gate_up_proj.weight" in names
-                and "model.layers.0.mlp.down_proj.weight" in names
+                any("mlp.gate_up_proj.weight" in name for name in names)
+                and any("mlp.down_proj.weight" in name for name in names)
             )
             if not separate_mlp and not fused_mlp:
                 reasons.append("native tensor layout requires a gated MLP")
         elif not any(
             name.startswith("model.layers.0.mlp.experts.")
             or name.startswith("model.layers.0.block_sparse_moe.experts.")
+            or "experts." in name
             for name in names
         ):
             reasons.append("native MoE layout requires packed or separate experts")

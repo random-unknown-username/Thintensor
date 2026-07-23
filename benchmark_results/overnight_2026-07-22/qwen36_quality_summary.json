@@ -1,0 +1,20 @@
+{
+  "model": "Qwen/Qwen3.6-27B",
+  "source_revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+  "archive": "/home/satvik/.cache/thintensor/archives/Qwen--Qwen3.6-27B.thin",
+  "reference": "official Hugging Face Qwen3.5 implementation, sequential full-vocabulary logits",
+  "selected_profile": {
+    "dense_int4": "all text layers, group size 32, input-RMS weighted affine calibration",
+    "fp8_edges": "gate_up, down_proj, qkv, and o_proj in layers 0 and 63",
+    "calibration_json": "qwen36_hf_calibration_coding.json",
+    "calibration_npz": "qwen36_hf_calibration_coding_stats.npz"
+  },
+  "fixed_trajectory_results": {
+    "coding": {"minimum_cosine": 0.9956226348876953, "minimum_top5_overlap": 0.8, "top1_all_records": true},
+    "general_explanation": {"minimum_cosine": 0.9955862164497375, "minimum_top5_overlap": 1.0, "top1_all_records": true},
+    "mathematics": {"minimum_cosine": 0.9954721331596375, "minimum_top5_overlap": 1.0, "top1_all_records": true},
+    "long_continuation": {"minimum_cosine": 0.9944778680801392, "minimum_top5_overlap": 1.0, "top1_all_records": true},
+    "instruction_style": {"minimum_cosine": 0.9980615377426147, "minimum_top5_overlap": 0.8, "top1_all_records": true}
+  },
+  "verdict": "accepted: all five fixed trajectories preserved top-1 at every recorded full-vocabulary comparison point"
+}

@@ -105,6 +105,16 @@ def resolve_input(value: str) -> dict:
             "error": f"Archive not found: {value}",
         }
 
+    # 2b. Implicit archive reference (bare name or HF ID) that exists in cache
+    possible_archive = cached_archive_path(value)
+    if possible_archive.exists():
+        return {
+            "kind": "archive",
+            "path": str(possible_archive),
+            "needs_pull": False,
+            "needs_convert": False,
+        }
+
     # 3. Local HF directory
     if is_hf_directory(value):
         archive = cached_archive_path(Path(value).name)

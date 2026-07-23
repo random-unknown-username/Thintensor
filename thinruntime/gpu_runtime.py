@@ -5542,11 +5542,8 @@ class ThinGpuCausalLMRuntime:
                 for layer in range(self.layers)
             )
             self._gemma4_qkv_buffer = torch.empty(
-                self.heads * self.descriptor.global_head_dim
-                + 2 * max(
-                    self.descriptor.head_dim,
-                    self.descriptor.global_head_dim,
-                ),
+                self.heads * max(self.descriptor.head_dim, self.descriptor.global_head_dim)
+                + 2 * self.descriptor.num_key_value_heads * max(self.descriptor.head_dim, self.descriptor.global_head_dim),
                 device=self.device,
                 dtype=self._final_norm_weight.dtype,
             )
@@ -7907,7 +7904,12 @@ class ThinGpuCausalLMRuntime:
         first_shared = (
             self.layers - self.descriptor.num_kv_shared_layers
         )
-        if self.kernel_backend is not None and self.gemma4_triton_attention:
+        if (
+            self.kernel_backend is not None 
+            and self.gemma4_triton_attention
+            and q_weight.device.type == "cuda"
+            and self._weight_scale(q_weight) is None
+        ):
             assert self._gemma4_qkv_buffer is not None
             if layer < first_shared:
                 k_weight = self.weights.tensor(
@@ -7947,7 +7949,10 @@ class ThinGpuCausalLMRuntime:
                 k_raw = None
                 v_raw = None
         else:
-            q_raw = torch.mv(q_weight, hidden)
+            if getattr(self, "_gemma4_qkv_buffer", None) is None:
+                q_raw = self._runtime_matvec(q_weight, hidden, torch.empty(q_weight.shape[0], device=hidden.device, dtype=hidden.dtype))
+            else:
+                q_raw = self._runtime_matvec(q_weight, hidden, self._gemma4_qkv_buffer[:int(q_weight.shape[0])])
             k_raw = None
             v_raw = None
         q = q_raw.reshape(self.heads, head_dim)
@@ -7963,22 +7968,16 @@ class ThinGpuCausalLMRuntime:
 
         if layer < first_shared:
             if k_raw is None or v_raw is None:
-                k = torch.mv(
-                    self.weights.tensor(
-                        _layer_tensor(
-                            layer, "self_attn.k_proj.weight"
-                        )
-                    ),
-                    hidden,
-                ).reshape(-1, head_dim)
-                v = torch.mv(
-                    self.weights.tensor(
-                        _layer_tensor(
-                            layer, "self_attn.v_proj.weight"
-                        )
-                    ),
-                    hidden,
-                ).reshape(-1, head_dim)
+                k_weight = self.weights.tensor(_layer_tensor(layer, "self_attn.k_proj.weight"))
+                v_weight = self.weights.tensor(_layer_tensor(layer, "self_attn.v_proj.weight"))
+                if getattr(self, "_gemma4_qkv_buffer", None) is None:
+                    k_out = torch.empty(k_weight.shape[0], device=hidden.device, dtype=hidden.dtype)
+                    v_out = torch.empty(v_weight.shape[0], device=hidden.device, dtype=hidden.dtype)
+                else:
+                    k_out = self._gemma4_qkv_buffer[int(q_weight.shape[0]) : int(q_weight.shape[0]) + int(k_weight.shape[0])]
+                    v_out = self._gemma4_qkv_buffer[int(q_weight.shape[0]) + int(k_weight.shape[0]) : int(q_weight.shape[0]) + int(k_weight.shape[0]) + int(v_weight.shape[0])]
+                k = self._runtime_matvec(k_weight, hidden, k_out).reshape(-1, head_dim)
+                v = self._runtime_matvec(v_weight, hidden, v_out).reshape(-1, head_dim)
             else:
                 k = k_raw.reshape(-1, head_dim)
                 v = v_raw.reshape(-1, head_dim)
@@ -8030,8 +8029,8 @@ class ThinGpuCausalLMRuntime:
             _layer_tensor(layer, "self_attn.o_proj.weight")
         )
         if self._gemma4_projection_buffer is not None:
-            return torch.mv(o_weight, mixed, out=self._gemma4_projection_buffer)
-        return torch.mv(o_weight, mixed)
+            return self._runtime_matvec(o_weight, mixed, out=self._gemma4_projection_buffer)
+        return self._runtime_matvec(o_weight, mixed)
 
     def _gemma4_head_norm(
         self,
@@ -9024,204 +9023,245 @@ class ThinGpuCausalLMRuntime:
                 if hasattr(self.weights, "prefetch_layer"):
                     self.weights.prefetch_layer(layer + distance)
             self._capture_debug(layer, "post_input_rmsnorm", normed)
-            q_proj_id = _layer_tensor(layer, "self_attn.q_proj.weight")
-            q_proj = self._bound_layer_tensor(layer, "q_weight")
-            if q_proj is not None or q_proj_id in self.weights.page_specs:
-                if q_proj is None:
-                    q_proj = self.weights.tensor(q_proj_id)
-                k_proj = self._bound_layer_tensor(layer, "k_weight")
-                if k_proj is None:
-                    k_proj = self.weights.tensor(
-                        _layer_tensor(layer, "self_attn.k_proj.weight")
-                    )
-                v_proj = self._bound_layer_tensor(layer, "v_weight")
-                if v_proj is None:
-                    v_proj = self.weights.tensor(
-                        _layer_tensor(layer, "self_attn.v_proj.weight")
-                    )
-                if self.kernel_backend is not None:
-                    self.kernel_backend.multi_matvec(
-                        (q_proj, k_proj, v_proj),
-                        normed,
-                        self._moe_qkv_buffer,
-                        block_m=64,
-                    )
-                    q = self._moe_qkv_buffer[: self.q_dim]
-                    k = self._moe_qkv_buffer[
-                        self.q_dim : self.q_dim + self.kv_dim
-                    ]
-                    v = self._moe_qkv_buffer[
-                        self.q_dim + self.kv_dim :
-                    ]
-                else:
-                    q = self._runtime_matvec(
-                        q_proj, normed, self._moe_qkv_buffer[: self.q_dim]
-                    )
-                    k = self._runtime_matvec(
-                        k_proj,
-                        normed,
-                        self._moe_qkv_buffer[
-                            self.q_dim : self.q_dim + self.kv_dim
-                        ],
-                    )
-                    v = self._runtime_matvec(
-                        v_proj,
-                        normed,
-                        self._moe_qkv_buffer[self.q_dim + self.kv_dim :],
-                    )
+            if getattr(self, "is_gemma4", False):
+                if lev is not None:
+                    lev.qkv_start.record()
+                    lev.qkv_end.record()
+                    lev.o_proj_start.record()
+                attention_output = self._gemma4_attention(layer, normed, token_index)
+                if lev is not None:
+                    lev.o_proj_end.record()
             else:
-                qkv_weight = _first_optional_tensor(
-                    self.weights,
-                    (
-                        _layer_tensor(layer, "self_attn.qkv_proj.weight"),
-                        _layer_tensor(layer, "attn.c_attn.weight"),
-                    ),
-                )
-                if qkv_weight is None:
-                    raise RuntimeError(f"layer {layer} has no supported QKV weights")
-                qkv_out = (
-                    self._runtime_matvec(
-                        qkv_weight, normed, self._moe_qkv_buffer
-                    )
-                    if self.kernel_backend is not None
-                    else torch.mv(qkv_weight, normed)
-                )
-                q = qkv_out[:self.q_dim]
-                k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
-                v = qkv_out[self.q_dim + self.kv_dim :]
-            if lev is not None:
-                lev.qkv_end.record()
-            for projected, role, suffix in (
-                (q, "q_bias", "self_attn.q_proj.bias"),
-                (k, "k_bias", "self_attn.k_proj.bias"),
-                (v, "v_bias", "self_attn.v_proj.bias"),
-            ):
-                bias = self._bound_layer_tensor(layer, role)
-                if bias is None:
-                    bias = _optional_tensor(
+                q_proj_id = _layer_tensor(layer, "self_attn.q_proj.weight")
+                q_proj = self._bound_layer_tensor(layer, "q_weight")
+                if q_proj is not None or q_proj_id in self.weights.page_specs:
+                    if q_proj is None:
+                        q_proj = self.weights.tensor(q_proj_id)
+                    k_proj = self._bound_layer_tensor(layer, "k_weight")
+                    if k_proj is None:
+                        k_proj = self.weights.tensor(
+                            _layer_tensor(layer, "self_attn.k_proj.weight")
+                        )
+                    v_proj = self._bound_layer_tensor(layer, "v_weight")
+                    if v_proj is None:
+                        v_proj = self.weights.tensor(
+                            _layer_tensor(layer, "self_attn.v_proj.weight")
+                        )
+                    if self.kernel_backend is not None:
+                        self.kernel_backend.multi_matvec(
+                            (q_proj, k_proj, v_proj),
+                            normed,
+                            self._moe_qkv_buffer,
+                            block_m=64,
+                        )
+                        q = self._moe_qkv_buffer[: self.q_dim]
+                        k = self._moe_qkv_buffer[
+                            self.q_dim : self.q_dim + self.kv_dim
+                        ]
+                        v = self._moe_qkv_buffer[
+                            self.q_dim + self.kv_dim :
+                        ]
+                    else:
+                        q = self._runtime_matvec(
+                            q_proj, normed, self._moe_qkv_buffer[: self.q_dim]
+                        )
+                        k = self._runtime_matvec(
+                            k_proj,
+                            normed,
+                            self._moe_qkv_buffer[
+                                self.q_dim : self.q_dim + self.kv_dim
+                            ],
+                        )
+                        v = self._runtime_matvec(
+                            v_proj,
+                            normed,
+                            self._moe_qkv_buffer[self.q_dim + self.kv_dim :],
+                        )
+                else:
+                    qkv_weight = _first_optional_tensor(
                         self.weights,
-                        _layer_tensor(layer, suffix),
+                        (
+                            _layer_tensor(layer, "self_attn.qkv_proj.weight"),
+                            _layer_tensor(layer, "attn.c_attn.weight"),
+                        ),
                     )
-                if bias is not None:
-                    projected.add_(bias)
-            fused_qkv_bias = _optional_tensor(
-                self.weights,
-                _layer_tensor(layer, "self_attn.qkv_proj.bias"),
-            )
-            if fused_qkv_bias is not None:
-                q_bias, k_bias, v_bias = torch.split(
-                    fused_qkv_bias,
-                    (self.q_dim, self.kv_dim, self.kv_dim),
-                )
-                q.add_(q_bias)
-                k.add_(k_bias)
-                v.add_(v_bias)
-            self._capture_debug(layer, "q_projection", q)
-            self._capture_debug(layer, "k_projection", k)
-            self._capture_debug(layer, "v_projection", v)
-            q_norm = self._bound_layer_tensor(layer, "q_norm")
-            if q_norm is None:
-                q_norm = _optional_tensor(
+                    if qkv_weight is None:
+                        raise RuntimeError(f"layer {layer} has no supported QKV weights")
+                    qkv_out = (
+                        self._runtime_matvec(
+                            qkv_weight, normed, self._moe_qkv_buffer
+                        )
+                        if self.kernel_backend is not None
+                        else torch.mv(qkv_weight, normed)
+                    )
+                    q = qkv_out[:self.q_dim]
+                    k = qkv_out[self.q_dim : self.q_dim + self.kv_dim]
+                    v = qkv_out[self.q_dim + self.kv_dim :]
+                if lev is not None:
+                    lev.qkv_end.record()
+                for projected, role, suffix in (
+                    (q, "q_bias", "self_attn.q_proj.bias"),
+                    (k, "k_bias", "self_attn.k_proj.bias"),
+                    (v, "v_bias", "self_attn.v_proj.bias"),
+                ):
+                    bias = self._bound_layer_tensor(layer, role)
+                    if bias is None:
+                        bias = _optional_tensor(
+                            self.weights,
+                            _layer_tensor(layer, suffix),
+                        )
+                    if bias is not None:
+                        projected.add_(bias)
+                fused_qkv_bias = _optional_tensor(
                     self.weights,
-                    _layer_tensor(layer, "self_attn.q_norm.weight"),
+                    _layer_tensor(layer, "self_attn.qkv_proj.bias"),
                 )
-            k_norm = self._bound_layer_tensor(layer, "k_norm")
-            if k_norm is None:
-                k_norm = _optional_tensor(
-                    self.weights,
-                    _layer_tensor(layer, "self_attn.k_norm.weight"),
+                if fused_qkv_bias is not None:
+                    q_bias, k_bias, v_bias = torch.split(
+                        fused_qkv_bias,
+                        (self.q_dim, self.kv_dim, self.kv_dim),
+                    )
+                    q.add_(q_bias)
+                    k.add_(k_bias)
+                    v.add_(v_bias)
+                self._capture_debug(layer, "q_projection", q)
+                self._capture_debug(layer, "k_projection", k)
+                self._capture_debug(layer, "v_projection", v)
+                q_norm = self._bound_layer_tensor(layer, "q_norm")
+                if q_norm is None:
+                    q_norm = _optional_tensor(
+                        self.weights,
+                        _layer_tensor(layer, "self_attn.q_norm.weight"),
+                    )
+                k_norm = self._bound_layer_tensor(layer, "k_norm")
+                if k_norm is None:
+                    k_norm = _optional_tensor(
+                        self.weights,
+                        _layer_tensor(layer, "self_attn.k_norm.weight"),
+                    )
+                fused_qk_norm_rope = (
+                    q_norm is not None
+                    and k_norm is not None
+                    and q_norm.numel() == self.head_dim
+                    and k_norm.numel() == self.head_dim
+                    and self.attention_mode == "causal_kv"
+                    and self.descriptor.layer_uses_rope(layer)
+                    and int(self.head_dim * self.partial_rotary_factor)
+                    == self.head_dim
+                    and self.fused_rope_enabled
+                    and self.kernel_backend is not None
                 )
-            fused_qk_norm_rope = (
-                q_norm is not None
-                and k_norm is not None
-                and q_norm.numel() == self.head_dim
-                and k_norm.numel() == self.head_dim
-                and self.attention_mode == "causal_kv"
-                and self.descriptor.layer_uses_rope(layer)
-                and int(self.head_dim * self.partial_rotary_factor)
-                == self.head_dim
-                and self.fused_rope_enabled
-                and self.kernel_backend is not None
-            )
-            if fused_qk_norm_rope:
-                cos, sin = self._rope_values(token_index, q.dtype)
-                q, k = self.kernel_backend.qk_head_rmsnorm_rope_inplace(
-                    q,
-                    k,
-                    q_norm,
-                    k_norm,
-                    cos,
-                    sin,
-                    self.heads,
-                    self.kv_heads,
-                    self.head_dim,
-                    self.rms_norm_eps,
-                )
-            elif q_norm is not None:
-                q = (
-                    _rms_norm(q, q_norm, self.rms_norm_eps)
-                    if q_norm.numel() == q.numel()
-                    else _head_rms_norm(
+                if fused_qk_norm_rope:
+                    cos, sin = self._rope_values(token_index, q.dtype)
+                    q, k = self.kernel_backend.qk_head_rmsnorm_rope_inplace(
                         q,
-                        q_norm,
-                        self.heads,
-                        self.head_dim,
-                        self.rms_norm_eps,
-                    )
-                )
-            if k_norm is not None and not fused_qk_norm_rope:
-                k = (
-                    _rms_norm(k, k_norm, self.rms_norm_eps)
-                    if k_norm.numel() == k.numel()
-                    else _head_rms_norm(
                         k,
+                        q_norm,
                         k_norm,
+                        cos,
+                        sin,
+                        self.heads,
                         self.kv_heads,
                         self.head_dim,
                         self.rms_norm_eps,
                     )
+                elif q_norm is not None:
+                    q = (
+                        _rms_norm(q, q_norm, self.rms_norm_eps)
+                        if q_norm.numel() == q.numel()
+                        else _head_rms_norm(
+                            q,
+                            q_norm,
+                            self.heads,
+                            self.head_dim,
+                            self.rms_norm_eps,
+                        )
+                    )
+                if k_norm is not None and not fused_qk_norm_rope:
+                    k = (
+                        _rms_norm(k, k_norm, self.rms_norm_eps)
+                        if k_norm.numel() == k.numel()
+                        else _head_rms_norm(
+                            k,
+                            k_norm,
+                            self.kv_heads,
+                            self.head_dim,
+                            self.rms_norm_eps,
+                        )
+                    )
+                if self.attention_mode == "causal_kv" and not fused_qk_norm_rope:
+                    q, k = self._apply_rope(q, k, layer, token_index)
+                if self.kv_cache is not None and not getattr(
+                    self, "_autotuning", False
+                ):
+                    self.kv_cache.append(layer, k, v, token_index)
+                attention = self._attention(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    token_index,
+                    lev,
                 )
-            if self.attention_mode == "causal_kv" and not fused_qk_norm_rope:
-                q, k = self._apply_rope(q, k, layer, token_index)
-            if self.kv_cache is not None and not getattr(
-                self, "_autotuning", False
-            ):
-                self.kv_cache.append(layer, k, v, token_index)
-            attention = self._attention(
-                q,
-                k,
-                v,
-                layer,
-                token_index,
-                lev,
-            )
-            if lev is not None:
-                lev.o_proj_start.record()
-            o_weight = self._bound_layer_tensor(layer, "o_weight")
-            if o_weight is None:
-                o_weight = self.weights.tensor(
-                    _layer_tensor(layer, "self_attn.o_proj.weight")
+                if lev is not None:
+                    lev.o_proj_start.record()
+                o_weight = self._bound_layer_tensor(layer, "o_weight")
+                if o_weight is None:
+                    o_weight = self.weights.tensor(
+                        _layer_tensor(layer, "self_attn.o_proj.weight")
+                    )
+                attention_output = (
+                    self._runtime_matvec(
+                        o_weight,
+                        attention,
+                        self._moe_attention_output_buffer,
+                    )
+                    if self.kernel_backend is not None
+                    else torch.mv(o_weight, attention)
                 )
-            attention_output = (
-                self._runtime_matvec(
-                    o_weight,
-                    attention,
-                    self._moe_attention_output_buffer,
-                )
-                if self.kernel_backend is not None
-                else torch.mv(o_weight, attention)
-            )
-            o_bias = self._bound_layer_tensor(layer, "o_bias")
-            if o_bias is None:
-                o_bias = _optional_tensor(
-                    self.weights,
-                    _layer_tensor(layer, "self_attn.o_proj.bias"),
-                )
-            if o_bias is not None:
-                attention_output.add_(o_bias)
-            if lev is not None:
-                lev.o_proj_end.record()
+                o_bias = self._bound_layer_tensor(layer, "o_bias")
+                if o_bias is None:
+                    o_bias = _optional_tensor(
+                        self.weights,
+                        _layer_tensor(layer, "self_attn.o_proj.bias"),
+                    )
+                if o_bias is not None:
+                    attention_output.add_(o_bias)
+                if lev is not None:
+                    lev.o_proj_end.record()
 
+                if self.kernel_backend is not None:
+                    post_attention_norm = self._bound_layer_tensor(
+                        layer,
+                        "post_attention_norm",
+                    )
+                    if post_attention_norm is None:
+                        post_attention_norm = self.weights.tensor(
+                            _layer_tensor(
+                                layer,
+                                "post_attention_layernorm.weight",
+                            )
+                        )
+                    self.kernel_backend.add_rms_norm(
+                        hidden_a,
+                        attention_output,
+                        hidden_b,
+                        post_attention_norm,
+                        self._moe_normed_buffer,
+                        self.rms_norm_eps,
+                    )
+                    normed = self._moe_normed_buffer
+                else:
+                    hidden_b.copy_(hidden_a + attention_output)
+                    normed = self._normalization(
+                        hidden_b,
+                        _layer_tensor(
+                            layer,
+                            "post_attention_layernorm.weight",
+                        ),
+                    )
+                self._capture_debug(layer, "post_attention_residual", hidden_b)
+                self._capture_debug(layer, "post_attention_rmsnorm", normed)
             if self.kernel_backend is not None:
                 post_attention_norm = self._bound_layer_tensor(
                     layer,

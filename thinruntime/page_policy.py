@@ -82,7 +82,7 @@ def is_body_weight(page: Mapping[str, Any]) -> bool:
 
 
 def is_expert_weight(page: Mapping[str, Any]) -> bool:
-    return page_role(page) == PageRole.EXPERT and is_body_weight(page)
+    return page_role(page) == PageRole.EXPERT and (is_body_weight(page) or is_native_packed_weight(page))
 
 
 def is_attention_weight(page: Mapping[str, Any]) -> bool:
@@ -113,3 +113,6 @@ def _legacy_name_role(page_id: str) -> PageRole:
     if any(token in page_id for token in ("layernorm", ".norm.")):
         return PageRole.NORM
     return PageRole.OTHER
+
+def is_router_weight(page: Mapping[str, Any]) -> bool:
+    return page_role(page) == PageRole.ROUTER
