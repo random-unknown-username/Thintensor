@@ -4,17 +4,24 @@
 
 ---
 
-## Fast-Path: Setting Up thintensor
+## Fast-Path: Install the shipped release
 
-Follow these steps to set up `thintensor` from scratch on a new development machine:
+ThinTensor ships as two packages: the Python/Triton runtime on
+[PyPI](https://pypi.org/project/thintensor/) and the native
+archive/conversion core on [crates.io](https://crates.io/crates/thintensor). A
+normal user installs both from the registries; cloning the repository and
+building the Rust binary is not required.
 
-### 1. Install Prerequisites
-Ensure you have the following installed on your host system:
-*   **Python (>= 3.10)**
-*   **Rust Compiler (`cargo`)**: Install via [rustup.rs](https://rustup.rs/) if missing.
-*   **NVIDIA CUDA Toolkit**: Required for GPU acceleration (ensure `nvcc` is available).
+### 1. Install prerequisites
 
-### 2. Set Up a Virtual Environment & Install PyTorch
+Ensure the host has:
+
+* **Python 3.10 or newer**
+* **Rust and Cargo**: install via [rustup.rs](https://rustup.rs/) if missing
+* **NVIDIA CUDA Toolkit** for GPU execution (ensure `nvcc` is available)
+
+### 2. Set up a virtual environment and install PyTorch
+
 Create a fresh python environment and install PyTorch with CUDA support:
 ```bash
 python3 -m venv venv
@@ -25,19 +32,45 @@ pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### 3. Clone and Build ThinTensor
-Clone the repository and install it in editable mode along with all optional dependencies:
+### 3. Install the published Python package and Rust core
+
+Install the Python CLI from PyPI and the native `thintensor-core` binary from
+crates.io:
+
 ```bash
-git clone https://github.com/random-unknown-username/Thintensor.git
-cd Thintensor
-pip install -e '.[all]'
+python -m pip install 'thintensor[all]'
+cargo install thintensor --locked
 ```
-*Note: Installing the package automatically compiles the internal Rust core binaries using `setup.py`.*
+
+`cargo install thintensor` installs the `thintensor-core` executable into
+Cargo's binary directory, normally `~/.cargo/bin`. Make sure that directory is
+on `PATH`:
+
+```bash
+command -v thintensor-core
+thintensor-core --help
+```
+
+The Python CLI discovers that Cargo-installed binary automatically. For a
+source checkout or a custom installation, set `THINTENSOR_CORE_BIN` to the
+binary path instead.
 
 ### 4. Verify the Installation
 Run the doctor command to ensure the GPU runtime and kernel dependencies are fully operational:
 ```bash
 thintensor doctor --strict
+```
+
+### Developing from source
+
+If you are contributing to ThinTensor rather than using the shipped release,
+the source build remains available:
+
+```bash
+git clone https://github.com/random-unknown-username/Thintensor.git
+cd Thintensor
+python -m pip install -e '.[all]'
+cargo build --locked --release --bin thintensor-core
 ```
 
 ### Quickstart: Downloading & Running a Sample Model (Qwen-0.8B)
@@ -86,32 +119,32 @@ graph TD
 ```
 
 ### 1. CLI Entrypoint & Routing
-*   **CLI Handler**: [thinruntime/cli.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/cli.py) manages subcommands like `run`, `pull`, `convert`, `bench`, and `validate`.
+*   **CLI Handler**: [thinruntime/cli.py](thinruntime/cli.py) manages subcommands like `run`, `pull`, `convert`, `bench`, and `validate`.
 *   **Routing Engine**: The CLI inspects model metadata via `auto_fit.py` and routes to the native high-performance runtime for compatible models, falling back to Hugging Face transformers for incompatible architectures.
 
 ### 2. Rust Core (Archive & Conversion)
-The Rust modules under [src/](file:///home/satvik/Projects/thintensor-opus/src) handle disk-to-memory layouts and weight packing:
-*   **Archive Reader/Writer**: [src/archive.rs](file:///home/satvik/Projects/thintensor-opus/src/archive.rs) and [src/manifest.rs](file:///home/satvik/Projects/thintensor-opus/src/manifest.rs) define the binary format of `.thin` packages.
-*   **Model Converter**: [src/convert_hf.rs](file:///home/satvik/Projects/thintensor-opus/src/convert_hf.rs) parses Hugging Face safetensors, mapping weights and transforming shapes into contiguous memory layouts.
-*   **VRAM Budget & Fit Planner**: [src/plan.rs](file:///home/satvik/Projects/thintensor-opus/src/plan.rs) inspects available VRAM and maps which weight layers must be streamed or pinned to VRAM.
+The Rust modules under [src/](src/) handle disk-to-memory layouts and weight packing:
+*   **Archive Reader/Writer**: [src/archive.rs](src/archive.rs) and [src/manifest.rs](src/manifest.rs) define the binary format of `.thin` packages.
+*   **Model Converter**: [src/convert_hf.rs](src/convert_hf.rs) parses Hugging Face safetensors, mapping weights and transforming shapes into contiguous memory layouts.
+*   **VRAM Budget & Fit Planner**: [src/plan.rs](src/plan.rs) inspects available VRAM and maps which weight layers must be streamed or pinned to VRAM.
 
 ### 3. High-Performance GPU Runtime
 The Python runtime classes coordinate host-device memory mapping and layer execution:
-*   **ThinGpuCausalLMRuntime**: [thinruntime/gpu_runtime.py#L2490](file:///home/satvik/Projects/thintensor-opus/thinruntime/gpu_runtime.py#L2490) is the execution engine.
-    *   **Memory-Mapped Zero-Copy Views**: [thinruntime/archive.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/archive.py) exposes binary pages as PyTorch tensor views directly from mmap.
+*   **ThinGpuCausalLMRuntime**: [thinruntime/gpu_runtime.py#L2490](thinruntime/gpu_runtime.py#L2490) is the execution engine.
+    *   **Memory-Mapped Zero-Copy Views**: [thinruntime/archive.py](thinruntime/archive.py) exposes binary pages as PyTorch tensor views directly from mmap.
     *   **Forward Causal Decode**: `forward_token` (line 4828+) coordinates prefetch pipelines and sequential layer dispatch.
     *   **Gated Mixture-of-Experts (MoE)**: `_forward_token_moe` (line 6095+) runs MoE routing. When weights exceed VRAM, experts are streamed dynamically using page-pool overlays (line 6260+).
     *   **Optimized Eager RoPE**: `_apply_rope` (line 5804+) applies rotary positional embeddings. Eager position embeddings are applied in-place to avoid allocations while matching Hugging Face precision perfectly.
     *   **Scaled Dot-Product Attention**: `_attention` (line 5948+) leverages PyTorch's native C++ `scaled_dot_product_attention` for fast GQA/MHA execution.
 
 ### 4. Triton Custom Kernels
-*   **Fused Normalization**: [thinruntime/triton_kernels.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/triton_kernels.py) implements fused `add_rms_norm` and SwiGLU operations to bypass PyTorch intermediate launch overheads.
+*   **Fused Normalization**: [thinruntime/triton_kernels.py](thinruntime/triton_kernels.py) implements fused `add_rms_norm` and SwiGLU operations to bypass PyTorch intermediate launch overheads.
 
 ---
 
 ## Profiles & Configuration
 
-Profiles are intent-based presets defined in [thinruntime/profile_presets.py](file:///home/satvik/Projects/thintensor-opus/thinruntime/profile_presets.py):
+Profiles are intent-based presets defined in [thinruntime/profile_presets.py](thinruntime/profile_presets.py):
 
 *   **`safe`**: Preserves full precision (BF16) weights and KV history with the broadest compatibility.
 *   **`balanced`**: Enables native matvec and GQA/MHA attention kernels without weight compression.

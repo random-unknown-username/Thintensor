@@ -1,6 +1,6 @@
 # Rust build artifacts
 /target/
-Cargo.lock
+# Keep Cargo.lock committed so published binary installs can use --locked.
 
 # Python build and package files
 /build/

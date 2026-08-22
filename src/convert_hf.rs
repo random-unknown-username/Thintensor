@@ -752,7 +752,10 @@ fn canonical_text_page_id(suffix: &str, cross_layers: &BTreeSet<u32>) -> Option<
     if normalized.starts_with("model.language_model.layers.") {
         normalized = normalized.replace("model.language_model.layers.", "model.layers.");
     }
-    if normalized.contains(".experts.") && !normalized.contains(".mlp.experts.") && !normalized.contains(".block_sparse_moe.experts.") {
+    if normalized.contains(".experts.")
+        && !normalized.contains(".mlp.experts.")
+        && !normalized.contains(".block_sparse_moe.experts.")
+    {
         normalized = normalized.replace(".experts.", ".mlp.experts.");
     }
     if normalized.contains(".router.proj.") {

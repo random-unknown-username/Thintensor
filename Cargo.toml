@@ -2,6 +2,19 @@
 name = "thintensor"
 version = "1.0.1"
 edition = "2024"
+rust-version = "1.85"
+description = "ThinTensor model archive and planning core"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/random-unknown-username/Thintensor"
+keywords = ["machine-learning", "inference", "llm", "gpu", "quantization"]
+categories = ["command-line-utilities", "science"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "src/**/*.rs",
+]
 
 [[bin]]
 name = "thintensor-core"
