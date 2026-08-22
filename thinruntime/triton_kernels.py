@@ -4984,8 +4984,27 @@ class TritonDecodeBackend:
         block_m: int = 8,
         num_warps: int = 8,
     ) -> torch.Tensor:
+        # Qwen3.5's recurrent projection has four matrices. Keep the existing
+        # three-way Triton kernel and launch two packed groups for that path.
+        if len(weights) == 4:
+            first_rows = sum(int(weight.shape[0]) for weight in weights[:2])
+            self.multi_matvec(
+                weights[:2],
+                x,
+                out[:first_rows],
+                block_m=block_m,
+                num_warps=num_warps,
+            )
+            self.multi_matvec(
+                weights[2:],
+                x,
+                out[first_rows:],
+                block_m=block_m,
+                num_warps=num_warps,
+            )
+            return out
         if len(weights) not in {2, 3}:
-            raise ValueError("multi_matvec supports exactly two or three matrices")
+            raise ValueError("multi_matvec supports two, three, or four matrices")
         weight0, weight1 = weights[:2]
         weight2 = weights[2] if len(weights) == 3 else weight1
         cache_key = tuple(self._layout_key(weight) for weight in weights) + (
